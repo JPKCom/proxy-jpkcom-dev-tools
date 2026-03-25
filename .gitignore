@@ -1,0 +1,13 @@
+# Build output
+localproxy
+localproxy-*
+*.exe
+
+# Test binary
+*.test
+
+# Go build cache
+*.out
+
+# Development
+.dev
