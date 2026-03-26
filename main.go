@@ -41,7 +41,15 @@ import (
 )
 
 // Version is set at build time via -ldflags "-X main.Version=...".
+// Local builds show "dev"; release builds get the git tag (e.g. "v1.0.1").
 var Version = "dev"
+
+const (
+	Author    = "Jean Pierre Kolb"
+	AuthorURL = "https://www.jpkc.com/"
+	RepoURL   = "https://github.com/JPKCom/proxy-jpkcom-dev-tools"
+	License   = "GPL-2.0-or-later"
+)
 
 // -----------------------------------------------------------------------
 // Configuration
@@ -1285,7 +1293,16 @@ func main() {
 	timeoutSec := flag.Int("timeout", 30, "Upstream request timeout in seconds")
 	maxMB := flag.Int64("max-mb", 50, "Maximum upstream response size in megabytes (0 = unlimited)")
 	rawDNS := flag.String("dns", "1.1.1.1,8.8.8.8", `Comma-separated DNS servers (e.g. "9.9.9.9,8.8.4.4"), or "system" for OS defaults`)
+	showVersion := flag.Bool("version", false, "Print version information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("localproxy %s\n", Version)
+		fmt.Printf("License: %s\n", License)
+		fmt.Printf("Author:  %s [%s]\n", Author, AuthorURL)
+		fmt.Printf("Repo:    %s\n", RepoURL)
+		os.Exit(0)
+	}
 
 	// ---- Parse origins ---------------------------------------------------
 	var origins []string
@@ -1398,6 +1415,23 @@ func main() {
 		fmt.Fprintln(w, "localproxy ok")
 	})
 
+	// Version endpoint — no auth needed, returns version info as JSON.
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		writeCORSHeaders(w, r, cfg)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"version": Version,
+			"license": License,
+			"author":  Author,
+			"url":     AuthorURL,
+			"repo":    RepoURL,
+		})
+	})
+
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -1405,7 +1439,7 @@ func main() {
 	}
 
 	// ---- Print startup information ---------------------------------------
-	title := "localproxy  —  ready"
+	title := fmt.Sprintf("localproxy %s  —  ready", Version)
 	addressLine := fmt.Sprintf("  Address  :  http://127.0.0.1:%d", actualPort)
 	tokenLine := fmt.Sprintf("  Token    :  %s", token)
 	dnsLine := fmt.Sprintf("  DNS      :  %s", dnsLabel)
@@ -1415,11 +1449,14 @@ func main() {
 	} else {
 		originsLine = "  Origins  :  (all — pass --origin for production)"
 	}
+	licenseLine := fmt.Sprintf("  License  :  %s", License)
+	authorLine := fmt.Sprintf("  Author   :  %s [%s]", Author, AuthorURL)
+	repoLine := fmt.Sprintf("  Repo     :  %s", RepoURL)
 
 	// Determine box width from the longest content line (rune-aware for UTF-8)
 	runeWidth := func(s string) int { return utf8.RuneCountInString(s) }
 	innerWidth := runeWidth(title)
-	for _, line := range []string{addressLine, tokenLine, dnsLine, originsLine} {
+	for _, line := range []string{addressLine, tokenLine, dnsLine, originsLine, licenseLine, authorLine, repoLine} {
 		if w := runeWidth(line); w > innerWidth {
 			innerWidth = w
 		}
@@ -1440,14 +1477,21 @@ func main() {
 	titleRight := innerWidth - runeWidth(title) - titlePad
 	centeredTitle := "║" + strings.Repeat(" ", titlePad) + title + strings.Repeat(" ", titleRight) + "║"
 
+	thinBar := "╟" + strings.Repeat("─", innerWidth) + "╢"
+
 	fmt.Println()
 	fmt.Println("╔" + hBar + "╗")
 	fmt.Println(centeredTitle)
 	fmt.Println("╠" + hBar + "╣")
 	fmt.Println(pad(addressLine))
 	fmt.Println(pad(tokenLine))
+	fmt.Println(thinBar)
 	fmt.Println(pad(dnsLine))
 	fmt.Println(pad(originsLine))
+	fmt.Println(thinBar)
+	fmt.Println(pad(licenseLine))
+	fmt.Println(pad(authorLine))
+	fmt.Println(pad(repoLine))
 	fmt.Println("╚" + hBar + "╝")
 	fmt.Println()
 	fmt.Println("  Enter the address and token in your online tool.")

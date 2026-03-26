@@ -367,12 +367,86 @@ func TestProxy_UpstreamDNSError_ReturnsJSON(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// Version variable
+// Version variable & /version endpoint
 // -----------------------------------------------------------------------
 
 func TestVersionDefault(t *testing.T) {
 	if Version != "dev" {
 		t.Errorf("expected default Version to be 'dev', got %q", Version)
+	}
+}
+
+func TestVersionEndpoint(t *testing.T) {
+	cfg := newTestConfig()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		writeCORSHeaders(w, r, cfg)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"version": Version,
+			"license": License,
+			"author":  Author,
+			"url":     AuthorURL,
+			"repo":    RepoURL,
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/version", nil)
+	req.Header.Set("Origin", "https://test.example.com")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected application/json, got %q", ct)
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("could not decode version response: %v", err)
+	}
+	if resp["version"] != Version {
+		t.Errorf("expected version=%q, got %q", Version, resp["version"])
+	}
+	if resp["license"] != License {
+		t.Errorf("expected license=%q, got %q", License, resp["license"])
+	}
+	if resp["author"] != Author {
+		t.Errorf("expected author=%q, got %q", Author, resp["author"])
+	}
+	if resp["repo"] != RepoURL {
+		t.Errorf("expected repo=%q, got %q", RepoURL, resp["repo"])
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://test.example.com" {
+		t.Errorf("expected CORS origin on /version, got %q", got)
+	}
+}
+
+func TestVersionEndpoint_CORS_Preflight(t *testing.T) {
+	cfg := newTestConfig()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		writeCORSHeaders(w, r, cfg)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"version": Version})
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/version", nil)
+	req.Header.Set("Origin", "https://test.example.com")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("expected 204 for OPTIONS, got %d", rr.Code)
 	}
 }
 

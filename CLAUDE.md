@@ -6,6 +6,12 @@
 
 This proxy is the **"Expertenmodus"** companion for the **JPKCom Tools** project (`/home/jpk/ddev/jpkcom-tools/`). It does **not** replace the existing PHP-based proxy system (`p.php` + `proxy.php`), but offers an optional, high-performance alternative that users can install locally on their machine.
 
+## Repository
+
+- **GitHub:** https://github.com/JPKCom/proxy-jpkcom-dev-tools
+- **Author:** Jean Pierre Kolb ([https://www.jpkc.com/](https://www.jpkc.com/))
+- **License:** GPL-2.0-or-later
+
 ## Language & Stack
 
 - **Language:** Go (single-file, no external dependencies — stdlib only)
@@ -50,7 +56,7 @@ Single-file proxy with these components (all in `main.go`):
 - **pageHandler** — full page analysis endpoint (`/page`): traces the redirect chain via HEAD requests (`traceRedirectChain`), then fetches the final page via GET with body decompression and HEAD pre-check for true `Content-Encoding`. Returns a single JSON response with redirect chain (per-hop timing, IP, status, headers), HTML body, SSL info, timing, transfer size, and content encoding. Designed as 1:1 replacement for PHP proxy's `handlePageAction`
 - **SSRF protection** — `isPrivateHost` blocks requests to private/loopback IP ranges; also checked on each redirect target in `traceRedirectChain`
 - **Header forwarding** — `copyRequestHeaders` / `copyResponseHeaders` strip hop-by-hop and proxy-internal headers
-- **Endpoints:** `/proxy` (streaming proxy), `/inspect` (metadata + SSL inspection), `/page` (full page analysis with redirect chain), `/ping` (health check, no auth, with CORS for browser access)
+- **Endpoints:** `/proxy` (streaming proxy), `/inspect` (metadata + SSL inspection), `/page` (full page analysis with redirect chain), `/ping` (health check, no auth, with CORS for browser access), `/version` (version info as JSON, no auth, with CORS)
 
 ## Security Design
 

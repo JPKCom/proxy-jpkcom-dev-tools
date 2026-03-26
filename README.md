@@ -54,14 +54,19 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 
 Output:
 ```
-╔═══════════════════════════════════════════════════════╗
-║              localproxy  —  ready                     ║
-╠═══════════════════════════════════════════════════════╣
-║  Address  :  http://127.0.0.1:54321                   ║
-║  Token    :  a3f8c2...                                ║
-║  DNS      :  1.1.1.1:53, 8.8.8.8:53                   ║
-║  Origins  :  (all — pass --origin for production)     ║
-╚═══════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║              localproxy v1.0.1  —  ready                         ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Address  :  http://127.0.0.1:54321                              ║
+║  Token    :  a3f8c2...                                           ║
+╟──────────────────────────────────────────────────────────────────╢
+║  DNS      :  1.1.1.1:53, 8.8.8.8:53                              ║
+║  Origins  :  (all — pass --origin for production)                ║
+╟──────────────────────────────────────────────────────────────────╢
+║  License  :  GPL-2.0-or-later                                    ║
+║  Author   :  Jean Pierre Kolb [https://www.jpkc.com/]            ║
+║  Repo     :  https://github.com/JPKCom/proxy-jpkcom-dev-tools    ║
+╚══════════════════════════════════════════════════════════════════╝
 ```
 
 ### Production: Restrict allowed origins
@@ -82,6 +87,8 @@ Output:
 
 By default, localproxy uses **Cloudflare (1.1.1.1)** and **Google (8.8.8.8)** for DNS resolution — independent of the host system's DNS configuration. This ensures consistent results across machines. Use `--dns system` to fall back to the OS resolver (e.g. `/etc/resolv.conf`).
 
+> **Note:** The `--dns` flag accepts addresses with or without port. If no port is specified, `:53` (standard DNS port) is appended automatically. So `--dns "1.1.1.1,8.8.8.8"` and `--dns "1.1.1.1:53,8.8.8.8:53"` are equivalent. The startup banner always shows the normalized form with port.
+
 ### All options
 
 ```
@@ -90,6 +97,7 @@ By default, localproxy uses **Cloudflare (1.1.1.1)** and **Google (8.8.8.8)** fo
 --timeout   int     Upstream request timeout in seconds                  [default: 30]
 --max-mb    int64   Maximum upstream response size in MB (0 = unlimited) [default: 50]
 --dns       string  DNS servers, comma-separated, or "system" for OS defaults [default: "1.1.1.1,8.8.8.8"]
+--version           Print version information and exit
 ```
 
 ---
@@ -106,6 +114,7 @@ By default, localproxy uses **Cloudflare (1.1.1.1)** and **Google (8.8.8.8)** fo
 | `GET /page?url=...` | Yes (`X-Proxy-Token`) | Full page analysis: redirect chain + body + SSL + timing (single JSON) |
 | `OPTIONS /proxy`, `OPTIONS /inspect`, `OPTIONS /page` | No | CORS preflight (returns 204 with CORS + PNA headers) |
 | `GET /ping` | No | Health check (returns `localproxy ok`) |
+| `GET /version` | No | Version info as JSON (version, license, author, repo) |
 
 ---
 
@@ -415,8 +424,8 @@ go version
 ```
 
 ```bash
-git clone https://github.com/YOUR-USER/localproxy.git
-cd localproxy
+git clone https://github.com/JPKCom/proxy-jpkcom-dev-tools.git
+cd proxy-jpkcom-dev-tools
 
 # Build for current platform
 go build -o localproxy .
@@ -448,6 +457,26 @@ go test -v ./...
 
 ---
 
+## Changelog
+
+### v1.0.1
+
+- Added `--version` CLI flag to print version information
+- Added `/version` endpoint returning version, license, author, and repo as JSON
+- Added GPL-2.0-or-later license
+- Startup banner now shows version, license, author, and repository URL
+
+### v1.0.0
+
+- Initial release
+- Streaming proxy (`/proxy`), metadata inspection (`/inspect`), full page analysis (`/page`)
+- Per-session cryptographic token authentication
+- Origin allowlist, SSRF protection, configurable DNS resolver
+- CORS with Private Network Access support
+- Cross-platform binaries via GitHub Actions
+
+---
+
 ## License
 
-MIT
+GPL-2.0-or-later — see [LICENSE](LICENSE) for the full text.
