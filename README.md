@@ -465,6 +465,8 @@ go test -v ./...
 - Added `/version` endpoint returning version, license, author, and repo as JSON
 - Added GPL-2.0-or-later license
 - Startup banner now shows version, license, author, and repository URL
+- Startup banner groups Address/Token, DNS/Origins, and License/Author/Repo into visually separated sections
+- Fixed resource safety: response body in redirect chain tracing is now closed immediately after receiving the response
 
 ### v1.0.0
 

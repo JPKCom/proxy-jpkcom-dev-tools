@@ -108,7 +108,7 @@ When an upstream request fails, the proxy returns a **JSON error response** with
 go test -v ./...
 ```
 
-Tests in `main_test.go` cover: token generation, origin validation, SSRF blocking, CORS preflight (including dynamic `Access-Control-Expose-Headers`), handler error paths (missing token, wrong origin, missing/invalid URL), successful upstream forwarding with metadata headers (`X-Upstream-Protocol`, `X-Upstream-Timing`, `X-Upstream-Content-Encoding`, `X-Upstream-Content-Length`), the `/inspect` endpoint (auth, missing URL, successful with/without body), the `/page` endpoint (auth, missing URL, method restriction, successful no-redirect, redirect chain with 301→200, `formatRawHeaders`), SSL extraction (`extractSSLInfo`, `tlsVersionName`), connection tracing (`connTrace` timing header, remote IP), and the `/ping` endpoint.
+Tests in `main_test.go` cover: token generation, origin validation, SSRF blocking, CORS preflight (including dynamic `Access-Control-Expose-Headers`), handler error paths (missing token, wrong origin, missing/invalid URL), successful upstream forwarding with metadata headers (`X-Upstream-Protocol`, `X-Upstream-Timing`, `X-Upstream-Content-Encoding`, `X-Upstream-Content-Length`), the `/inspect` endpoint (auth, missing URL, successful with/without body), the `/page` endpoint (auth, missing URL, method restriction, successful no-redirect, redirect chain with 301→200, `formatRawHeaders`), SSL extraction (`extractSSLInfo`, `tlsVersionName`), connection tracing (`connTrace` timing header, remote IP), the `/ping` endpoint, and the `/version` endpoint (JSON response, CORS preflight).
 
 ## Conventions
 

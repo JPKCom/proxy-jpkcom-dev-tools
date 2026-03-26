@@ -843,10 +843,10 @@ func traceRedirectChain(client *http.Client, startURL string, browserReq *http.R
 			break
 		}
 
+		resp.Body.Close()
 		hop.Status = resp.StatusCode
 		hop.Server = resp.Header.Get("Server")
 		hop.RawHeaders = formatRawHeaders(resp.Header)
-		resp.Body.Close()
 
 		// Only record redirect hops (3xx). The final non-redirect hop is
 		// handled by the caller (pageHandler) which does a GET with body.
