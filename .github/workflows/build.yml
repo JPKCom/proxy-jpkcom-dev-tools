@@ -33,6 +33,18 @@ jobs:
             goarch: amd64
             suffix: windows-amd64
             ext: .exe
+          - goos: freebsd
+            goarch: amd64
+            suffix: freebsd-amd64
+          - goos: freebsd
+            goarch: arm64
+            suffix: freebsd-arm64
+          - goos: openbsd
+            goarch: amd64
+            suffix: openbsd-amd64
+          - goos: netbsd
+            goarch: amd64
+            suffix: netbsd-amd64
 
     steps:
       - name: Checkout

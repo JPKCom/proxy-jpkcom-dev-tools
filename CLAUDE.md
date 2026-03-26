@@ -38,7 +38,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 
 - **GitHub Actions workflow:** `.github/workflows/build.yml`
 - Triggers on version tags (`v*`) and `workflow_dispatch`
-- Cross-compiles for: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64
+- Cross-compiles for: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64, freebsd/amd64, freebsd/arm64, openbsd/amd64, netbsd/amd64
 - Creates a GitHub Release with all binaries via `softprops/action-gh-release@v2`
 - Injects version via `-ldflags "-X main.Version=$TAG"` into `var Version` in `main.go`
 

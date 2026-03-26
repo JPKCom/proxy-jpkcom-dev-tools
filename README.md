@@ -33,6 +33,10 @@ Pre-built binaries for all platforms are available under **Releases** in this re
 | macOS Intel | `localproxy-macos-intel` |
 | macOS Apple Silicon | `localproxy-macos-apple-silicon` |
 | Windows x64 | `localproxy-windows-amd64.exe` |
+| FreeBSD x64 | `localproxy-freebsd-amd64` |
+| FreeBSD ARM64 | `localproxy-freebsd-arm64` |
+| OpenBSD x64 | `localproxy-openbsd-amd64` |
+| NetBSD x64 | `localproxy-netbsd-amd64` |
 
 ### macOS / Linux: Make the binary executable
 
@@ -467,6 +471,7 @@ go test -v ./...
 - Startup banner now shows version, license, author, and repository URL
 - Startup banner groups Address/Token, DNS/Origins, and License/Author/Repo into visually separated sections
 - Fixed resource safety: response body in redirect chain tracing is now closed immediately after receiving the response
+- Added FreeBSD (amd64, arm64), OpenBSD (amd64), and NetBSD (amd64) release binaries
 
 ### v1.0.0
 
