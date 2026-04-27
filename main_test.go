@@ -555,7 +555,6 @@ func TestProxy_UpstreamMetadataHeaders(t *testing.T) {
 	}
 }
 
-
 // -----------------------------------------------------------------------
 // /inspect endpoint
 // -----------------------------------------------------------------------
@@ -629,11 +628,11 @@ func TestInspect_SuccessfulWithBody(t *testing.T) {
 	if resp.Body != "<html>hello</html>" {
 		t.Errorf("expected body in response, got %q", resp.Body)
 	}
-	if resp.Headers["Server"] != "TestServer" {
-		t.Errorf("expected Server header in response, got %q", resp.Headers["Server"])
+	if got := resp.Headers["Server"]; len(got) != 1 || got[0] != "TestServer" {
+		t.Errorf("expected Server=[TestServer] in response, got %v", got)
 	}
-	if resp.Headers["X-Custom"] != "inspect-test" {
-		t.Errorf("expected X-Custom header in response, got %q", resp.Headers["X-Custom"])
+	if got := resp.Headers["X-Custom"]; len(got) != 1 || got[0] != "inspect-test" {
+		t.Errorf("expected X-Custom=[inspect-test] in response, got %v", got)
 	}
 	// SSL should be nil for plain HTTP.
 	if resp.SSL != nil {
@@ -676,6 +675,55 @@ func TestInspect_WithoutBody(t *testing.T) {
 
 	if resp.Body != "" {
 		t.Errorf("expected empty body without body=1, got %q", resp.Body)
+	}
+}
+
+// TestInspect_MultiValueSetCookie verifies that multiple Set-Cookie headers
+// are preserved as a JSON array (RFC 6265 §3) — joining them with ", " is
+// unsafe because cookie expiry dates contain literal commas.
+func TestInspect_MultiValueSetCookie(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Set-Cookie", "be_typo_user=deleted; expires=Sun, 27 Apr 2025 14:03:58 GMT; Max-Age=0; path=/; httponly; samesite=lax")
+		w.Header().Add("Set-Cookie", "__Secure-typo3nonce=eyJ0eXAi; path=/; secure; httponly; samesite=strict")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.allowedOrigins = nil
+	cfg.ssrfCheck = func(string) bool { return false }
+	handler := inspectHandler(cfg, upstream.Client())
+
+	req := httptest.NewRequest(http.MethodGet, "/inspect?url="+upstream.URL+"&body=1", nil)
+	req.Header.Set("X-Proxy-Token", cfg.sessionToken)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp inspectResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	cookies := resp.Headers["Set-Cookie"]
+	if len(cookies) != 2 {
+		t.Fatalf("expected 2 Set-Cookie values, got %d: %v", len(cookies), cookies)
+	}
+	if !strings.Contains(cookies[0], "be_typo_user=deleted") {
+		t.Errorf("first Set-Cookie should contain 'be_typo_user=deleted', got %q", cookies[0])
+	}
+	if !strings.Contains(cookies[1], "__Secure-typo3nonce") {
+		t.Errorf("second Set-Cookie should contain '__Secure-typo3nonce', got %q", cookies[1])
+	}
+	// Ensure no value contains the join separator we used to apply.
+	for i, c := range cookies {
+		if strings.Contains(c, "be_typo_user") && strings.Contains(c, "__Secure-typo3nonce") {
+			t.Errorf("cookie[%d] looks like a joined string (RFC 6265 §3 violation): %q", i, c)
+		}
 	}
 }
 
@@ -851,8 +899,8 @@ func TestPage_SuccessfulNoRedirect(t *testing.T) {
 	if len(resp.RedirectChain) != 1 {
 		t.Errorf("expected 1 hop in redirect chain, got %d", len(resp.RedirectChain))
 	}
-	if resp.Headers["Server"] != "TestServer" {
-		t.Errorf("expected Server=TestServer in headers, got %q", resp.Headers["Server"])
+	if got := resp.Headers["Server"]; len(got) != 1 || got[0] != "TestServer" {
+		t.Errorf("expected Server=[TestServer] in headers, got %v", got)
 	}
 	if resp.RawHeaders == "" {
 		t.Error("expected rawHeaders to be non-empty")

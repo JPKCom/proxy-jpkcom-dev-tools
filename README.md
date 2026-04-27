@@ -59,7 +59,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.0.2  —  ready                         ║
+║              localproxy v1.0.3  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -445,8 +445,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.0.2
-git push origin v1.0.2
+git tag v1.0.3
+git push origin v1.0.3
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -469,9 +469,37 @@ metadata headers, SSL extraction, and connection tracing.
 Tests also run automatically in CI before each release build (see
 `.github/workflows/build.yml`).
 
+### Linting
+
+The project is linted with [staticcheck](https://staticcheck.dev/) — a Go
+linter that catches deprecated APIs, unused code, and bug patterns that
+`go vet` misses. CI blocks the release build if `staticcheck` reports any
+finding.
+
+To run the same check locally:
+
+```bash
+# One-time install (binary lands in $(go env GOPATH)/bin)
+go install honnef.co/go/tools/cmd/staticcheck@latest
+
+# Run on the project
+staticcheck ./...
+```
+
+Make sure `$(go env GOPATH)/bin` is on your `$PATH`. `staticcheck` is a
+dev tool only — it is not part of the runtime dependencies and never
+ships with the binary.
+
 ---
 
 ## Changelog
+
+### v1.0.3
+
+- Hardened `/inspect` and `/page` body decompression: the decompressed stream is now also capped at `--max-mb`, preventing zip-bomb-style payloads where a small compressed body would expand to gigabytes of memory
+- **Breaking (JSON shape):** `/inspect` and `/page` now return `headers` as `map[string][]string` (JSON arrays of values) instead of `map[string]string` (joined with `", "`). This fixes RFC 6265 §3 — multiple `Set-Cookie` headers used to be joined with `", "`, producing an unparseable string because cookie expiry dates contain literal commas (e.g. `expires=Sun, 27 Apr 2025 14:03:58 GMT`). Browser-side consumers should access values via `headers["X"][0]` for single-value or `headers["X"].join(", ")` for display. A `Array.isArray()` guard makes code compatible with both old and new format.
+- CI now runs `staticcheck ./...` on linux/amd64 before producing release binaries; any finding blocks the release
+- Code formatted with `gofmt -w` (struct alignment cleanup)
 
 ### v1.0.2
 

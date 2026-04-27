@@ -110,6 +110,20 @@ go test -v ./...
 
 Tests in `main_test.go` cover: token generation, origin validation, SSRF blocking, CORS preflight (including dynamic `Access-Control-Expose-Headers`), handler error paths (missing token, wrong origin, missing/invalid URL), successful upstream forwarding with metadata headers (`X-Upstream-Protocol`, `X-Upstream-Timing`, `X-Upstream-Content-Encoding`, `X-Upstream-Content-Length`), the `/inspect` endpoint (auth, missing URL, successful with/without body), the `/page` endpoint (auth, missing URL, method restriction, successful no-redirect, redirect chain with 301→200, `formatRawHeaders`), SSL extraction (`extractSSLInfo`, `tlsVersionName`), connection tracing (`connTrace` timing header, remote IP), the `/ping` endpoint, and the `/version` endpoint (JSON response, CORS preflight).
 
+## Linting
+
+The project is linted with [staticcheck](https://staticcheck.dev/). CI runs `staticcheck ./...` on linux/amd64 before the release build; any finding blocks the release.
+
+```bash
+# One-time install
+go install honnef.co/go/tools/cmd/staticcheck@latest
+
+# Run locally (requires $(go env GOPATH)/bin in $PATH)
+staticcheck ./...
+```
+
+`staticcheck` is a dev tool only — it is not added to `go.mod` and never ships with the binary. The stdlib-only rule applies to runtime dependencies, not to build/lint tooling.
+
 ## Conventions
 
 - Documentation language: English (README.md, code comments, identifiers)
@@ -242,6 +256,7 @@ async function inspectViaLocalProxy(targetUrl, includeBody = false) {
     }
     return response.json();
     // Returns: { status, headers, ssl, timing, ip, protocol, body? }
+    // headers ist map[string][]string (Array pro Key) — siehe "Header-Format" unten.
 }
 
 // Full Page Analysis über localproxy — Redirect-Chain + Body + SSL + Timing
@@ -260,7 +275,24 @@ async function pageFetchViaLocalProxy(targetUrl) {
     return response.json();
     // Returns: { url, finalUrl, status, httpVersion, headers, rawHeaders, html,
     //            redirectChain, ssl, timing, ip, size, transferSize, contentEncoding, error }
+    // headers ist map[string][]string (Array pro Key) — siehe "Header-Format" unten.
 }
+
+// Header-Format: ab v1.0.3 ist `headers` ein Map mit Array-Werten,
+// damit Multi-Value-Headers wie `Set-Cookie` RFC-6265-konform getrennt
+// bleiben (Komma in Cookie-Expires-Datum sonst nicht von Separator
+// unterscheidbar). Konsumieren-Pattern:
+//
+//   const ct = (data.headers["Content-Type"] || [])[0] || "";
+//   const cookies = data.headers["Set-Cookie"] || [];   // Array, jeder Cookie einzeln
+//
+// Defensive Variante (kompatibel mit altem String-Format und neuem Array):
+//
+//   function headerFirst(h, name) {
+//       const v = h[name] ?? h[name.toLowerCase()];
+//       if (v == null) return "";
+//       return Array.isArray(v) ? (v[0] ?? "") : v;
+//   }
 
 // Fetch über p.php (Standard-Modus) — bestehender Code bleibt unverändert
 async function fetchViaPhpProxy(toolPath, targetUrl, token, timestamp) {
@@ -320,6 +352,7 @@ async function testLocalProxy(address) {
 | IDN/Punycode | ✅ (idn_to_ascii) | ✅ (Go's net/http handhabt IDN nativ) | Kompatibel |
 | HTTP Header Forwarding | Teilweise (eigene Header gesetzt) | ✅ (alle safe Headers) | Kompatibel |
 | Response Header Forwarding | Nein (nur Body) | ✅ (alle safe Headers + Upstream-Metadata-Headers) | Go gibt **mehr** Infos zurück |
+| Multi-Value Response Headers (`Set-Cookie` etc.) | ✅ (curl_getinfo getrennt) | ✅ ab v1.0.3: `/inspect` und `/page` JSON liefern `headers` als `map[string][]string` (Array pro Key, RFC-6265-§3-konform). Vorher: mit `", "` joined — bei Cookie-Expires-Datum unparsbar. | **Breaking** im JSON-Shape: Frontend muss `headers["X"][0]` (single) oder `headers["X"]` (array) konsumieren — `Array.isArray()`-Guard macht beides kompatibel |
 | Concurrent Requests | ❌ (single-threaded pro PHP-Prozess) | ✅ (Goroutine pro Request, fresh connections via `DisableKeepAlives`) | Verbesserung — parallele Crawls möglich, jeder Request mit akkuratem Timing |
 | Private Network Access | Nicht nötig (same-origin) | ✅ (`Access-Control-Allow-Private-Network: true`) | Kompatibel — Chrome PNA-Preflight wird korrekt beantwortet |
 | Mixed Content (HTTPS→HTTP) | Nicht nötig (same-origin) | ✅ (kein Problem — `127.0.0.1` ist "potentially trustworthy origin") | Kompatibel |

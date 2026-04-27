@@ -41,7 +41,7 @@ import (
 )
 
 // Version is set at build time via -ldflags "-X main.Version=...".
-// Local builds show "dev"; release builds get the git tag (e.g. "v1.0.2").
+// Local builds show "dev"; release builds get the git tag (e.g. "v1.0.3").
 var Version = "dev"
 
 const (
@@ -475,14 +475,19 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 // -----------------------------------------------------------------------
 
 // inspectResponse is the JSON envelope returned by the /inspect endpoint.
+//
+// Headers preserves multi-valued response headers as JSON arrays — required
+// for RFC 6265 §3 compliant Set-Cookie handling, where joining multiple
+// values with ", " produces an unparseable string (cookie expiry dates
+// contain literal commas, indistinguishable from the join separator).
 type inspectResponse struct {
-	Status   int                    `json:"status"`
-	Headers  map[string]string      `json:"headers"`
-	SSL      *sslInfo               `json:"ssl"`
-	Timing   map[string]float64     `json:"timing"`
-	IP       string                 `json:"ip"`
-	Protocol string                 `json:"protocol"`
-	Body     string                 `json:"body,omitempty"`
+	Status   int                 `json:"status"`
+	Headers  map[string][]string `json:"headers"`
+	SSL      *sslInfo            `json:"ssl"`
+	Timing   map[string]float64  `json:"timing"`
+	IP       string              `json:"ip"`
+	Protocol string              `json:"protocol"`
+	Body     string              `json:"body,omitempty"`
 }
 
 // sslInfo holds TLS certificate details extracted from the connection.
@@ -688,17 +693,19 @@ func inspectHandler(cfg *config, client *http.Client) http.Handler {
 		// Build timing map (milliseconds as floats, 1 decimal).
 		timingMap := ct.timingMap(requestStart)
 
-		// Collect response headers as flat map.
-		hdrs := make(map[string]string, len(resp.Header))
+		// Collect response headers, preserving multi-valued headers as slices.
+		// Set-Cookie in particular MUST NOT be joined: cookie expiry dates
+		// contain literal commas, indistinguishable from a "," separator (RFC 6265 §3).
+		hdrs := make(map[string][]string, len(resp.Header))
 		for k, v := range resp.Header {
-			hdrs[k] = strings.Join(v, ", ")
+			hdrs[k] = v
 		}
 
 		// Restore the server's true Content-Encoding from the HEAD probe.
 		// The GET response may show "gzip" because we limited Accept-Encoding,
 		// but the HEAD reveals the server's actual preferred encoding (e.g. zstd, br).
 		if serverContentEncoding != "" {
-			hdrs["Content-Encoding"] = serverContentEncoding
+			hdrs["Content-Encoding"] = []string{serverContentEncoding}
 		}
 
 		// Read body if requested, decompressing based on Content-Encoding.
@@ -722,6 +729,12 @@ func inspectHandler(cfg *config, client *http.Client) http.Handler {
 				fr := flate.NewReader(bodySource)
 				defer fr.Close()
 				bodySource = fr
+			}
+
+			// Cap the decompressed stream too — guards against zip-bomb-style
+			// payloads where a small compressed body expands to gigabytes.
+			if cfg.maxResponseBytes > 0 {
+				bodySource = io.LimitReader(bodySource, cfg.maxResponseBytes)
 			}
 
 			bodyBytes, err := io.ReadAll(bodySource)
@@ -754,34 +767,39 @@ func inspectHandler(cfg *config, client *http.Client) http.Handler {
 
 // pageHop represents a single hop in the redirect chain.
 type pageHop struct {
-	Hop        int    `json:"hop"`
-	URL        string `json:"url"`
-	Status     int    `json:"status"`
+	Hop        int     `json:"hop"`
+	URL        string  `json:"url"`
+	Status     int     `json:"status"`
 	Timing     float64 `json:"timing"`
-	SSL        bool   `json:"ssl"`
-	IP         string `json:"ip"`
-	Server     string `json:"server,omitempty"`
-	RawHeaders string `json:"rawHeaders,omitempty"`
-	Error      string `json:"error,omitempty"`
+	SSL        bool    `json:"ssl"`
+	IP         string  `json:"ip"`
+	Server     string  `json:"server,omitempty"`
+	RawHeaders string  `json:"rawHeaders,omitempty"`
+	Error      string  `json:"error,omitempty"`
 }
 
 // pageResponse is the JSON envelope returned by the /page endpoint.
+//
+// Headers preserves multi-valued response headers as JSON arrays — required
+// for RFC 6265 §3 compliant Set-Cookie handling, where joining multiple
+// values with ", " produces an unparseable string (cookie expiry dates
+// contain literal commas, indistinguishable from the join separator).
 type pageResponse struct {
-	URL             string             `json:"url"`
-	FinalURL        string             `json:"finalUrl"`
-	Status          int                `json:"status"`
-	HTTPVersion     string             `json:"httpVersion"`
-	Headers         map[string]string  `json:"headers"`
-	RawHeaders      string             `json:"rawHeaders"`
-	HTML            string             `json:"html"`
-	RedirectChain   []pageHop          `json:"redirectChain"`
-	SSL             *sslInfo           `json:"ssl"`
-	Timing          map[string]float64 `json:"timing"`
-	IP              string             `json:"ip"`
-	Size            int                `json:"size"`
-	TransferSize    int                `json:"transferSize"`
-	ContentEncoding string             `json:"contentEncoding"`
-	Error           *proxyError        `json:"error"`
+	URL             string              `json:"url"`
+	FinalURL        string              `json:"finalUrl"`
+	Status          int                 `json:"status"`
+	HTTPVersion     string              `json:"httpVersion"`
+	Headers         map[string][]string `json:"headers"`
+	RawHeaders      string              `json:"rawHeaders"`
+	HTML            string              `json:"html"`
+	RedirectChain   []pageHop           `json:"redirectChain"`
+	SSL             *sslInfo            `json:"ssl"`
+	Timing          map[string]float64  `json:"timing"`
+	IP              string              `json:"ip"`
+	Size            int                 `json:"size"`
+	TransferSize    int                 `json:"transferSize"`
+	ContentEncoding string              `json:"contentEncoding"`
+	Error           *proxyError         `json:"error"`
 }
 
 // formatRawHeaders renders response headers as a raw string (one per line).
@@ -1034,12 +1052,20 @@ func pageHandler(cfg *config, client *http.Client) http.Handler {
 		}
 
 		// Decompress the raw bytes based on Content-Encoding.
+		// Cap the decompressed stream to guard against zip-bomb-style payloads
+		// where a small compressed body expands to gigabytes.
 		actualEncoding := resp.Header.Get("Content-Encoding")
 		var bodyBytes []byte
+		decompressLimited := func(r io.Reader) ([]byte, error) {
+			if cfg.maxResponseBytes > 0 {
+				return io.ReadAll(io.LimitReader(r, cfg.maxResponseBytes))
+			}
+			return io.ReadAll(r)
+		}
 		switch strings.ToLower(actualEncoding) {
 		case "gzip":
 			if gz, err := gzip.NewReader(bytes.NewReader(rawBytes)); err == nil {
-				bodyBytes, err = io.ReadAll(gz)
+				bodyBytes, err = decompressLimited(gz)
 				gz.Close()
 				if err != nil {
 					log.Printf("warn: error decompressing gzip body: %v", err)
@@ -1051,7 +1077,7 @@ func pageHandler(cfg *config, client *http.Client) http.Handler {
 			}
 		case "deflate":
 			fr := flate.NewReader(bytes.NewReader(rawBytes))
-			bodyBytes, err = io.ReadAll(fr)
+			bodyBytes, err = decompressLimited(fr)
 			fr.Close()
 			if err != nil {
 				log.Printf("warn: error decompressing deflate body: %v", err)
@@ -1067,14 +1093,16 @@ func pageHandler(cfg *config, client *http.Client) http.Handler {
 			contentEncoding = actualEncoding
 		}
 
-		// Build headers map.
-		hdrs := make(map[string]string, len(resp.Header))
+		// Build headers map, preserving multi-valued headers as slices.
+		// Set-Cookie in particular MUST NOT be joined: cookie expiry dates
+		// contain literal commas, indistinguishable from a "," separator (RFC 6265 §3).
+		hdrs := make(map[string][]string, len(resp.Header))
 		for k, v := range resp.Header {
-			hdrs[k] = strings.Join(v, ", ")
+			hdrs[k] = v
 		}
 		// Restore true Content-Encoding from HEAD probe.
 		if serverContentEncoding != "" {
-			hdrs["Content-Encoding"] = serverContentEncoding
+			hdrs["Content-Encoding"] = []string{serverContentEncoding}
 		}
 
 		// Build timing map.
@@ -1175,9 +1203,9 @@ func isOriginAllowed(origin string, allowed []string) bool {
 // privateRangeCIDRs contains CIDR blocks that must never be targeted by the proxy.
 var privateRangeCIDRs = func() []*net.IPNet {
 	cidrs := []string{
-		"0.0.0.0/8",      // RFC 1122 "this network"
+		"0.0.0.0/8", // RFC 1122 "this network"
 		"10.0.0.0/8",
-		"100.64.0.0/10",  // RFC 6598 Carrier-Grade NAT
+		"100.64.0.0/10", // RFC 6598 Carrier-Grade NAT
 		"127.0.0.0/8",
 		"169.254.0.0/16", // link-local
 		"172.16.0.0/12",
@@ -1372,13 +1400,13 @@ func main() {
 		Resolver:  resolver,
 	}
 	transport := &http.Transport{
-		DialContext: dialer.DialContext,
+		DialContext:           dialer.DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: time.Duration(*timeoutSec) * time.Second,
 		MaxIdleConns:          50,
 		IdleConnTimeout:       60 * time.Second,
 		ForceAttemptHTTP2:     true,
-		DisableKeepAlives:    true, // Fresh connection per request — accurate httptrace timing and IP.
+		DisableKeepAlives:     true, // Fresh connection per request — accurate httptrace timing and IP.
 		// TLS verification is intentionally left enabled (InsecureSkipVerify: false).
 	}
 	httpClient := &http.Client{
