@@ -59,7 +59,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.0.1  —  ready                         ║
+║              localproxy v1.0.2  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -445,8 +445,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.0.2
+git push origin v1.0.2
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -456,12 +456,28 @@ This cross-compiles binaries for all platforms and creates a GitHub Release auto
 ## Testing
 
 ```bash
-go test -v ./...
+go test -v ./...              # all tests, verbose
+go test -race ./...           # with race detector (recommended)
+go test -cover ./...          # with coverage report
 ```
+
+Tests in `main_test.go` cover token generation, origin validation, SSRF
+blocking, CORS preflight (including dynamic `Access-Control-Expose-Headers`),
+all endpoints (`/proxy`, `/inspect`, `/page`, `/ping`, `/version`), upstream
+metadata headers, SSL extraction, and connection tracing.
+
+Tests also run automatically in CI before each release build (see
+`.github/workflows/build.yml`).
 
 ---
 
 ## Changelog
+
+### v1.0.2
+
+- Built with Go 1.26.2 — includes upstream security fixes for `crypto/tls`, `crypto/x509`, `net/url`, and `net/http`
+- CI now runs `go test -race -v ./...` on linux/amd64 before producing release binaries; failed tests block the release
+- Expanded README testing section with `-race` and `-cover` examples and a summary of what `main_test.go` covers
 
 ### v1.0.1
 
