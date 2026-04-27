@@ -392,16 +392,18 @@ Folgende Punkte müssen beachtet werden, wenn der Expertenmodus in `/home/jpk/dd
 ./localproxy --origin https://www.jpkc.com --port 8765 --dns system
 ```
 
-### Dateien die in JPKCom Tools erstellt/geändert werden müssen (später, separat)
+### Integrations-Status in JPKCom Tools
 
-| Datei | Änderung |
-|---|---|
-| `tools/assets/js/tools/localproxy.js` | **Neu:** Globales JS-Modul für localproxy-Integration (Config, Ping, Fetch, UI-Helpers) |
-| `tools/.tpl/footer.php` | Script-Tag für `localproxy.js` hinzufügen |
-| `tools/.tpl/header.php` oder `nav.php` | Optionaler "Expert Mode"-Badge/Indicator |
-| `tools/seo/assets/seo.js` | `proxyFetch()` statt direktem `p.php`-Aufruf (mit Fallback) |
-| `tools/dns-ssl-redirect-url/assets/dns-ssl-redirect-url.js` | Ditto |
-| `tools/source/assets/source.js` | Ditto |
-| `tools/wysiwyg/assets/wysiwyg.js` | Ditto |
+Stand der Integration im JPKCom-Tools-Repo (`/home/jpk/ddev/jpkcom-tools/`):
+
+| Datei | Status | Bemerkung |
+|---|---|---|
+| `tools/assets/js/tools/localproxy.js` | ✅ vorhanden | Globales JS-Modul (Config, Ping, Fetch, UI-Helpers) |
+| `tools/.tpl/footer.php` | ✅ eingebunden | `<script src=".../localproxy.js">` enthalten |
+| `tools/seo/assets/seo.js` | ✅ integriert | nutzt `pageFetchViaLocalProxy()` mit p.php-Fallback; Header-Zugriffe sind durchgängig mit `Array.isArray()`-Guard für das v1.0.3-Format kompatibel |
+| `tools/dns-ssl-redirect-url/assets/dns-ssl-redirect-url.js` | ✅ integriert | analoge Logik mit Fallback |
+| `tools/source/assets/source.js` | ⏳ offen | noch direkter `p.php`-Aufruf, Expertenmodus-Path fehlt |
+| `tools/wysiwyg/assets/wysiwyg.js` | ⏳ offen | noch direkter `p.php`-Aufruf, Expertenmodus-Path fehlt |
+| `tools/.tpl/header.php` / `nav.php` Expert-Mode-Badge | (optional) | siehe Tool-spezifische UI |
 
 Keine PHP-Änderungen nötig. Alle p.php-Dateien bleiben unverändert.
