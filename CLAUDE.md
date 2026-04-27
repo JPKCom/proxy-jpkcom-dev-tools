@@ -16,7 +16,7 @@ This proxy is the **"Expertenmodus"** companion for the **JPKCom Tools** project
 
 - **Language:** Go (single-file, no external dependencies — stdlib only)
 - **Entry point:** `main.go` (contains all logic)
-- **Go version:** 1.26.0 (as specified in `go.mod` and GitHub Actions workflow)
+- **Go version:** 1.26 series — `go.mod` declares `go 1.26.0`; CI pin is `go-version: "1.26"` (auto-resolves to latest 1.26.x patch). Release builds since v1.0.2 use 1.26.2+.
 - **Module:** `github.com/jpk/localproxy` (`go.mod`)
 
 ## Build & Run
@@ -134,246 +134,31 @@ staticcheck ./...
 
 ## Integration with JPKCom Tools
 
-### Context: The Two-Proxy Architecture
+`localproxy` ist der **optionale Expertenmodus** für die JPKCom Tools — kein
+Ersatz für den bestehenden PHP-Proxy (`p.php`), sondern ein additiver Pfad
+mit automatischem Fallback. Bestehender Code bleibt 100% unverändert.
 
-The JPKCom Tools project has **two proxy layers** that coexist:
+### Two-Proxy-Architektur
 
-| | PHP-Proxy (bestehend) | Go-Proxy / localproxy (neu) |
+| | PHP-Proxy (Standard, immer aktiv) | localproxy (Expertenmodus, opt-in) |
 |---|---|---|
-| **Wo läuft er?** | Auf dem Server (DDEV lokal / Production) | Auf dem Rechner des Users |
-| **Dateien** | `tools/{tool}/p.php` + `tools/.lib/proxy.php` | Standalone Binary (`localproxy`) |
-| **Auth** | Token V2 (SHA-256, User-Agent + IP + Timestamp + Secrets) | Per-Session random Token (`X-Proxy-Token` Header) |
-| **Aufruf** | `p.php?purl=...&token=...&t=...` | `/proxy?url=...`, `/inspect?url=...`, `/page?url=...` + `X-Proxy-Token` Header |
-| **Wann genutzt?** | Standard-Modus (immer) | Expertenmodus (optional, vom User aktiviert) |
-| **Vorteil** | Keine Installation nötig, funktioniert sofort | Keine Server-Last, kein Rate-Limit, unbegrenzte Crawls |
-| **Limitierung** | Server-Ressourcen, Timeout ~15-30s, Rate-Limits | User muss Binary herunterladen und starten |
+| Wo läuft er | Server (DDEV / Production) | User-Rechner (`127.0.0.1:PORT`) |
+| Auth | Token V2 (SHA-256) | Per-Session 48-char hex via `X-Proxy-Token` Header |
+| Aufruf | `p.php?purl=...&token=...&t=...` | `/proxy`, `/inspect`, `/page` + Header |
+| Vorteil | Keine Installation | Keine Server-Last, kein Rate-Limit, größere Responses |
 
-### JPKCom Tools URLs
+### Frontend-Integration
 
-- **DDEV (lokal):** `https://jpkcom-tools.ddev.site/tools/`
-- **Produktion:** `https://www.jpkc.com/tools/`
-- **Tool-URL-Schema:** `{baseUrl}{toolName}/` (z.B. `https://www.jpkc.com/tools/seo/`)
+Die Client-Seite (Fetch-Patterns, localStorage-Layout, Error-Handling, Status-
+Tabelle pro Tool) ist im JPKCom-Tools-Repo dokumentiert:
 
-### Tools die aktuell den PHP-Proxy nutzen
+→ **[/home/jpk/ddev/jpkcom-tools/.claude/docs/INTEGRATION.md](file:///home/jpk/ddev/jpkcom-tools/.claude/docs/INTEGRATION.md)**
 
-Diese Tools haben `p.php`-Endpunkte und sind Kandidaten für die localproxy-Integration:
+Stand: SEO + DNS-SSL-Redirect ✅ integriert, Source + WYSIWYG ⏳ noch offen.
 
-| Tool | Verzeichnis | p.php Funktionen | Expertenmodus-Nutzen |
-|---|---|---|---|
-| **SEO Analyzer** | `tools/seo/` | `action=page` (Full HTML + Headers + SSL + Redirects + Timing), `action=robots` (robots.txt), `action=check-url` (HEAD mit Rate-Limit 2s) | Unbegrenzter Crawl ohne Rate-Limit, schnellere Analyse |
-| **DNS/SSL/Redirect** | `tools/dns-ssl-redirect-url/` | `?ssl=on` (SSL-Cert + Security-Headers), `?redirect=on` (Redirect-Chain hop-by-hop) | Schnellere Batch-Checks, keine Server-Last |
-| **Source Viewer** | `tools/source/` | Full HTML fetch + Meta-Analyse + Link/Image-Extraction + Keyword-Density | Größere Seiten laden, kein 950 KB Limit |
-| **WYSIWYG Editor** | `tools/wysiwyg/` | HTML-Seiten laden für TinyMCE "Insert from URL" | Größere Seiten, schnelleres Laden |
+### Empfohlene Startup-Konfiguration
 
-### Expertenmodus — Konzept
-
-Der Expertenmodus ist ein **optionaler Zusatz**, der in die JPKCom Tools integriert wird. Er ändert nichts am bestehenden Verhalten der Tools.
-
-**Aktivierungs-Flow (im Browser):**
-
-1. User klickt auf "Expertenmodus" (Toggle/Button in der Tool-UI)
-2. Es öffnet sich ein **Optionsdialog (Bootstrap Modal)** mit:
-   - Anleitung zum Download des passenden Binaries (Link zu GitHub Releases)
-   - Anleitung zum Starten (`./localproxy --origin https://www.jpkc.com`)
-   - Eingabefelder für **Proxy-Adresse** (`http://127.0.0.1:PORT`) und **Token**
-   - "Verbindung testen"-Button (ruft `/ping` auf)
-   - "Speichern"-Button (speichert in `localStorage`)
-3. Nach erfolgreicher Verbindung erscheint ein **visueller Indikator** (z.B. Badge "Expert Mode") im Tool
-4. Das Tool nutzt nun localproxy statt p.php für Requests
-
-**localStorage-Struktur:**
-```javascript
-// Key: "localproxy"
-{
-    "enabled": true,
-    "address": "http://127.0.0.1:54321",
-    "token": "a3f8c2..."
-}
-```
-
-### Wie Tools localproxy ansprechen (JavaScript)
-
-```javascript
-// Prüfen ob Expertenmodus aktiv
-function isExpertMode() {
-    try {
-        const config = JSON.parse(localStorage.getItem('localproxy') || '{}');
-        return config.enabled === true && config.address && config.token;
-    } catch { return false; }
-}
-
-// Config auslesen
-function getLocalProxyConfig() {
-    return JSON.parse(localStorage.getItem('localproxy') || '{}');
-}
-
-// Fetch über localproxy (Expertenmodus)
-// Bei Upstream-Fehlern (502/504) liefert der Proxy kategorisierte JSON-Errors:
-//   { "error": "dns_error|tls_error|connection_error|timeout|upstream_error",
-//     "message": "...", "status": 502|504 }
-async function fetchViaLocalProxy(targetUrl) {
-    const config = getLocalProxyConfig();
-    const response = await fetch(
-        `${config.address}/proxy?url=${encodeURIComponent(targetUrl)}`,
-        {
-            headers: { "X-Proxy-Token": config.token }
-        }
-    );
-    if (!response.ok) {
-        // Versuche JSON-Error zu parsen (502/504 Upstream-Fehler)
-        const contentType = response.headers.get('Content-Type') || '';
-        if (contentType.includes('application/json')) {
-            const errData = await response.json();
-            const err = new Error(errData.message);
-            err.code = errData.error;   // z.B. "dns_error", "tls_error", "timeout"
-            err.status = errData.status;
-            throw err;
-        }
-        throw new Error(`Proxy error: ${response.status}`);
-    }
-    return response;
-}
-
-// Inspect über localproxy — SSL, Timing, IP, Protocol, Headers als JSON
-// Optional mit body=1 um auch den Response-Body zu erhalten
-async function inspectViaLocalProxy(targetUrl, includeBody = false) {
-    const config = getLocalProxyConfig();
-    let inspectUrl = `${config.address}/inspect?url=${encodeURIComponent(targetUrl)}`;
-    if (includeBody) inspectUrl += '&body=1';
-    const response = await fetch(inspectUrl, {
-        headers: { "X-Proxy-Token": config.token }
-    });
-    if (!response.ok) {
-        const contentType = response.headers.get('Content-Type') || '';
-        if (contentType.includes('application/json')) {
-            const errData = await response.json();
-            const err = new Error(errData.message);
-            err.code = errData.error;
-            err.status = errData.status;
-            throw err;
-        }
-        throw new Error(`Proxy error: ${response.status}`);
-    }
-    return response.json();
-    // Returns: { status, headers, ssl, timing, ip, protocol, body? }
-    // headers ist map[string][]string (Array pro Key) — siehe "Header-Format" unten.
-}
-
-// Full Page Analysis über localproxy — Redirect-Chain + Body + SSL + Timing
-// Ersetzt die Kombination aus /proxy + /inspect + manueller Redirect-Verfolgung
-async function pageFetchViaLocalProxy(targetUrl) {
-    const config = getLocalProxyConfig();
-    const response = await fetch(
-        `${config.address}/page?url=${encodeURIComponent(targetUrl)}`,
-        {
-            headers: { "X-Proxy-Token": config.token }
-        }
-    );
-    if (!response.ok) {
-        throw new Error(`Proxy error: ${response.status}`);
-    }
-    return response.json();
-    // Returns: { url, finalUrl, status, httpVersion, headers, rawHeaders, html,
-    //            redirectChain, ssl, timing, ip, size, transferSize, contentEncoding, error }
-    // headers ist map[string][]string (Array pro Key) — siehe "Header-Format" unten.
-}
-
-// Header-Format: ab v1.0.3 ist `headers` ein Map mit Array-Werten,
-// damit Multi-Value-Headers wie `Set-Cookie` RFC-6265-konform getrennt
-// bleiben (Komma in Cookie-Expires-Datum sonst nicht von Separator
-// unterscheidbar). Konsumieren-Pattern:
-//
-//   const ct = (data.headers["Content-Type"] || [])[0] || "";
-//   const cookies = data.headers["Set-Cookie"] || [];   // Array, jeder Cookie einzeln
-//
-// Defensive Variante (kompatibel mit altem String-Format und neuem Array):
-//
-//   function headerFirst(h, name) {
-//       const v = h[name] ?? h[name.toLowerCase()];
-//       if (v == null) return "";
-//       return Array.isArray(v) ? (v[0] ?? "") : v;
-//   }
-
-// Fetch über p.php (Standard-Modus) — bestehender Code bleibt unverändert
-async function fetchViaPhpProxy(toolPath, targetUrl, token, timestamp) {
-    // ... existierender p.php-Aufruf ...
-}
-
-// Universelle Fetch-Funktion mit automatischem Fallback
-async function proxyFetch(targetUrl, phpProxyOptions) {
-    if (isExpertMode()) {
-        try {
-            return await fetchViaLocalProxy(targetUrl);
-        } catch (e) {
-            console.warn('localproxy failed, falling back to p.php:', e);
-            // Fallback auf PHP-Proxy
-        }
-    }
-    return await fetchViaPhpProxy(
-        phpProxyOptions.toolPath,
-        targetUrl,
-        phpProxyOptions.token,
-        phpProxyOptions.timestamp
-    );
-}
-```
-
-### Verbindungstest (Ping)
-
-```javascript
-async function testLocalProxy(address) {
-    try {
-        const response = await fetch(`${address}/ping`, { mode: 'cors' });
-        const text = await response.text();
-        return response.ok && text.includes('ok');
-    } catch { return false; }
-}
-```
-
-### Feature-Kompatibilität: Was localproxy unterstützt
-
-| Feature | PHP-Proxy | localproxy | Status |
-|---|---|---|---|
-| GET Requests | ✅ | ✅ | Kompatibel |
-| POST Requests | ✅ | ✅ | Kompatibel |
-| HEAD Requests | ✅ | ✅ | Kompatibel |
-| CORS Headers | Nicht nötig (same-origin) | ✅ (dynamische `Expose-Headers`-Liste aus tatsächlichen upstream Response-Headern + `X-Upstream-*`) | Kompatibel — JS kann alle Response-Headers lesen |
-| SSRF-Schutz | ✅ (URL-Prefix-Blocklist) | ✅ (DNS-Resolution + CIDR) | Go ist stärker (DNS-basiert) |
-| TLS-Verifikation | ✅ | ✅ | Kompatibel |
-| SSL-Zertifikat-Details | ✅ (CURLOPT_CERTINFO + openssl) | ✅ (`/inspect` Endpoint, `resp.TLS.PeerCertificates`) | Kompatibel — Subject, Issuer, SANs, Chain, Validity, Algorithmen, TLS-Version |
-| Connection Timing | ✅ (curl_getinfo) | ✅ (`httptrace`: DNS, TCP, SSL, TTFB, Total) | Kompatibel — via `X-Upstream-Timing` Header und `/inspect` JSON |
-| Resolved IP | ✅ (gethostbyname) | ✅ (`httptrace.ConnectDone`) | Kompatibel — via `X-Upstream-IP` Header und `/inspect` JSON |
-| HTTP-Version | ✅ (CURLINFO_HTTP_VERSION) | ✅ (`resp.Proto`, HTTP/2 via `ForceAttemptHTTP2`) | Kompatibel — via `X-Upstream-Protocol` Header und `/inspect` JSON |
-| Content-Encoding Info | ✅ (curl_getinfo) | ✅ (`X-Upstream-Content-Encoding`, `X-Upstream-Content-Length`) | Kompatibel |
-| Response-Size-Limit | ✅ (950 KB - 1 MB) | ✅ (50 MB default, konfigurierbar) | Kompatibel (Go erlaubt größere Responses) |
-| Timeout | ✅ (10-30s) | ✅ (30s default, konfigurierbar) | Kompatibel |
-| Redirect-Verfolgung | ✅ (CURLOPT_FOLLOWLOCATION) | ✅ (`/page` verfolgt Redirect-Chain serverseitig mit Timing/IP pro Hop; `/proxy` gibt 3xx zurück — Browser entscheidet selbst) | Kompatibel — `/page` liefert vollständige Redirect-Chain wie PHP-Proxy |
-| User-Agent | Chrome UA hardcoded | Forwarded from browser | Kompatibel (Browser UA wird durchgereicht) |
-| IDN/Punycode | ✅ (idn_to_ascii) | ✅ (Go's net/http handhabt IDN nativ) | Kompatibel |
-| HTTP Header Forwarding | Teilweise (eigene Header gesetzt) | ✅ (alle safe Headers) | Kompatibel |
-| Response Header Forwarding | Nein (nur Body) | ✅ (alle safe Headers + Upstream-Metadata-Headers) | Go gibt **mehr** Infos zurück |
-| Multi-Value Response Headers (`Set-Cookie` etc.) | ✅ (curl_getinfo getrennt) | ✅ ab v1.0.3: `/inspect` und `/page` JSON liefern `headers` als `map[string][]string` (Array pro Key, RFC-6265-§3-konform). Vorher: mit `", "` joined — bei Cookie-Expires-Datum unparsbar. | **Breaking** im JSON-Shape: Frontend muss `headers["X"][0]` (single) oder `headers["X"]` (array) konsumieren — `Array.isArray()`-Guard macht beides kompatibel |
-| Concurrent Requests | ❌ (single-threaded pro PHP-Prozess) | ✅ (Goroutine pro Request, fresh connections via `DisableKeepAlives`) | Verbesserung — parallele Crawls möglich, jeder Request mit akkuratem Timing |
-| Private Network Access | Nicht nötig (same-origin) | ✅ (`Access-Control-Allow-Private-Network: true`) | Kompatibel — Chrome PNA-Preflight wird korrekt beantwortet |
-| Mixed Content (HTTPS→HTTP) | Nicht nötig (same-origin) | ✅ (kein Problem — `127.0.0.1` ist "potentially trustworthy origin") | Kompatibel |
-| Brotli/zstd-Kompression | ✅ (CURLOPT_ENCODING) | ✅ (`/proxy`: transparent — Browser-Header wird durchgereicht, Browser dekomprimiert. `/inspect?body=1`: HEAD-Pre-Check mit vollem `Accept-Encoding` erkennt Server-Präferenz (zstd, br, gzip), GET mit `gzip, deflate` für dekomprimierbaren Body, HEAD-Encoding wird in Header-Map restauriert) | Kompatibel |
-| HTTP/3 (QUIC) | ❌ | ❌ (Go stdlib nur HTTP/1.1 + HTTP/2) | **Kein Problem**: Upstream fällt automatisch auf HTTP/2 zurück, kein spürbarer Unterschied. HTTP/3 bräuchte externe Library (`quic-go`), widerspricht dem stdlib-only-Prinzip |
-| DNS-Server-Wahl | ❌ (System-DNS) | ✅ (konfigurierbar, Default: Cloudflare + Google) | Verbesserung — konsistente Ergebnisse unabhängig vom System |
-| Graceful Shutdown | Nein | ✅ (SIGTERM/SIGINT) | Verbesserung |
-
-### Wichtig für die Integration in JPKCom Tools
-
-Folgende Punkte müssen beachtet werden, wenn der Expertenmodus in `/home/jpk/ddev/jpkcom-tools/` implementiert wird:
-
-1. **Bestehender Code bleibt 100% unverändert** — der Expertenmodus ist rein additiv
-2. **Fallback auf p.php** — wenn localproxy nicht erreichbar ist, wird automatisch p.php genutzt
-3. **localStorage für Konfiguration** — Proxy-Adresse und Token werden pro Browser gespeichert
-4. **Kein Server-Side-Code nötig** — die gesamte Expertenmodus-Logik ist clientseitig (JavaScript)
-5. **Origin muss konfiguriert sein** — User muss `--origin https://www.jpkc.com` (oder `https://jpkcom-tools.ddev.site` für DDEV) beim Start angeben
-6. **SEO-Tool ist der primäre Kandidat** — hat den größten Nutzen (unbegrenzte Crawls, kein 2s Rate-Limit)
-7. **Redirect-Handling** — der `/page`-Endpoint verfolgt Redirect-Chains serverseitig und liefert eine vollständige `redirectChain` mit Timing, IP, Status und Headers pro Hop. Für Tools die nur den Body brauchen (Source Viewer, WYSIWYG), gibt `/proxy` weiterhin 3xx zurück — der Browser entscheidet selbst.
-
-### Empfohlene Startup-Konfiguration für JPKCom Tools
+User startet `localproxy` mit dem Origin der jeweiligen Umgebung:
 
 ```bash
 # Produktion
@@ -382,28 +167,19 @@ Folgende Punkte müssen beachtet werden, wenn der Expertenmodus in `/home/jpk/dd
 # DDEV Entwicklung
 ./localproxy --origin https://jpkcom-tools.ddev.site --port 8765
 
-# Mehrere Origins erlauben (Entwicklung + Produktion gleichzeitig)
+# Beide Origins zugleich (Empfehlung für Entwickler)
 ./localproxy --origin "https://www.jpkc.com,https://jpkcom-tools.ddev.site" --port 8765
 
 # Mit eigenem DNS-Server (z.B. Quad9)
-./localproxy --origin https://www.jpkc.com --port 8765 --dns "9.9.9.9,1.1.1.1"
+./localproxy --origin https://www.jpkc.com --dns "9.9.9.9,1.1.1.1"
 
 # System-DNS verwenden statt Cloudflare/Google
-./localproxy --origin https://www.jpkc.com --port 8765 --dns system
+./localproxy --origin https://www.jpkc.com --dns system
 ```
 
-### Integrations-Status in JPKCom Tools
+### Wichtige Architektur-Punkte
 
-Stand der Integration im JPKCom-Tools-Repo (`/home/jpk/ddev/jpkcom-tools/`):
-
-| Datei | Status | Bemerkung |
-|---|---|---|
-| `tools/assets/js/tools/localproxy.js` | ✅ vorhanden | Globales JS-Modul (Config, Ping, Fetch, UI-Helpers) |
-| `tools/.tpl/footer.php` | ✅ eingebunden | `<script src=".../localproxy.js">` enthalten |
-| `tools/seo/assets/seo.js` | ✅ integriert | nutzt `pageFetchViaLocalProxy()` mit p.php-Fallback; Header-Zugriffe sind durchgängig mit `Array.isArray()`-Guard für das v1.0.3-Format kompatibel |
-| `tools/dns-ssl-redirect-url/assets/dns-ssl-redirect-url.js` | ✅ integriert | analoge Logik mit Fallback |
-| `tools/source/assets/source.js` | ⏳ offen | noch direkter `p.php`-Aufruf, Expertenmodus-Path fehlt |
-| `tools/wysiwyg/assets/wysiwyg.js` | ⏳ offen | noch direkter `p.php`-Aufruf, Expertenmodus-Path fehlt |
-| `tools/.tpl/header.php` / `nav.php` Expert-Mode-Badge | (optional) | siehe Tool-spezifische UI |
-
-Keine PHP-Änderungen nötig. Alle p.php-Dateien bleiben unverändert.
+- **`/page`-Endpoint** verfolgt Redirect-Chains serverseitig und liefert die komplette `redirectChain` mit Timing/IP/Status/Headers pro Hop — 1:1-Ersatz für `p.php?action=page`. Tools, die nur den Body brauchen (Source, WYSIWYG), nutzen weiterhin `/proxy` und lassen den Browser den 3xx selbst auflösen.
+- **Header-Format ab v1.0.3:** `/inspect` und `/page` liefern `headers` als `map[string][]string` (Array pro Key). Frontend-Konsumenten brauchen `Array.isArray()`-Guards oder `headers["X"][0]`-Zugriff — siehe INTEGRATION.md.
+- **localproxy ist stärker als der PHP-Proxy in:** SSRF-Schutz (DNS-basiert + CIDR statt URL-Prefix), Connection-Timing (`httptrace` für DNS/TCP/TLS/TTFB einzeln), SSL-Cert-Details (`/inspect` liefert Chain/SANs/Algorithms), Concurrent Requests (Goroutine pro Request mit fresh connections), Response-Limit (50 MB statt 950 KB), DNS-Server-Wahl (Default Cloudflare+Google statt System).
+- **Bewusste Limitation:** kein HTTP/3 (Go-stdlib-only-Prinzip — `quic-go` wäre externe Dependency). Upstream fällt automatisch auf HTTP/2 zurück.
