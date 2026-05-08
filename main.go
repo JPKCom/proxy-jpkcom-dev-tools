@@ -41,7 +41,7 @@ import (
 )
 
 // Version is set at build time via -ldflags "-X main.Version=...".
-// Local builds show "dev"; release builds get the git tag (e.g. "v1.0.3").
+// Local builds show "dev"; release builds get the git tag (e.g. "v1.0.4").
 var Version = "dev"
 
 const (

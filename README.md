@@ -59,7 +59,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.0.3  —  ready                         ║
+║              localproxy v1.0.4  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -408,16 +408,16 @@ Requires [Go 1.26+](https://go.dev/dl/). If Go is not yet installed:
 
 ```bash
 # Linux (amd64)
-wget https://go.dev/dl/go1.26.0.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.0.linux-amd64.tar.gz
-rm go1.26.0.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.26.3.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.3.linux-amd64.tar.gz
+rm go1.26.3.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc  # or ~/.zshrc
 source ~/.bashrc
 
 # macOS (Apple Silicon)
-wget https://go.dev/dl/go1.26.0.darwin-arm64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.0.darwin-arm64.tar.gz
-rm go1.26.0.darwin-arm64.tar.gz
+wget https://go.dev/dl/go1.26.3.darwin-arm64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.3.darwin-arm64.tar.gz
+rm go1.26.3.darwin-arm64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.zshrc
 source ~/.zshrc
 
@@ -445,8 +445,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.0.3
-git push origin v1.0.3
+git tag v1.0.4
+git push origin v1.0.4
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -493,6 +493,11 @@ ships with the binary.
 ---
 
 ## Changelog
+
+### v1.0.4
+
+- Built with Go 1.26.3 — picks up upstream stdlib fixes for `crypto/tls`, `crypto/x509`, `net/http`, and the runtime
+- `go.mod` toolchain directive bumped from `go 1.26.0` to `go 1.26.3`
 
 ### v1.0.3
 

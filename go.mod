@@ -1,3 +1,3 @@
 module github.com/jpk/localproxy
 
-go 1.26.0
+go 1.26.3

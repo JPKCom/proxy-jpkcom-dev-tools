@@ -16,7 +16,7 @@ This proxy is the **"Expertenmodus"** companion for the **JPKCom Tools** project
 
 - **Language:** Go (single-file, no external dependencies — stdlib only)
 - **Entry point:** `main.go` (contains all logic)
-- **Go version:** 1.26 series — `go.mod` declares `go 1.26.0`; CI pin is `go-version: "1.26"` (auto-resolves to latest 1.26.x patch). Release builds since v1.0.2 use 1.26.2+.
+- **Go version:** 1.26 series — `go.mod` declares `go 1.26.3`; CI pin is `go-version: "1.26"` (auto-resolves to latest 1.26.x patch). Release builds since v1.0.4 use 1.26.3+.
 - **Module:** `github.com/jpk/localproxy` (`go.mod`)
 
 ## Build & Run
