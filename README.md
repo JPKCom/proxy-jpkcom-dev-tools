@@ -59,13 +59,14 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.0.5  —  ready                         ║
+║              localproxy v1.1.0  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
 ╟──────────────────────────────────────────────────────────────────╢
 ║  DNS      :  1.1.1.1:53, 8.8.8.8:53                              ║
 ║  Origins  :  (all — pass --origin for production)                ║
+║  Host     :  localhost only                                      ║
 ╟──────────────────────────────────────────────────────────────────╢
 ║  License  :  GPL-2.0-or-later                                    ║
 ║  Author   :  Jean Pierre Kolb [https://www.jpkc.com/]            ║
@@ -96,13 +97,28 @@ By default, localproxy uses **Cloudflare (1.1.1.1)** and **Google (8.8.8.8)** fo
 ### All options
 
 ```
---port      int     TCP port to listen on (0 = random free port)        [default: 0]
---origin    string  Allowed origins, comma-separated
---timeout   int     Upstream request timeout in seconds                  [default: 30]
---max-mb    int64   Maximum upstream response size in MB (0 = unlimited) [default: 50]
---dns       string  DNS servers, comma-separated, or "system" for OS defaults [default: "1.1.1.1,8.8.8.8"]
---version           Print version information and exit
+--port            int     TCP port to listen on (0 = random free port)        [default: 0]
+--origin          string  Allowed origins, comma-separated
+--timeout         int     Upstream request timeout in seconds                  [default: 30]
+--max-mb          int64   Maximum upstream response size in MB (0 = unlimited) [default: 50]
+--dns             string  DNS servers, comma-separated, or "system" for OS defaults [default: "1.1.1.1,8.8.8.8"]
+--allow-any-host          Accept a non-localhost Host header (not recommended)
+--version                 Print version information and exit
 ```
+
+`--port`, `--timeout` and `--max-mb` are validated at startup; an out-of-range
+value aborts with a message instead of failing later in a confusing way.
+
+### `--allow-any-host`
+
+By default localproxy only answers requests whose `Host` header names the
+loopback interface (`127.0.0.0/8`, `localhost` or `[::1]`, with any port). This
+blocks DNS rebinding: without it, a web page can point a hostname it controls at
+`127.0.0.1` and address the proxy from your browser.
+
+You only need `--allow-any-host` if you reach the proxy under some other local
+name (for example through a container alias). Prefer `--origin` over disabling
+the check.
 
 ---
 
@@ -133,6 +149,7 @@ Every `/proxy` response includes upstream connection metadata as custom headers:
 | `X-Upstream-Timing` | `dns=12;tcp=45;ssl=23;ttfb=156;total=234` | Connection timing breakdown in milliseconds |
 | `X-Upstream-Content-Encoding` | `gzip` | Original `Content-Encoding` from upstream |
 | `X-Upstream-Content-Length` | `34567` | Transfer size in bytes (from `Content-Length` or counted for chunked responses) |
+| `X-Upstream-Truncated` | `1` | Present only when the body exceeded `--max-mb` and was cut short |
 
 All upstream response headers are readable by JavaScript — `Access-Control-Expose-Headers` is dynamically built from the actual upstream response headers plus the `X-Upstream-*` metadata headers.
 
@@ -190,6 +207,7 @@ Without `body=1`, the proxy sends a HEAD request upstream (faster, no body downl
   },
   "ip": "93.184.216.34",
   "protocol": "HTTP/2.0",
+  "http3": true,
   "body": "<html>..."
 }
 ```
@@ -201,7 +219,8 @@ Without `body=1`, the proxy sends a HEAD request upstream (faster, no body downl
 | `ssl` | object / null | TLS certificate details (`null` for HTTP targets) |
 | `timing` | object | Connection timing in milliseconds (1 decimal precision) |
 | `ip` | string | Resolved IP address of the upstream server |
-| `protocol` | string | HTTP protocol version (e.g. `HTTP/1.1`, `HTTP/2.0`) |
+| `protocol` | string | HTTP protocol version actually used for this request (e.g. `HTTP/1.1`, `HTTP/2.0`) |
+| `http3` | bool | Whether the target **advertises** HTTP/3 — see [HTTP/3 detection](#http3-detection) |
 | `body` | string | Response body (only present when `body=1` is requested) |
 
 ---
@@ -225,6 +244,7 @@ Header: X-Proxy-Token: {TOKEN}
   "finalUrl": "https://www.example.com/",
   "status": 200,
   "httpVersion": "HTTP/2.0",
+  "http3": true,
   "headers": {
     "Content-Type": "text/html; charset=utf-8",
     "Strict-Transport-Security": "max-age=31536000",
@@ -277,7 +297,8 @@ Header: X-Proxy-Token: {TOKEN}
 | `url` | string | Original input URL |
 | `finalUrl` | string | Final URL after following all redirects |
 | `status` | int | HTTP status code of the final page |
-| `httpVersion` | string | HTTP protocol version (e.g. `HTTP/2.0`) |
+| `httpVersion` | string | HTTP protocol version actually used for this request (e.g. `HTTP/2.0`) |
+| `http3` | bool | Whether the final page **advertises** HTTP/3 — see [HTTP/3 detection](#http3-detection) |
 | `headers` | object | Response headers of the final page |
 | `rawHeaders` | string | Raw headers as multi-line string |
 | `html` | string | Decompressed response body |
@@ -306,6 +327,32 @@ Header: X-Proxy-Token: {TOKEN}
 GET http://127.0.0.1:{PORT}/proxy?url={ENCODED_TARGET_URL}
 Header: X-Proxy-Token: {TOKEN}
 ```
+
+### Error responses
+
+Every error carries a JSON body and CORS headers, so the calling page can read
+it and react. The one exception is a rejected `Origin`: that response is plain
+text and deliberately carries no CORS headers, because it is not meant to be
+readable by the origin that was just turned away.
+
+```json
+{ "error": "dns_error", "message": "could not resolve hostname", "status": 502 }
+```
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `bad_request` | 400 | `url` parameter missing or not a valid http/https URL |
+| `forbidden` | 403 | Invalid or missing `X-Proxy-Token` |
+| `blocked_target` | 403 | Target resolves to a private or reserved address |
+| `method_not_allowed` | 405 | HTTP method not accepted on this endpoint |
+| `dns_error` | 502 | Hostname could not be resolved |
+| `tls_error` | 502 | Certificate expired, hostname mismatch, unknown CA, … |
+| `connection_error` | 502 | TCP connection failed |
+| `upstream_error` | 502 | Any other upstream failure |
+| `timeout` | 504 | Upstream request timed out |
+
+`message` is safe to display; full error details are logged to the proxy's
+terminal only.
 
 ### JavaScript example
 
@@ -372,15 +419,41 @@ async function testProxy(base) {
 | Measure | Details |
 |---|---|
 | **Localhost-only** | Binds exclusively to `127.0.0.1`, never to `0.0.0.0` |
-| **Session token** | 48-character cryptographic random token, regenerated on each start |
+| **Host check** | Requests must address the proxy as `127.0.0.0/8`, `localhost` or `[::1]` — blocks DNS rebinding against the proxy itself |
+| **Session token** | 48-character cryptographic random token, regenerated on each start; compared in constant time |
 | **Origin check** | Only configured origins are allowed to send requests |
-| **SSRF protection** | Target hostnames are resolved via DNS and checked against private/loopback CIDR ranges |
+| **SSRF protection** | Enforced in the dialer, after DNS resolution and before connect — see below |
+| **Credential isolation** | `Cookie`, `Authorization`, `Origin`, `Referer` and `Sec-Fetch-*` are never forwarded to the target |
 | **Configurable DNS** | Uses Cloudflare + Google DNS by default; custom servers or system DNS via `--dns` |
 | **TLS verification** | Upstream certificates are always verified |
 | **Redirect control** | Redirects are not followed automatically — the client decides |
-| **Response cap** | Maximum response size is configurable (default: 50 MB) |
-| **Hop-by-hop filter** | Proxy-internal and hop-by-hop headers are stripped |
+| **Response cap** | Maximum response size is configurable (default: 50 MB), enforced on the decompressed stream too |
+| **Bounded work** | Every upstream request hangs off the client's request context; `/page` has an overall time budget |
+| **Hop-by-hop filter** | Proxy-internal, hop-by-hop and `Connection`-listed headers are stripped |
 | **Private Network Access** | Responds with `Access-Control-Allow-Private-Network: true` for Chrome PNA preflights |
+
+### SSRF protection
+
+The check runs in the dialer's `Control` hook, which fires **after** DNS
+resolution and **before** the socket connects — so it sees the address the
+connection will actually reach.
+
+This matters because the obvious design is unsafe. Resolving the hostname up
+front and then handing the *name* to the HTTP client means the name is resolved
+twice, and an attacker-controlled zone with a short TTL can answer with a public
+address for the check and a loopback address for the connection. Checking at
+dial time leaves only one resolution to attack. It also covers every code path
+without extra plumbing: redirect hops, encoding probes and the final request all
+dial through the same transport.
+
+A hostname pre-check still runs first, purely so obvious cases fail fast with a
+clear message. It is deliberately fail-open on lookup errors; the dialer is what
+enforces the rule.
+
+Blocked ranges cover loopback, RFC 1918 private, CGNAT, link-local (including
+cloud metadata at `169.254.169.254`), multicast and reserved space, plus the
+IPv6 forms that embed an IPv4 address — IPv4-mapped (`::ffff:127.0.0.1`), NAT64
+(`64:ff9b::/96`) and 6to4 (`2002::/16`).
 
 ### HTTPS pages calling HTTP localhost
 
@@ -400,6 +473,60 @@ The proxy handles **multiple requests concurrently**. Go's `net/http` server spa
 
 **`/inspect?body=1`:** The proxy first sends a HEAD request with the browser's full `Accept-Encoding` to detect the server's preferred compression (e.g. `zstd`, `br`), then a GET with `Accept-Encoding: gzip, deflate` to obtain a body that can be decompressed with Go's stdlib. The body is decompressed before embedding it in the JSON response. The `Content-Encoding` header in the `headers` map reflects the server's true preferred encoding from the HEAD probe, so consumers accurately detect compression support.
 
+**`deflate` handling:** RFC 7230 defines the `deflate` token as zlib
+(RFC 1950), but a large share of servers actually send raw DEFLATE (RFC 1951).
+The proxy sniffs the two-byte zlib header and picks the matching decoder, so
+both forms decode correctly.
+
+**Decompression limits:** the size cap from `--max-mb` is applied to the
+decompressed stream as well as the raw one, so a small compressed body cannot
+expand into gigabytes of memory.
+
+---
+
+## HTTP/3 detection
+
+`/inspect` and `/page` report an `http3` boolean. It answers *"does this target
+support HTTP/3?"* — **not** *"was this request made over HTTP/3?"*. The latter is
+`protocol` / `httpVersion`, which will read `HTTP/2.0`.
+
+```json
+{ "protocol": "HTTP/2.0", "http3": true }
+```
+
+No QUIC stack is involved. HTTP/3 is discovered over TCP by design: a server
+advertises it with an `Alt-Svc` field on its HTTP/1.1 or HTTP/2 response
+(RFC 7838), or via a DNS HTTPS/SVCB record. There is therefore no site reachable
+only over HTTP/3, and the capability signal is already present in the responses
+this proxy receives.
+
+Only the final ALPN token `h3` (RFC 9114) counts. Draft tokens such as `h3-29`
+or `h3-Q050` are ignored — current browsers no longer negotiate them, so
+counting them would overstate what a real visitor gets. `Alt-Svc: clear` yields
+`false`.
+
+The raw `Alt-Svc` field remains available in the `headers` map if you need the
+advertised authority or `ma` (max-age) value.
+
+### Why not speak HTTP/3 upstream?
+
+Deliberate. Adding a QUIC transport (`quic-go`) would mean:
+
+- an external dependency in a project whose premise is stdlib-only, in binaries
+  users run on their own machines
+- `net/http/httptrace` does not hook the HTTP/3 transport — the DNS / TCP / TLS /
+  TTFB breakdown would go blank
+- `http.Response.TLS` is not populated the same way, so certificate details
+  would be lost
+- UDP optimisations are documented for Linux, Windows and macOS only, while the
+  release matrix also covers FreeBSD, OpenBSD and NetBSD
+
+Meanwhile the benefit is small here: every request uses a fresh connection
+(`DisableKeepAlives`, for accurate timing), so QUIC's 0-RTT resumption and
+stream multiplexing have nothing to work with. The gain would be roughly one
+round-trip per request, at the cost of the certificate and timing data that are
+the point of these endpoints.
+
 ---
 
 ## Build from source
@@ -408,16 +535,16 @@ Requires [Go 1.26+](https://go.dev/dl/). If Go is not yet installed:
 
 ```bash
 # Linux (amd64)
-wget https://go.dev/dl/go1.26.4.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.4.linux-amd64.tar.gz
-rm go1.26.4.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.26.5.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.5.linux-amd64.tar.gz
+rm go1.26.5.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc  # or ~/.zshrc
 source ~/.bashrc
 
 # macOS (Apple Silicon)
-wget https://go.dev/dl/go1.26.4.darwin-arm64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.4.darwin-arm64.tar.gz
-rm go1.26.4.darwin-arm64.tar.gz
+wget https://go.dev/dl/go1.26.5.darwin-arm64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.5.darwin-arm64.tar.gz
+rm go1.26.5.darwin-arm64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.zshrc
 source ~/.zshrc
 
@@ -461,13 +588,22 @@ go test -race ./...           # with race detector (recommended)
 go test -cover ./...          # with coverage report
 ```
 
-Tests in `main_test.go` cover token generation, origin validation, SSRF
-blocking, CORS preflight (including dynamic `Access-Control-Expose-Headers`),
-all endpoints (`/proxy`, `/inspect`, `/page`, `/ping`, `/version`), upstream
-metadata headers, SSL extraction, and connection tracing.
+Tests in `main_test.go` cover token generation and constant-time comparison,
+origin validation, the Host-header check, SSRF blocking at both the pre-check
+and the dialer (including NAT64/6to4/IPv4-mapped addresses), request-header
+filtering, CORS preflight and CORS on error responses, deflate/zlib
+decompression, response truncation, all endpoints (`/proxy`, `/inspect`,
+`/page`, `/ping`, `/version`), upstream metadata headers, SSL extraction, and
+connection tracing.
 
-Tests also run automatically in CI before each release build (see
+CI runs `gofmt`, `go vet`, `staticcheck`, `govulncheck` and `go test -race` on
+every push and pull request — not only before a release build (see
 `.github/workflows/build.yml`).
+
+```bash
+go install golang.org/x/vuln/cmd/govulncheck@latest
+govulncheck ./...             # known vulnerabilities in toolchain & stdlib
+```
 
 ### Linting
 
@@ -493,6 +629,81 @@ ships with the binary.
 ---
 
 ## Changelog
+
+### v1.1.0
+
+Security-focused release. No changes are required in client code — existing
+fields keep their meaning and only additive fields were introduced.
+
+**New**
+
+- `/inspect` and `/page` report an `http3` boolean derived from the target's
+  `Alt-Svc` field (RFC 7838, ALPN token `h3` per RFC 9114). This answers
+  "does this site support HTTP/3?" without a QUIC stack — see
+  [HTTP/3 detection](#http3-detection). Draft tokens like `h3-29` are ignored.
+
+**Security**
+
+- **SSRF is now enforced in the dialer**, after DNS resolution and before
+  connect. The previous hostname pre-check resolved the name separately from
+  the HTTP client, so an attacker-controlled zone with a short TTL could answer
+  with a public address for the check and a loopback address for the connection.
+  The pre-check remains as a fast-fail path only.
+- **Blocked ranges extended**: reserved and special-purpose IPv4 space
+  (`0/8`, `192.0.0.0/24`, `198.18/15`, multicast, `240/4`) plus the IPv6 forms
+  that embed an IPv4 address — IPv4-mapped, NAT64 (`64:ff9b::/96`) and 6to4
+  (`2002::/16`). `64:ff9b::7f00:1` reaches `127.0.0.1` on a NAT64 network and
+  was previously invisible to a v4-only check.
+- **Host-header check**: requests must address the proxy as `127.0.0.0/8`,
+  `localhost` or `[::1]`, blocking DNS rebinding against the proxy itself.
+  Override with `--allow-any-host`.
+- **Credential and identity headers are no longer forwarded** to targets:
+  `Cookie`, `Cookie2`, `Authorization`, `Proxy-Authorization`, `Origin`,
+  `Referer` and `Sec-Fetch-*`. Headers the caller sets deliberately — `Accept`,
+  `User-Agent`, `Accept-Language`, custom `X-*` — still pass through.
+- **Bounded work per request**: `/page` derives one overall time budget from the
+  client's request context. Redirect hops and encoding probes previously used
+  `context.Background()`, so a client disconnect stopped nothing and 20 slow
+  redirects could keep a handler alive for minutes.
+- **DNS lookups in the SSRF pre-check are now bounded** (5 s) instead of able to
+  hang indefinitely against a black-holed resolver.
+- **Constant-time token comparison** via `crypto/subtle`.
+- **Truncated bodies no longer break the response**: when a body exceeds
+  `--max-mb`, the upstream `Content-Length` is dropped (it would promise more
+  bytes than are delivered, aborting the connection) and `X-Upstream-Truncated: 1`
+  is set instead.
+- **Error responses are now readable by the caller**: all 4xx responses carry
+  CORS headers and a JSON body with a machine-readable code
+  (`bad_request`, `forbidden`, `blocked_target`, `method_not_allowed`). A wrong
+  token used to be indistinguishable from an unreachable proxy. Rejected origins
+  still get a bare 403 with no CORS headers, by design.
+- `X-Content-Type-Options: nosniff` on all proxy-generated responses.
+
+**Fixes & quality**
+
+- `Content-Encoding: deflate` now decodes both zlib-wrapped (RFC 1950) and raw
+  DEFLATE (RFC 1951). Only raw was handled, so zlib-wrapped bodies — which a
+  large share of servers send — came back empty or corrupt.
+- Headers named in a `Connection` header are treated as hop-by-hop (RFC 9110 §7.6.1).
+- `Vary: Origin` is now always set, not only when a CORS origin was echoed.
+- SSL info includes IP SANs, not just DNS names.
+- `--port`, `--timeout` and `--max-mb` are validated at startup; `--timeout 0`
+  previously produced an already-expired context and failed every request.
+- Upstream `Content-Length` is sanity-checked before being reported as
+  `transferSize`.
+- Shared handler preamble replaces the duplicated method/origin/token/URL/SSRF
+  blocks across the three endpoints.
+- JSON encoding errors are logged rather than silently discarded.
+
+**Build & CI**
+
+- Built with Go 1.26.5 — security fixes in `crypto/tls` (GO-2026-5856 /
+  CVE-2026-42505, ECH handshake de-anonymisation) and `os`
+- `go.mod` toolchain directive bumped from `go 1.26.4` to `go 1.26.5`
+- CI now runs on every push and pull request, not only on tags — a broken test
+  no longer surfaces first at release time
+- `govulncheck` and a `gofmt` check added to CI
+- `GITHUB_TOKEN` scoped to read-only by default; only the release job gets write
 
 ### v1.0.5
 
