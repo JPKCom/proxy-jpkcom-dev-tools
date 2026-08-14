@@ -59,7 +59,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.1.0  —  ready                         ║
+║              localproxy v1.1.1  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -535,16 +535,16 @@ Requires [Go 1.26+](https://go.dev/dl/). If Go is not yet installed:
 
 ```bash
 # Linux (amd64)
-wget https://go.dev/dl/go1.26.5.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.5.linux-amd64.tar.gz
-rm go1.26.5.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.26.6.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.6.linux-amd64.tar.gz
+rm go1.26.6.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc  # or ~/.zshrc
 source ~/.bashrc
 
 # macOS (Apple Silicon)
-wget https://go.dev/dl/go1.26.5.darwin-arm64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.5.darwin-arm64.tar.gz
-rm go1.26.5.darwin-arm64.tar.gz
+wget https://go.dev/dl/go1.26.6.darwin-arm64.tar.gz
+sudo tar -C /usr/local -xzf go1.26.6.darwin-arm64.tar.gz
+rm go1.26.6.darwin-arm64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.zshrc
 source ~/.zshrc
 
@@ -572,8 +572,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.0.5
-git push origin v1.0.5
+git tag v1.1.1
+git push origin v1.1.1
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -629,6 +629,46 @@ ships with the binary.
 ---
 
 ## Changelog
+
+### v1.1.1
+
+Toolchain-only release: no code changes, no behaviour changes, no client-side
+adjustments needed. Built with **Go 1.26.6** (2026-08-13), which carries ten
+security fixes. Four of them touch code paths this proxy actually executes:
+
+- **`encoding/asn1` — CVE-2026-33818.** `Unmarshal` had no recursion limit, so
+  a deeply nested structure could exhaust the stack. `/inspect` and `/page`
+  parse the certificate chain of whatever host the caller names, so a hostile
+  TLS server was a plausible route to crashing the proxy.
+- **`net` (vendored `dns/dnsmessage`) — CVE-2026-46600.** Parsing a malformed
+  SVCB or HTTPS record with an overflowing parameter value could panic. The
+  proxy uses the pure-Go resolver (`PreferGo: true`) against the servers given
+  via `--dns`, and the parser walks every record in a reply — not just the A/AAAA
+  answers it asked for.
+- **`net/url` — CVE-2026-56860.** `resolvePath` was quadratic in the number of
+  `..` segments. `/page` resolves each `Location` header against its base URL
+  while tracing the redirect chain, so a target server could bill the proxy for
+  the CPU time. The 20-hop limit bounded the number of resolutions but not the
+  cost of one.
+- **`net/http` — CVE-2026-56853.** `ReadHeaderTimeout` was not applied while the
+  server sniffed for an HTTP/2 preface on a new cleartext connection. The proxy
+  sets `ReadHeaderTimeout: 10s` and serves cleartext HTTP, so the gap was real —
+  though only reachable from the local machine, since the listener binds to
+  `127.0.0.1` and the Host header must be loopback.
+
+The remaining six do not apply: `encoding/xml` and `html/template` are not
+imported; `x/net/idna` (CVE-2026-39821) affects hostname normalisation, but the
+SSRF boundary sits in the dialer after resolution and cannot be steered by a
+label-parsing quirk; `crypto/tls` KeyUpdate flooding (CVE-2026-56862) targets
+TLS *servers* and the proxy is a client; the two `x/mod/sumdb` transparency-log
+issues (CVE-2026-56864, CVE-2026-56865) affect the `go` command at build time,
+not the shipped binary — relevant to CI, which now runs on the fixed toolchain.
+
+**Build & CI**
+
+- `go.mod` toolchain directive bumped from `go 1.26.5` to `go 1.26.6`
+- `govulncheck` reports no findings on the 1.26.6 toolchain
+- CI pin stays `go-version: "1.26"` and resolves to 1.26.6 automatically
 
 ### v1.1.0
 
