@@ -64,7 +64,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.2.0  —  ready                         ║
+║              localproxy v1.2.1  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -577,8 +577,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.2.1
+git push origin v1.2.1
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -641,7 +641,7 @@ toolchain. Once 2026.2 ships as stable, `@latest` works again.
 
 ## Changelog
 
-### Unreleased
+### v1.2.1
 
 **Fixed — TLS handshake failures were misreported**
 
