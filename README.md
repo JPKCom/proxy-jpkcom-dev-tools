@@ -676,8 +676,15 @@ reason to move is that Go 1.26 reaches end of life when Go 1.28 lands (~February
   reports under `ssl` are unaffected.
 - **HTTP/1 response bodies are auto-drained on `Close`**, capped at 256 KB and
   50 ms, to improve connection reuse. It runs in the transport's background read
-  loop and never blocks the handler, and it is skipped when `Content-Length`
-  exceeds 256 KB — so the `--max-mb` truncation path is untouched.
+  loop and never blocks the handler — `Close` returns in microseconds either way
+  (measured). The drain is skipped when `Content-Length` is above 256 KB, but a
+  **chunked** response reports `Content-Length: -1` and therefore passes that
+  gate: aborting a chunked body early — which is exactly what the `--max-mb`
+  truncation path does — now pulls up to ~256 KB more from the target in the
+  background before the connection is dropped. Bounded, off the critical path,
+  and invisible in the response, but it is extra upstream traffic that Go 1.26
+  did not generate. `DisableKeepAlives` does not suppress it; `ForceAttemptHTTP2`
+  keeps most HTTPS targets on h2, which never enters this loop at all.
 - **`net/http` servers cap header values at 500 per request**
   (`DefaultMaxHeaderValueCount`). Inbound hardening on the local listener only;
   no browser request comes close.
