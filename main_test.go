@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -346,6 +347,170 @@ func TestClassifyUpstreamError_Connection(t *testing.T) {
 	code, _ := classifyUpstreamError(err)
 	if code != "connection_error" {
 		t.Errorf("expected connection_error, got %q", code)
+	}
+}
+
+// A TLS handshake that fails for a non-certificate reason (version, cipher
+// suite, an alert from the peer) is still a TLS problem, not a connection
+// problem. crypto/tls delivers those alerts wrapped in a *net.OpError whose Op
+// is "remote error" or "local error", which the plain *net.OpError check would
+// otherwise report as connection_error and hide the real cause.
+
+func TestClassifyUpstreamError_TLS_RemoteAlert(t *testing.T) {
+	// Shape produced by crypto/tls when the peer sends an alert.
+	err := &net.OpError{Op: "remote error", Err: errors.New("tls: protocol version not supported")}
+	code, msg := classifyUpstreamError(err)
+	if code != "tls_error" {
+		t.Errorf("expected tls_error, got %q", code)
+	}
+	if msg == "" {
+		t.Error("expected a non-empty message")
+	}
+}
+
+func TestClassifyUpstreamError_TLS_LocalAlert(t *testing.T) {
+	err := &net.OpError{Op: "local error", Err: errors.New("tls: handshake failure")}
+	code, _ := classifyUpstreamError(err)
+	if code != "tls_error" {
+		t.Errorf("expected tls_error, got %q", code)
+	}
+}
+
+func TestClassifyUpstreamError_TLS_RecordHeader(t *testing.T) {
+	// Sent by crypto/tls when the target speaks plain HTTP on an https:// port.
+	err := tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}
+	code, _ := classifyUpstreamError(err)
+	if code != "tls_error" {
+		t.Errorf("expected tls_error, got %q", code)
+	}
+}
+
+// Guard the other direction: genuine socket failures must not be swept into
+// tls_error just because they arrive as *net.OpError.
+func TestClassifyUpstreamError_Connection_NotMistakenForTLS(t *testing.T) {
+	for _, op := range []string{"dial", "read", "write"} {
+		err := &net.OpError{Op: op, Err: errors.New("connection reset by peer")}
+		code, _ := classifyUpstreamError(err)
+		if code != "connection_error" {
+			t.Errorf("op %q: expected connection_error, got %q", op, code)
+		}
+	}
+}
+
+// The shapes above are asserted against real handshakes rather than trusted
+// from a comment — crypto/tls is free to change how it wraps these.
+func TestClassifyUpstreamError_TLS_RealHandshakeFailures(t *testing.T) {
+	tlsServer := func(cfg *tls.Config) *httptest.Server {
+		s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		s.TLS = cfg
+		s.StartTLS()
+		return s
+	}
+
+	t.Run("plain HTTP on an https port", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		defer srv.Close()
+
+		_, err := tls.Dial("tcp", srv.Listener.Addr().String(), &tls.Config{InsecureSkipVerify: true})
+		if err == nil {
+			t.Fatal("expected the handshake to fail")
+		}
+		if code, _ := classifyUpstreamError(err); code != "tls_error" {
+			t.Errorf("expected tls_error, got %q (err: %v)", code, err)
+		}
+	})
+
+	t.Run("no mutually supported protocol version", func(t *testing.T) {
+		srv := tlsServer(&tls.Config{MaxVersion: tls.VersionTLS12})
+		defer srv.Close()
+
+		_, err := tls.Dial("tcp", srv.Listener.Addr().String(),
+			&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+		if err == nil {
+			t.Fatal("expected the handshake to fail")
+		}
+		if code, _ := classifyUpstreamError(err); code != "tls_error" {
+			t.Errorf("expected tls_error, got %q (err: %v)", code, err)
+		}
+	})
+
+	t.Run("no mutually supported cipher suite", func(t *testing.T) {
+		srv := tlsServer(&tls.Config{
+			MaxVersion:   tls.VersionTLS12,
+			CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+		})
+		defer srv.Close()
+
+		_, err := tls.Dial("tcp", srv.Listener.Addr().String(), &tls.Config{
+			InsecureSkipVerify: true,
+			MaxVersion:         tls.VersionTLS12,
+			CipherSuites:       []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
+		})
+		if err == nil {
+			t.Fatal("expected the handshake to fail")
+		}
+		if code, _ := classifyUpstreamError(err); code != "tls_error" {
+			t.Errorf("expected tls_error, got %q (err: %v)", code, err)
+		}
+	})
+
+	t.Run("refused connection stays a connection error", func(t *testing.T) {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		addr := l.Addr().String()
+		l.Close()
+
+		_, err = tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+		if err == nil {
+			t.Fatal("expected the dial to fail")
+		}
+		if code, _ := classifyUpstreamError(err); code != "connection_error" {
+			t.Errorf("expected connection_error, got %q (err: %v)", code, err)
+		}
+	})
+}
+
+// crypto/tls reports most negotiation failures as a bare fmt.Errorf with no
+// type to match on — only the package-wide "tls: " message prefix. The most
+// likely one in practice is a server stuck on TLS 1.0/1.1, which modern Go
+// clients refuse outright.
+func TestClassifyUpstreamError_TLS_UntypedHandshakeError(t *testing.T) {
+	for _, leaf := range []string{
+		"tls: server selected unsupported protocol version 301",
+		"tls: no supported versions satisfy MinVersion and MaxVersion",
+		"tls: server chose an unconfigured cipher suite",
+	} {
+		err := &url.Error{Op: "Get", URL: "https://example.com/", Err: errors.New(leaf)}
+		code, _ := classifyUpstreamError(err)
+		if code != "tls_error" {
+			t.Errorf("%q: expected tls_error, got %q", leaf, code)
+		}
+	}
+}
+
+// The prefix must be read off the leaf error, not the whole chain: the outer
+// *url.Error carries the caller-supplied URL, so matching the flattened message
+// would let a crafted query string forge a TLS verdict.
+func TestClassifyUpstreamError_TLSPrefixInURLDoesNotForgeTLSError(t *testing.T) {
+	err := &url.Error{
+		Op:  "Get",
+		URL: "https://example.com/?q=tls:+something",
+		Err: errors.New("some unrelated failure"),
+	}
+	if code, _ := classifyUpstreamError(err); code != "upstream_error" {
+		t.Errorf("expected upstream_error, got %q", code)
+	}
+}
+
+// Every caller sits inside an `if err != nil`, but the function used to be
+// nil-safe and unwrapping to a leaf error must not turn that into a panic in a
+// long-running proxy.
+func TestClassifyUpstreamError_NilIsNotAPanic(t *testing.T) {
+	code, _ := classifyUpstreamError(nil)
+	if code != "upstream_error" {
+		t.Errorf("expected upstream_error, got %q", code)
 	}
 }
 

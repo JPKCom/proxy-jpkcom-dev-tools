@@ -264,13 +264,52 @@ func classifyUpstreamError(err error) (code string, message string) {
 		return "tls_error", "TLS certificate hostname mismatch"
 	}
 
-	// Connection refused / unreachable.
+	// The target answered, but not with TLS — typically a plain HTTP server
+	// behind an https:// URL.
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return "tls_error", "upstream did not respond with TLS"
+	}
+
+	// Connection refused / unreachable — but not every *net.OpError is a socket
+	// failure. crypto/tls reports handshake alerts (protocol version, cipher
+	// suite, certificate_required, …) as an *net.OpError with Op "remote error"
+	// or "local error", wrapping an unexported alert type that errors.As cannot
+	// reach. Without this split those land in connection_error and the caller
+	// cannot tell "host is down" from "TLS could not be negotiated".
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
+		if opErr.Op == "remote error" || opErr.Op == "local error" {
+			return "tls_error", "TLS handshake failed"
+		}
 		return "connection_error", "could not connect to upstream host"
 	}
 
+	// Everything else crypto/tls rejects locally is a bare fmt.Errorf carrying
+	// no type at all — the package's "tls: " message prefix is the only marker
+	// (261 such errors in Go 1.27). The one that matters here is a server still
+	// stuck on TLS 1.0/1.1: "tls: server selected unsupported protocol version
+	// 301". Read the prefix off the innermost error, never off the chain — the
+	// wrapping *url.Error carries the caller-supplied URL, so matching the
+	// flattened message would let a query string forge a TLS verdict.
+	if leaf := leafError(err); leaf != nil && strings.HasPrefix(leaf.Error(), "tls: ") {
+		return "tls_error", "TLS handshake failed"
+	}
+
 	return "upstream_error", "upstream request failed"
+}
+
+// leafError unwraps err down to the innermost error in the chain. Returns nil
+// for a nil error, so callers must nil-check before calling Error on it.
+func leafError(err error) error {
+	for err != nil {
+		next := errors.Unwrap(err)
+		if next == nil {
+			break
+		}
+		err = next
+	}
+	return err
 }
 
 // -----------------------------------------------------------------------

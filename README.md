@@ -351,7 +351,7 @@ readable by the origin that was just turned away.
 | `blocked_target` | 403 | Target resolves to a private or reserved address |
 | `method_not_allowed` | 405 | HTTP method not accepted on this endpoint |
 | `dns_error` | 502 | Hostname could not be resolved |
-| `tls_error` | 502 | Certificate expired, hostname mismatch, unknown CA, … |
+| `tls_error` | 502 | Any TLS failure: certificate (expired, hostname mismatch, unknown CA) **or** handshake (no mutually supported protocol version or cipher suite, peer alert, target not speaking TLS) |
 | `connection_error` | 502 | TCP connection failed |
 | `upstream_error` | 502 | Any other upstream failure |
 | `timeout` | 504 | Upstream request timed out |
@@ -640,6 +640,44 @@ toolchain. Once 2026.2 ships as stable, `@latest` works again.
 ---
 
 ## Changelog
+
+### Unreleased
+
+**Fixed — TLS handshake failures were misreported**
+
+`classifyUpstreamError` only recognised *certificate* problems as
+`tls_error`. Every other way a TLS handshake can fail was mislabelled, so the
+frontend could not tell "this host is unreachable" from "this host and I cannot
+agree on TLS":
+
+| Target | Before | Now |
+|---|---|---|
+| Server stuck on TLS 1.0 / 1.1 | `upstream_error` | `tls_error` |
+| No mutually supported cipher suite | `connection_error` | `tls_error` |
+| Peer alert (`handshake_failure`, `certificate_required`, …) | `connection_error` | `tls_error` |
+| Plain HTTP server behind an `https://` URL | `upstream_error` | `tls_error` |
+| Connection refused / reset, DNS, certificates | *unchanged* | *unchanged* |
+
+Two separate causes, because `errors.As` cannot see either one:
+
+- `crypto/tls` delivers peer alerts as a `*net.OpError` with `Op` set to
+  `"remote error"` or `"local error"`, wrapping the **unexported** `tls.alert`
+  type — the exported `tls.AlertError` never matches, so `Op` is the only usable
+  marker. These were being swallowed by the generic `*net.OpError` check.
+- Failures the client rejects locally are bare `fmt.Errorf` values with no type
+  whatsoever (261 of them in Go 1.27), such as
+  `tls: server selected unsupported protocol version 301`. The only marker left
+  is the package-wide `tls: ` message prefix, which is read off the *innermost*
+  error — never the flattened chain, because the wrapping `*url.Error` contains
+  the caller-supplied URL and a crafted query string could otherwise forge a TLS
+  verdict.
+
+Verified against real failing handshakes (`httptest` in the test suite, plus
+badssl.com endpoints end-to-end); certificate, DNS, SSRF and genuine socket
+errors keep their existing codes.
+
+Note this only affects the `error` **code**. HTTP status stays 502 and the
+`message` field remains display-safe, so no frontend change is required.
 
 ### v1.2.0
 

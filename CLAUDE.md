@@ -105,14 +105,17 @@ When an upstream request fails, the proxy returns a **JSON error response** with
 | `blocked_target` | 403 | Target resolves to a private or reserved address (pre-check or dialer) |
 | `method_not_allowed` | 405 | HTTP method not accepted on this endpoint |
 | `dns_error` | 502 | Hostname could not be resolved |
-| `tls_error` | 502 | TLS/SSL error (certificate expired, hostname mismatch, unknown CA, etc.) |
+| `tls_error` | 502 | Any TLS error — certificate (expired, hostname mismatch, unknown CA) or handshake (protocol version, cipher suite, peer alert, non-TLS target) |
 | `connection_error` | 502 | TCP connection failed (refused, unreachable, etc.) |
 | `upstream_error` | 502 | Any other upstream failure |
 | `timeout` | 504 | Upstream request timed out |
 
 **Key implementation details:**
-- Classification uses Go's `errors.As` to inspect the error chain (`*net.DNSError`, `*tls.CertificateVerificationError`, `x509.*` errors, `*net.OpError`)
+- Classification uses Go's `errors.As` to inspect the error chain (`*net.DNSError`, `*tls.CertificateVerificationError`, `x509.*` errors, `tls.RecordHeaderError`, `*net.OpError`)
 - `errors.Is(err, errBlockedTarget)` is checked **first** — the dialer's block arrives wrapped in a `*net.OpError` and would otherwise be misreported as `connection_error`
+- **Non-certificate TLS failures** need two extra steps, because `errors.As` alone cannot see them:
+  - `crypto/tls` reports peer alerts (protocol version, cipher suite, `certificate_required`, …) as a `*net.OpError` with `Op` `"remote error"` / `"local error"` wrapping the **unexported** `tls.alert` type. `tls.AlertError` does *not* match these — the `Op` field is the only usable marker. Without the check they fall into `connection_error`
+  - Failures the client rejects locally are bare `fmt.Errorf` values with no type at all (261 of them in Go 1.27), e.g. `tls: server selected unsupported protocol version 301` from a TLS-1.0-only server. The only marker is the package-wide `tls: ` message prefix, read via `leafError` off the **innermost** error — never off the flattened chain, since the wrapping `*url.Error` carries the caller-supplied URL and a query string could otherwise forge the verdict
 - The `message` field is safe for display — it never contains internal error details
 - **Ab v1.1.0** tragen auch 4xx-Antworten CORS-Header und einen JSON-Body. Einzige Ausnahme: abgelehnter Origin → Plaintext 403 ohne CORS (bewusst nicht für den abgewiesenen Origin lesbar)
 - Full error details are logged server-side via `log.Printf` for debugging in the terminal
@@ -126,7 +129,7 @@ go test -v ./...
 go test -race ./...    # needs CGO_ENABLED=1 and a C compiler
 ```
 
-Tests in `main_test.go` cover: token generation and constant-time comparison (`tokenValid`), origin validation, the Host-header check (`isLocalHostname`, `localhostOnly`, `--allow-any-host`), SSRF blocking at both layers — pre-check (`isPrivateHost`, literal IPs without DNS) and dialer (`isBlockedIP` incl. NAT64/6to4/IPv4-mapped, `safeDialControl`, and an end-to-end test proving the dialer blocks loopback even with the pre-check disabled) — request-header filtering (`copyRequestHeaders` strips `Cookie`/`Authorization`/`Origin`/`Referer`/`Sec-Fetch-*` while keeping `Accept`/`User-Agent`/custom `X-*`; `Connection`-listed headers dropped), CORS preflight (including dynamic `Access-Control-Expose-Headers`), CORS + JSON on all 4xx and the deliberate absence of CORS for a rejected origin, `Vary: Origin`, deflate/zlib decompression (`newDecompressor`), response truncation (`Content-Length` dropped + `X-Upstream-Truncated`), successful upstream forwarding with metadata headers, the `/inspect` endpoint (auth, missing URL, with/without body, multi-value `Set-Cookie`), the `/page` endpoint (auth, missing URL, method restriction, no-redirect, 301→200 chain, `formatRawHeaders`, `pageBudget`), SSL extraction (`extractSSLInfo` incl. IP SANs, `tlsVersionName`), connection tracing, `/ping` and `/version`.
+Tests in `main_test.go` cover: token generation and constant-time comparison (`tokenValid`), origin validation, the Host-header check (`isLocalHostname`, `localhostOnly`, `--allow-any-host`), SSRF blocking at both layers — pre-check (`isPrivateHost`, literal IPs without DNS) and dialer (`isBlockedIP` incl. NAT64/6to4/IPv4-mapped, `safeDialControl`, and an end-to-end test proving the dialer blocks loopback even with the pre-check disabled) — request-header filtering (`copyRequestHeaders` strips `Cookie`/`Authorization`/`Origin`/`Referer`/`Sec-Fetch-*` while keeping `Accept`/`User-Agent`/custom `X-*`; `Connection`-listed headers dropped), CORS preflight (including dynamic `Access-Control-Expose-Headers`), CORS + JSON on all 4xx and the deliberate absence of CORS for a rejected origin, `Vary: Origin`, deflate/zlib decompression (`newDecompressor`), response truncation (`Content-Length` dropped + `X-Upstream-Truncated`), successful upstream forwarding with metadata headers, the `/inspect` endpoint (auth, missing URL, with/without body, multi-value `Set-Cookie`), the `/page` endpoint (auth, missing URL, method restriction, no-redirect, 301→200 chain, `formatRawHeaders`, `pageBudget`), SSL extraction (`extractSSLInfo` incl. IP SANs, `tlsVersionName`), error classification (`classifyUpstreamError`: DNS, certificate errors, and — against **real** failing handshakes via `httptest` — peer alerts, protocol-version and cipher-suite mismatches, a non-TLS target, plus guards that genuine socket errors stay `connection_error` and that a `tls: ` substring in the URL cannot forge a TLS verdict), connection tracing, `/ping` and `/version`.
 
 ## Linting
 
