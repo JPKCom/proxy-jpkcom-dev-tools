@@ -38,6 +38,11 @@ Pre-built binaries for all platforms are available under **Releases** in this re
 | OpenBSD x64 | `localproxy-openbsd-amd64` |
 | NetBSD x64 | `localproxy-netbsd-amd64` |
 
+Since v1.2.0 the binaries are built with Go 1.27, which requires **macOS 13
+Ventura or later**. On macOS 12 Monterey and older, stay on
+[v1.1.1](https://github.com/JPKCom/proxy-jpkcom-dev-tools/releases/tag/v1.1.1) —
+it is functionally identical and built with Go 1.26.6.
+
 ### macOS / Linux: Make the binary executable
 
 ```bash
@@ -59,7 +64,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.1.1  —  ready                         ║
+║              localproxy v1.2.0  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -531,20 +536,20 @@ the point of these endpoints.
 
 ## Build from source
 
-Requires [Go 1.26+](https://go.dev/dl/). If Go is not yet installed:
+Requires [Go 1.27+](https://go.dev/dl/). If Go is not yet installed:
 
 ```bash
 # Linux (amd64)
-wget https://go.dev/dl/go1.26.6.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.6.linux-amd64.tar.gz
-rm go1.26.6.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.27.0.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.27.0.linux-amd64.tar.gz
+rm go1.27.0.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc  # or ~/.zshrc
 source ~/.bashrc
 
 # macOS (Apple Silicon)
-wget https://go.dev/dl/go1.26.6.darwin-arm64.tar.gz
-sudo tar -C /usr/local -xzf go1.26.6.darwin-arm64.tar.gz
-rm go1.26.6.darwin-arm64.tar.gz
+wget https://go.dev/dl/go1.27.0.darwin-arm64.tar.gz
+sudo tar -C /usr/local -xzf go1.27.0.darwin-arm64.tar.gz
+rm go1.27.0.darwin-arm64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.zshrc
 source ~/.zshrc
 
@@ -572,8 +577,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.1.1
-git push origin v1.1.1
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -616,7 +621,7 @@ To run the same check locally:
 
 ```bash
 # One-time install (binary lands in $(go env GOPATH)/bin)
-go install honnef.co/go/tools/cmd/staticcheck@latest
+go install honnef.co/go/tools/cmd/staticcheck@v0.8.0-rc.1
 
 # Run on the project
 staticcheck ./...
@@ -626,9 +631,75 @@ Make sure `$(go env GOPATH)/bin` is on your `$PATH`. `staticcheck` is a
 dev tool only — it is not part of the runtime dependencies and never
 ships with the binary.
 
+The version is pinned rather than `@latest` on purpose: the newest stable
+staticcheck (2026.1 / v0.7.0) cannot read Go 1.27 export data and aborts with
+`export data version 4 is greater than maximum supported version 2` on every
+stdlib import. 2026.2rc1 is the first build that understands the 1.27
+toolchain. Once 2026.2 ships as stable, `@latest` works again.
+
 ---
 
 ## Changelog
+
+### v1.2.0
+
+Toolchain release: the proxy moves to **Go 1.27.0** (2026-08-19). No code
+changes, no API changes, no client-side adjustments — every endpoint, field and
+error code behaves exactly as in v1.1.1.
+
+This is explicitly **not** a security release. Go 1.27.0 carries no stdlib fix
+that was not already in Go 1.26.6; the ten-CVE batch documented under v1.1.1
+shipped in both. `govulncheck` reports no findings on either toolchain. The
+reason to move is that Go 1.26 reaches end of life when Go 1.28 lands (~February
+2027), and 1.27 is where the fixes will arrive from now on.
+
+**Breaking for macOS 12 users**
+
+- Go 1.27 discontinued support for macOS 12 Monterey and older; the darwin
+  binaries now require **macOS 13 Ventura or later**. On an older macOS, stay on
+  [v1.1.1](https://github.com/JPKCom/proxy-jpkcom-dev-tools/releases/tag/v1.1.1)
+  — it is functionally identical. No other platform in the release matrix
+  changed its minimum requirement.
+
+**Behaviour changes inherited from the toolchain**
+
+- **`crypto/x509` on macOS and Windows** now honours `SSL_CERT_FILE` and
+  `SSL_CERT_DIR`. When either is set, roots are read from disk and verification
+  switches from the platform APIs to the pure-Go verifier. This is the one
+  change that can alter what `/inspect` and `/page` report about a certificate
+  chain — but only for users who have those variables exported (corporate MITM
+  proxies, Homebrew OpenSSL setups). `GODEBUG=x509sslcertoverrideplatform=0`
+  restores the old behaviour. Linux was already reading these variables.
+- **ML-DSA signature schemes** (`MLDSA44/65/87`, FIPS 204) are now advertised by
+  default in TLS 1.3 ClientHellos. Verified against TLS 1.3 and TLS 1.2-only
+  targets with no interop change; the negotiated suite and everything `/inspect`
+  reports under `ssl` are unaffected.
+- **HTTP/1 response bodies are auto-drained on `Close`**, capped at 256 KB and
+  50 ms, to improve connection reuse. It runs in the transport's background read
+  loop and never blocks the handler, and it is skipped when `Content-Length`
+  exceeds 256 KB — so the `--max-mb` truncation path is untouched.
+- **`net/http` servers cap header values at 500 per request**
+  (`DefaultMaxHeaderValueCount`). Inbound hardening on the local listener only;
+  no browser request comes close.
+- Legacy TLS escape hatches are gone for good: the `tlsrsakex`, `tls3des`,
+  `tls10server`, `tlsunsafeekm` and `x509keypairleaf` GODEBUG settings were
+  removed. All had been off by default since Go 1.22/1.23, so nothing changes in
+  practice — a target that only speaks RSA key exchange or 3DES was already
+  unreachable.
+- `encoding/json` is now backed by the v2 implementation. Output is unchanged:
+  HTML escaping, sorted map keys, `null` for nil slices and U+FFFD replacement
+  for invalid UTF-8 in header values all verified identical. Only the text of
+  internal error messages may differ, and those are never sent to the client.
+
+**Build & CI**
+
+- `go.mod` go directive bumped from `go 1.26.6` to `go 1.27.0`
+- CI pin moved from `go-version: "1.26"` to `"1.27"` in both jobs
+- `staticcheck` is now pinned to `@v0.8.0-rc.1` instead of `@latest`: the current
+  stable release (2026.1 / v0.7.0) cannot read Go 1.27 export data and aborts on
+  every stdlib import. Revert to `@latest` once 2026.2 is stable.
+- `gofmt`, `go vet`, `staticcheck`, `govulncheck` and the full test suite pass on
+  1.27.0 with no source changes
 
 ### v1.1.1
 

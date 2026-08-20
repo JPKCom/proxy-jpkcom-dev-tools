@@ -30,7 +30,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.27"
 
       - name: gofmt
         run: |
@@ -44,8 +44,13 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # Pinned instead of @latest: the newest stable staticcheck (2026.1 /
+      # v0.7.0) cannot read Go 1.27 export data and fails with "export data
+      # version 4 is greater than maximum supported version 2" on every stdlib
+      # import. 2026.2rc1 is the first build that understands the 1.27
+      # toolchain. Move back to @latest once 2026.2 ships as stable.
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.0-rc.1
 
       - name: Run staticcheck
         run: staticcheck ./...
@@ -107,7 +112,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.27"
 
       - name: Build binary
         env:

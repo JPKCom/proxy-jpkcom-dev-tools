@@ -16,7 +16,7 @@ This proxy is the **"Expertenmodus"** companion for the **JPKCom Tools** project
 
 - **Language:** Go (single-file, no external dependencies — stdlib only)
 - **Entry point:** `main.go` (contains all logic)
-- **Go version:** 1.26 series — `go.mod` declares `go 1.26.6`; CI pin is `go-version: "1.26"` (auto-resolves to latest 1.26.x patch). Release builds since v1.1.1 use 1.26.6+.
+- **Go version:** 1.27 series — `go.mod` declares `go 1.27.0`; CI pin is `go-version: "1.27"` (auto-resolves to latest 1.27.x patch). Release builds since v1.2.0 use 1.27.0+. Building with 1.27 raises the macOS floor for the darwin binaries to **macOS 13 Ventura**.
 - **Module:** `github.com/jpk/localproxy` (`go.mod`)
 
 ## Build & Run
@@ -133,8 +133,10 @@ Tests in `main_test.go` cover: token generation and constant-time comparison (`t
 The project is linted with [staticcheck](https://staticcheck.dev/). CI runs `staticcheck ./...` on linux/amd64 before the release build; any finding blocks the release.
 
 ```bash
-# One-time install
-go install honnef.co/go/tools/cmd/staticcheck@latest
+# One-time install — pinned, not @latest: staticcheck 2026.1 (v0.7.0) cannot
+# read Go 1.27 export data ("export data version 4 is greater than maximum
+# supported version 2"). 2026.2rc1 is the first build that handles 1.27.
+go install honnef.co/go/tools/cmd/staticcheck@v0.8.0-rc.1
 
 # Run locally (requires $(go env GOPATH)/bin in $PATH)
 staticcheck ./...
