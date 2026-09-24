@@ -64,7 +64,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.2.1  —  ready                         ║
+║              localproxy v1.2.2  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -540,16 +540,16 @@ Requires [Go 1.27+](https://go.dev/dl/). If Go is not yet installed:
 
 ```bash
 # Linux (amd64)
-wget https://go.dev/dl/go1.27.0.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.27.0.linux-amd64.tar.gz
-rm go1.27.0.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.27.1.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.27.1.linux-amd64.tar.gz
+rm go1.27.1.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc  # or ~/.zshrc
 source ~/.bashrc
 
 # macOS (Apple Silicon)
-wget https://go.dev/dl/go1.27.0.darwin-arm64.tar.gz
-sudo tar -C /usr/local -xzf go1.27.0.darwin-arm64.tar.gz
-rm go1.27.0.darwin-arm64.tar.gz
+wget https://go.dev/dl/go1.27.1.darwin-arm64.tar.gz
+sudo tar -C /usr/local -xzf go1.27.1.darwin-arm64.tar.gz
+rm go1.27.1.darwin-arm64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.zshrc
 source ~/.zshrc
 
@@ -577,8 +577,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.2.1
-git push origin v1.2.1
+git tag v1.2.2
+git push origin v1.2.2
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -640,6 +640,39 @@ toolchain. Once 2026.2 ships as stable, `@latest` works again.
 ---
 
 ## Changelog
+
+### v1.2.2
+
+Toolchain-only release: no code changes, no behaviour changes, no client-side
+adjustments needed. Built with **Go 1.27.1** (2026-09-01), a regular bug-fix
+point release — explicitly **not** a security release, it carries no CVE fix.
+The move keeps the binaries on the current patch level of the 1.27 series.
+
+Of the twelve backported fixes, three touch packages the proxy imports; none of
+them has an observable effect on it:
+
+- **`net/http` — Go issue #81027.** Since 1.27.0, `Request.Body.Close` on the
+  server side returned `io.EOF` instead of `nil` when a handler left part of the
+  body unread (a refactor dropped the line that cleared it). `/proxy` hands the
+  incoming POST body to the upstream request, and the transport closes it
+  without checking that error on its failure paths — so the regression was
+  invisible here. Fixed nonetheless.
+- **`encoding/json` — Go issues #81083 and #81012.** A quoted `null` was
+  rejected for fields tagged `,string`, and `Decoder.Token` lost
+  `io.ErrUnexpectedEOF` after the move to the v2 backend. Both are decoding
+  paths; the proxy only *encodes* JSON, and uses neither `,string` tags nor
+  `Decoder.Token`.
+
+The rest does not apply: `database/sql`, `debug/elf` and `simd` are not
+imported; the compiler fixes cover generic methods on alias receivers and
+s390x/arm64 SIMD code generation, and the `go fix` fixes touch a build-time
+tool only.
+
+**Build & CI**
+
+- `go.mod` go directive bumped from `go 1.27.0` to `go 1.27.1`
+- `govulncheck` reports no findings on the 1.27.1 toolchain
+- CI pin stays `go-version: "1.27"` and resolves to 1.27.1 automatically
 
 ### v1.2.1
 
