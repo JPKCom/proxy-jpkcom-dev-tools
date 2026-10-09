@@ -64,7 +64,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.2.2  —  ready                         ║
+║              localproxy v1.2.3  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -540,16 +540,16 @@ Requires [Go 1.27+](https://go.dev/dl/). If Go is not yet installed:
 
 ```bash
 # Linux (amd64)
-wget https://go.dev/dl/go1.27.1.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.27.1.linux-amd64.tar.gz
-rm go1.27.1.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.27.2.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.27.2.linux-amd64.tar.gz
+rm go1.27.2.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc  # or ~/.zshrc
 source ~/.bashrc
 
 # macOS (Apple Silicon)
-wget https://go.dev/dl/go1.27.1.darwin-arm64.tar.gz
-sudo tar -C /usr/local -xzf go1.27.1.darwin-arm64.tar.gz
-rm go1.27.1.darwin-arm64.tar.gz
+wget https://go.dev/dl/go1.27.2.darwin-arm64.tar.gz
+sudo tar -C /usr/local -xzf go1.27.2.darwin-arm64.tar.gz
+rm go1.27.2.darwin-arm64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.zshrc
 source ~/.zshrc
 
@@ -577,8 +577,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.2.2
-git push origin v1.2.2
+git tag v1.2.3
+git push origin v1.2.3
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -620,8 +620,11 @@ finding.
 To run the same check locally:
 
 ```bash
-# One-time install (binary lands in $(go env GOPATH)/bin)
-go install honnef.co/go/tools/cmd/staticcheck@v0.8.0-rc.1
+# One-time install (binary lands in $(go env GOPATH)/bin), built in a
+# throwaway module so golang.org/x/tools can be raised — see below
+d=$(mktemp -d) && cd "$d" && go mod init staticcheck-build \
+  && go get honnef.co/go/tools/cmd/staticcheck@v0.8.1 golang.org/x/tools@v0.51.0 \
+  && go install honnef.co/go/tools/cmd/staticcheck && cd - && rm -rf "$d"
 
 # Run on the project
 staticcheck ./...
@@ -631,15 +634,82 @@ Make sure `$(go env GOPATH)/bin` is on your `$PATH`. `staticcheck` is a
 dev tool only — it is not part of the runtime dependencies and never
 ships with the binary.
 
-The version is pinned rather than `@latest` on purpose: the newest stable
-staticcheck (2026.1 / v0.7.0) cannot read Go 1.27 export data and aborts with
-`export data version 4 is greater than maximum supported version 2` on every
-stdlib import. 2026.2rc1 is the first build that understands the 1.27
-toolchain. Once 2026.2 ships as stable, `@latest` works again.
+A plain `go install honnef.co/go/tools/cmd/staticcheck@v0.8.1` is not enough
+on Go 1.27.2: that toolchain writes export data version 5, while staticcheck
+v0.8.1 (2026.2.1) still requires `golang.org/x/tools` v0.44, which reads only up
+to version 4 and aborts with `export data version 5 is greater than maximum
+supported version 4` on every stdlib import. `golang.org/x/tools` v0.51.0 reads
+version 5, but `go install pkg@version` cannot override a dependency, hence the
+throwaway module. CI uses the same recipe. Once a staticcheck release requires
+x/tools v0.51.0 or newer, a plain `go install` works again.
 
 ---
 
 ## Changelog
+
+### v1.2.3
+
+**Security release.** Toolchain-only: no changes to `main.go` or `main_test.go`,
+no client-side adjustments needed. Built with **Go 1.27.2** (2026-10-08), which
+carries security fixes to the `go` command and to `crypto/tls`, `html/template`,
+`net/http`, `net/textproto` and `os`. Every v1.2.x binary built with Go 1.27.0
+or 1.27.1 is affected — please update.
+
+`govulncheck` against the 1.27.1 standard library reports nine advisories whose
+symbols this binary reaches, plus four in imported packages that the code does
+not call. With 1.27.2 it reports none. Reachable symbols do not mean every one
+of them can be triggered against the proxy. Assessed against its actual setup —
+an HTTP/1-only server on loopback, and an HTTP/2-capable client to arbitrary,
+user-supplied targets:
+
+**Relevant — the proxy is the HTTP/2 client of a potentially hostile target**
+
+- **GO-2026-6610 / CVE-2026-78660 — HTTP/2 transport accepted malformed
+  framing-related headers.** An HTTP/2 response could carry malformed
+  framing-related headers such as `Content-Length`. `/proxy` forwards the
+  target's `Content-Length` to the browser over HTTP/1, which is exactly the
+  response-smuggling pattern the advisory describes for proxies.
+  (`Transfer-Encoding` was already stripped as a hop-by-hop header.) With 1.27.2
+  such a response fails as an upstream error and is no longer passed through.
+- **GO-2026-6611 / CVE-2026-78669 — CPU exhaustion from repeated
+  `SETTINGS_INITIAL_WINDOW_SIZE` changes.** This affects HTTP/2 clients as well as
+  servers. A malicious target could keep the proxy busy for the length of a
+  request. The per-request timeout limited this; it is now fixed outright.
+
+**Reachable in the call graph, not exploitable in this setup**
+
+- **HTTP/2 server issues** — GO-2026-6617 (HPACK encoder race → crash),
+  GO-2026-6612 (double flow-control refund), GO-2026-6603 (memory exhaustion via
+  `Trailer`). The proxy serves plain HTTP on `127.0.0.1` without TLS and does not
+  enable unencrypted HTTP/2, so its server never speaks HTTP/2.
+- **CONNECT desync** — GO-2026-6613 (server, 2xx to CONNECT) and GO-2026-6605
+  (client, CONNECT with a body). The proxy rejects CONNECT with 405 and never
+  sends it upstream; only GET, HEAD and POST are accepted.
+- **GO-2026-6607 — ECH outer extensions (`crypto/tls`)**: server-side
+  ClientHello decoding. The proxy is only ever a TLS client.
+- **GO-2026-6608 — MIME header memory limit (`net/textproto`)**: triggered by
+  multipart form parsing, which the proxy does not do. `net/textproto` also sits
+  in the HTTP/1 header path, so the fix applies there too.
+
+**Not reached** — GO-2026-6609 (`Range` parsing in `ServeContent`/`ServeFile`),
+GO-2026-6604 (`os.Root` junctions, Windows), GO-2026-6599 and GO-2026-6600
+(`html/template`). The `go` command fix affects building only. CI builds this
+repository's own stdlib-only code and fetches no third-party modules into the
+binary.
+
+**Build & CI**
+
+- `go.mod` go directive bumped from `go 1.27.1` to `go 1.27.2`
+- `govulncheck` reports no findings on the 1.27.2 toolchain (nine reachable
+  advisories on 1.27.1)
+- CI pin stays `go-version: "1.27"` and resolves to 1.27.2 automatically
+- **staticcheck build fixed for Go 1.27.2.** The toolchain writes export data
+  version 5, and staticcheck v0.8.1 still pins `golang.org/x/tools` v0.44, which
+  stops at version 4. Without this fix the `verify` job fails on every push. CI
+  now builds staticcheck v0.8.1 in a throwaway module against `golang.org/x/tools`
+  v0.51.0 (replacing the `v0.8.0-rc.1` pin). See [Linting](#linting).
+- `gofmt`, `go vet`, `staticcheck`, `go test -race` and cross-compilation for
+  all release targets pass on Go 1.27.2
 
 ### v1.2.2
 

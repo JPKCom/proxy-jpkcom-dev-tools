@@ -44,13 +44,21 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      # Pinned instead of @latest: the newest stable staticcheck (2026.1 /
-      # v0.7.0) cannot read Go 1.27 export data and fails with "export data
-      # version 4 is greater than maximum supported version 2" on every stdlib
-      # import. 2026.2rc1 is the first build that understands the 1.27
-      # toolchain. Move back to @latest once 2026.2 ships as stable.
+      # Built in a throwaway module instead of `go install ...@version`:
+      # Go 1.27.2 writes export data version 5, and staticcheck v0.8.1 still
+      # requires golang.org/x/tools v0.44, which only reads up to version 4
+      # ("export data version 5 is greater than maximum supported version 4"
+      # on every stdlib import). x/tools v0.51.0 reads version 5. `go install`
+      # cannot override a dependency version, so pin both here. Go back to a
+      # plain `go install honnef.co/go/tools/cmd/staticcheck@<version>` once
+      # a staticcheck release requires x/tools v0.51.0 or newer.
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.0-rc.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/staticcheck-build"
+          cd "$RUNNER_TEMP/staticcheck-build"
+          go mod init staticcheck-build
+          go get honnef.co/go/tools/cmd/staticcheck@v0.8.1 golang.org/x/tools@v0.51.0
+          go install honnef.co/go/tools/cmd/staticcheck
 
       - name: Run staticcheck
         run: staticcheck ./...
