@@ -16,7 +16,7 @@ This proxy is the **"Expertenmodus"** companion for the **JPKCom Tools** project
 
 - **Language:** Go (single-file, no external dependencies — stdlib only)
 - **Entry point:** `main.go` (contains all logic)
-- **Go version:** 1.27 series — `go.mod` declares `go 1.27.2`; CI pin is `go-version: "1.27"` (auto-resolves to latest 1.27.x patch). Release builds since v1.2.3 use 1.27.2+ (security release). Building with 1.27 raises the macOS floor for the darwin binaries to **macOS 13 Ventura**.
+- **Go version:** 1.27 series — `go.mod` declares `go 1.27.3`; CI pin is `go-version: "1.27"` (auto-resolves to latest 1.27.x patch). Release builds since v1.2.4 use 1.27.3+ (security release, `crypto/x509` distrust). Building with 1.27 raises the macOS floor for the darwin binaries to **macOS 13 Ventura**.
 - **Module:** `github.com/jpk/localproxy` (`go.mod`)
 
 ## Build & Run

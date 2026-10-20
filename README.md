@@ -64,7 +64,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.2.3  —  ready                         ║
+║              localproxy v1.2.4  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -540,16 +540,16 @@ Requires [Go 1.27+](https://go.dev/dl/). If Go is not yet installed:
 
 ```bash
 # Linux (amd64)
-wget https://go.dev/dl/go1.27.2.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.27.2.linux-amd64.tar.gz
-rm go1.27.2.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.27.3.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.27.3.linux-amd64.tar.gz
+rm go1.27.3.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc  # or ~/.zshrc
 source ~/.bashrc
 
 # macOS (Apple Silicon)
-wget https://go.dev/dl/go1.27.2.darwin-arm64.tar.gz
-sudo tar -C /usr/local -xzf go1.27.2.darwin-arm64.tar.gz
-rm go1.27.2.darwin-arm64.tar.gz
+wget https://go.dev/dl/go1.27.3.darwin-arm64.tar.gz
+sudo tar -C /usr/local -xzf go1.27.3.darwin-arm64.tar.gz
+rm go1.27.3.darwin-arm64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.zshrc
 source ~/.zshrc
 
@@ -577,8 +577,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.2.3
-git push origin v1.2.3
+git tag v1.2.4
+git push origin v1.2.4
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -635,7 +635,7 @@ dev tool only — it is not part of the runtime dependencies and never
 ships with the binary.
 
 A plain `go install honnef.co/go/tools/cmd/staticcheck@v0.8.1` is not enough
-on Go 1.27.2: that toolchain writes export data version 5, while staticcheck
+on Go 1.27.2 and later: these toolchains write export data version 5, while staticcheck
 v0.8.1 (2026.2.1) still requires `golang.org/x/tools` v0.44, which reads only up
 to version 4 and aborts with `export data version 5 is greater than maximum
 supported version 4` on every stdlib import. `golang.org/x/tools` v0.51.0 reads
@@ -646,6 +646,44 @@ x/tools v0.51.0 or newer, a plain `go install` works again.
 ---
 
 ## Changelog
+
+### v1.2.4
+
+**Security release.** Toolchain-only: no changes to `main.go` or `main_test.go`,
+no client-side adjustments needed. Built with **Go 1.27.3** (2026-10-19), an
+[URGENT-track](https://go.dev/doc/security/policy#urgent) release with a single
+security fix to `crypto/x509`. Every earlier binary is affected — please update.
+
+**CVE-2026-111943 — distrusted intermediate certificates
+([go.dev/issue/82345](https://go.dev/issue/82345)).** Go now blocks trust in a
+small set of intermediate CA certificates "due to specific security concerns
+around their operation". `Certificate.Verify` drops every chain that contains
+one of them, matched by the SHA-256 hash of the certificate's public key (SPKI).
+The filter applies on every platform: the pure-Go verifier (Linux, BSD) and the
+macOS and Windows platform verifiers alike.
+
+**Relevant — the proxy verifies the certificate of every target.** TLS
+verification is always on, so all three endpoints (`/proxy`, `/inspect`,
+`/page`) rely on `crypto/x509` to decide whether a target is trustworthy. Before
+this release, a certificate issued through one of these intermediates was
+accepted as valid. `/inspect` and `/page` also reported it as valid in their SSL
+details. Now the handshake fails and the client gets a `tls_error`
+(`x509.CertificateInvalidError` → "TLS certificate invalid"). The error format
+is unchanged.
+
+`govulncheck` does not flag this yet: at release time the Go vulnerability
+database had no entry for CVE-2026-111943, so the scan is clean on 1.27.2 and
+1.27.3 alike. The upgrade follows the Go team's announcement, not a scanner
+finding.
+
+**Build & CI**
+
+- `go.mod` go directive bumped from `go 1.27.2` to `go 1.27.3`
+- CI pin stays `go-version: "1.27"` and resolves to 1.27.3 automatically
+- The staticcheck recipe (v0.8.1 against `golang.org/x/tools` v0.51.0) works
+  unchanged on 1.27.3
+- `gofmt`, `go vet`, `staticcheck`, `govulncheck`, `go test -race` and
+  cross-compilation for all release targets pass on Go 1.27.3
 
 ### v1.2.3
 
