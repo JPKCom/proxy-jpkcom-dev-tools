@@ -3,22 +3,42 @@ package main
 import (
 	"bytes"
 	"compress/flate"
+	"compress/gzip"
 	"compress/zlib"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // -----------------------------------------------------------------------
@@ -920,14 +940,14 @@ func TestInspect_MultiValueSetCookie(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestExtractSSLInfo_Nil(t *testing.T) {
-	if info := extractSSLInfo(nil); info != nil {
+	if info := extractSSLInfo(nil, ""); info != nil {
 		t.Error("expected nil for nil TLS state")
 	}
 }
 
 func TestExtractSSLInfo_NoCerts(t *testing.T) {
 	state := &tls.ConnectionState{}
-	if info := extractSSLInfo(state); info != nil {
+	if info := extractSSLInfo(state, ""); info != nil {
 		t.Error("expected nil for empty PeerCertificates")
 	}
 }
@@ -1714,6 +1734,93 @@ func TestProxy_UntruncatedBodyKeepsContentLength(t *testing.T) {
 	}
 }
 
+// A compressed body without Content-Length (chunked) is buffered before the
+// headers go out, so a cut there must be announced too — unlike the plain
+// chunked stream, whose headers are already sent when the cap hits.
+func TestProxy_TruncatedCompressedChunked(t *testing.T) {
+	var page strings.Builder
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&page, "<p>paragraph %d</p>", i)
+	}
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte(page.String()))
+	zw.Close()
+	compressed := gz.Bytes()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush() // no Content-Length: chunked
+		w.Write(compressed)
+	}))
+	defer upstream.Close()
+
+	run := func(t *testing.T, limit int64) *httptest.ResponseRecorder {
+		t.Helper()
+		cfg := newTestConfig()
+		cfg.ssrfCheck = func(string) bool { return false }
+		cfg.maxResponseBytes = limit
+		req := httptest.NewRequest(http.MethodGet, "/proxy?url="+upstream.URL, nil)
+		req.Header.Set("Origin", "https://test.example.com")
+		req.Header.Set("X-Proxy-Token", cfg.sessionToken)
+		// Keeps Go's transport from decompressing transparently.
+		req.Header.Set("Accept-Encoding", "gzip")
+		rr := httptest.NewRecorder()
+		proxyHandler(cfg, &http.Client{Timeout: 5 * time.Second}).ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+		if got := rr.Header().Get("X-Upstream-Content-Encoding"); got != "gzip" {
+			t.Fatalf("upstream was not compressed: X-Upstream-Content-Encoding=%q", got)
+		}
+		if got := rr.Header().Get("Content-Length"); got != "" {
+			t.Errorf("no Content-Length expected in the buffered branch, got %q", got)
+		}
+		return rr
+	}
+
+	t.Run("over the cap", func(t *testing.T) {
+		const limit = 1000
+		if len(compressed) <= limit {
+			t.Fatalf("test body too small: %d bytes", len(compressed))
+		}
+		rr := run(t, limit)
+		if got := rr.Header().Get("X-Upstream-Truncated"); got != "1" {
+			t.Errorf("expected X-Upstream-Truncated: 1, got %q", got)
+		}
+		if rr.Body.Len() != limit || !bytes.Equal(rr.Body.Bytes(), compressed[:limit]) {
+			t.Errorf("expected the first %d compressed bytes, got %d bytes", limit, rr.Body.Len())
+		}
+		if got := rr.Header().Get("X-Upstream-Content-Length"); got != fmt.Sprintf("%d", limit) {
+			t.Errorf("X-Upstream-Content-Length = %q", got)
+		}
+	})
+
+	t.Run("under the cap", func(t *testing.T) {
+		rr := run(t, int64(len(compressed))+1)
+		if got := rr.Header().Get("X-Upstream-Truncated"); got != "" {
+			t.Errorf("did not expect a truncation marker, got %q", got)
+		}
+		if !bytes.Equal(rr.Body.Bytes(), compressed) {
+			t.Errorf("body differs: got %d bytes, want %d", rr.Body.Len(), len(compressed))
+		}
+		if got := rr.Header().Get("X-Upstream-Content-Length"); got != fmt.Sprintf("%d", len(compressed)) {
+			t.Errorf("X-Upstream-Content-Length = %q, want %d", got, len(compressed))
+		}
+	})
+
+	t.Run("exactly the cap", func(t *testing.T) {
+		rr := run(t, int64(len(compressed)))
+		if got := rr.Header().Get("X-Upstream-Truncated"); got != "" {
+			t.Errorf("a body of exactly the cap is not truncated, got %q", got)
+		}
+		if !bytes.Equal(rr.Body.Bytes(), compressed) {
+			t.Errorf("body differs: got %d bytes, want %d", rr.Body.Len(), len(compressed))
+		}
+	})
+}
+
 // -----------------------------------------------------------------------
 // /page time budget (S3)
 // -----------------------------------------------------------------------
@@ -1746,7 +1853,7 @@ func TestExtractSSLInfo_IncludesIPSANs(t *testing.T) {
 		PeerCertificates: []*x509.Certificate{cert},
 	}
 
-	info := extractSSLInfo(state)
+	info := extractSSLInfo(state, "")
 	if info == nil {
 		t.Fatal("expected SSL info")
 	}
@@ -1937,4 +2044,2583 @@ func TestPage_ReportsHTTP3(t *testing.T) {
 	if strings.Contains(result.HTTPVersion, "3") {
 		t.Errorf("httpVersion should still report the transport actually used, got %q", result.HTTPVersion)
 	}
+}
+
+// =======================================================================
+// v1.3.0 — certificate report, TLS diagnosis, /inspect additions
+// =======================================================================
+
+// -----------------------------------------------------------------------
+// Test PKI helpers
+// -----------------------------------------------------------------------
+
+// certOpts describes a test certificate. Zero values get sensible defaults:
+// valid from an hour ago for 90 days, a P-256 key, a random serial.
+type certOpts struct {
+	cn, org             string
+	extraNames          []pkix.AttributeTypeAndValue // full subject in DER order; overrides cn/org
+	dns                 []string
+	ips                 []net.IP
+	notBefore, notAfter time.Time
+	isCA                bool
+	key                 string // "rsa2048", "rsa1024", "p256" (default), "p384", "ed25519"
+	sigAlg              x509.SignatureAlgorithm
+	serial              *big.Int
+}
+
+var (
+	testKeysMu sync.Mutex
+	testKeys   = map[string]crypto.Signer{}
+)
+
+// testKey returns a cached key of the given kind. slot keeps keys of different
+// certificates apart — two certificates sharing a key would make a wrong
+// issuer look like a valid signer.
+func testKey(t *testing.T, kind, slot string) crypto.Signer {
+	t.Helper()
+	testKeysMu.Lock()
+	defer testKeysMu.Unlock()
+	if k, ok := testKeys[kind+"/"+slot]; ok {
+		return k
+	}
+	var (
+		k   crypto.Signer
+		err error
+	)
+	switch kind {
+	case "rsa2048":
+		k, err = rsa.GenerateKey(rand.Reader, 2048)
+	case "rsa1024":
+		k, err = rsa.GenerateKey(rand.Reader, 1024)
+	case "p384":
+		k, err = ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	case "ed25519":
+		_, k, err = ed25519.GenerateKey(rand.Reader)
+	default:
+		k, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	}
+	if err != nil {
+		t.Fatalf("generate %s key: %v", kind, err)
+	}
+	testKeys[kind+"/"+slot] = k
+	return k
+}
+
+// newCert creates a certificate signed by parent/parentKey, or self-signed
+// when parent is nil. Returns the parsed certificate, its key and the DER.
+func newCert(t *testing.T, o certOpts, parent *x509.Certificate, parentKey crypto.Signer) (*x509.Certificate, crypto.Signer, []byte) {
+	t.Helper()
+	slot := o.cn + "|" + o.org
+	if len(o.extraNames) > 0 {
+		slot = fmt.Sprint(o.extraNames)
+	}
+	key := testKey(t, o.key, slot)
+
+	if o.notBefore.IsZero() {
+		o.notBefore = time.Now().Add(-time.Hour)
+	}
+	if o.notAfter.IsZero() {
+		o.notAfter = time.Now().Add(90 * 24 * time.Hour)
+	}
+	if o.serial == nil {
+		o.serial, _ = rand.Int(rand.Reader, big.NewInt(1<<62))
+	}
+	subject := pkix.Name{CommonName: o.cn}
+	if o.org != "" {
+		subject.Organization = []string{o.org}
+	}
+	if len(o.extraNames) > 0 {
+		subject = pkix.Name{ExtraNames: o.extraNames}
+	}
+
+	tpl := &x509.Certificate{
+		SerialNumber:          o.serial,
+		Subject:               subject,
+		NotBefore:             o.notBefore,
+		NotAfter:              o.notAfter,
+		DNSNames:              o.dns,
+		IPAddresses:           o.ips,
+		SignatureAlgorithm:    o.sigAlg,
+		BasicConstraintsValid: true,
+		IsCA:                  o.isCA,
+	}
+	if o.isCA {
+		tpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature
+	} else {
+		tpl.KeyUsage = x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
+		tpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
+
+	signer, issuer := key, tpl
+	if parent != nil {
+		signer, issuer = parentKey, parent
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, issuer, key.Public(), signer)
+	if err != nil {
+		t.Fatalf("create certificate %q: %v", o.cn, err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate %q: %v", o.cn, err)
+	}
+	return cert, key, der
+}
+
+// testPKI is a root CA and an intermediate signed by it.
+type testPKI struct {
+	root, inter       *x509.Certificate
+	rootKey, interKey crypto.Signer
+	rootDER, interDER []byte
+	pool              *x509.CertPool // contains the root only
+}
+
+func newTestPKI(t *testing.T) *testPKI {
+	t.Helper()
+	p := &testPKI{}
+	p.root, p.rootKey, p.rootDER = newCert(t, certOpts{cn: "Test Root CA", org: "Test PKI", isCA: true,
+		notAfter: time.Now().Add(10 * 365 * 24 * time.Hour)}, nil, nil)
+	p.inter, p.interKey, p.interDER = newCert(t, certOpts{cn: "Test Intermediate CA", org: "Test PKI", isCA: true,
+		notAfter: time.Now().Add(5 * 365 * 24 * time.Hour)}, p.root, p.rootKey)
+	p.pool = x509.NewCertPool()
+	p.pool.AddCert(p.root)
+	return p
+}
+
+// leaf issues a server certificate from the intermediate. Defaults to
+// localhost / 127.0.0.1, which is what httptest servers listen on.
+func (p *testPKI) leaf(t *testing.T, o certOpts) ([]byte, crypto.Signer) {
+	t.Helper()
+	if o.cn == "" {
+		o.cn = "localhost"
+	}
+	if o.dns == nil && o.ips == nil {
+		o.dns = []string{"localhost"}
+		o.ips = []net.IP{net.ParseIP("127.0.0.1")}
+	}
+	_, key, der := newCert(t, o, p.inter, p.interKey)
+	return der, key
+}
+
+// tlsServerWith starts an HTTPS test server presenting exactly chainDER.
+func tlsServerWith(t *testing.T, chainDER [][]byte, key crypto.Signer, tweak func(*tls.Config), h http.Handler) *httptest.Server {
+	t.Helper()
+	if h == nil {
+		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0) // failed handshakes are the point here
+	cfg := &tls.Config{Certificates: []tls.Certificate{{Certificate: chainDER, PrivateKey: key}}}
+	if tweak != nil {
+		tweak(cfg)
+	}
+	srv.TLS = cfg
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// allowAllDial stands in for safeDialControl so tests can reach 127.0.0.1.
+func allowAllDial(_, _ string, _ syscall.RawConn) error { return nil }
+
+// testCfg is newTestConfig with every origin allowed, the SSRF pre-check off,
+// a dialer that may reach loopback and roots as the trust store.
+func testCfg(t *testing.T, roots *x509.CertPool) *config {
+	t.Helper()
+	cfg := newTestConfig()
+	cfg.allowedOrigins = nil
+	cfg.ssrfCheck = func(string) bool { return false }
+	cfg.dialControl = allowAllDial
+	cfg.rootCAs = roots
+	return cfg
+}
+
+// doInspect runs one /inspect request through the real upstream client.
+func doInspect(t *testing.T, cfg *config, target, extra string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/inspect?url="+url.QueryEscape(target)+extra, nil)
+	req.Header.Set("X-Proxy-Token", cfg.sessionToken)
+	rr := httptest.NewRecorder()
+	inspectHandler(cfg, newUpstreamClient(cfg)).ServeHTTP(rr, req)
+	return rr
+}
+
+func decodeInspect(t *testing.T, rr *httptest.ResponseRecorder) inspectResponse {
+	t.Helper()
+	var resp inspectResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode inspect response: %v — body: %s", err, rr.Body.String())
+	}
+	return resp
+}
+
+func serverPort(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener address: %v", err)
+	}
+	return port
+}
+
+func boolPtr(b bool) *bool { return &b }
+func intPtr(i int) *int    { return &i }
+
+func fmtBoolPtr(b *bool) string {
+	if b == nil {
+		return "null"
+	}
+	return fmt.Sprint(*b)
+}
+
+// md5CertPEM is a self-signed certificate with an md5WithRSAEncryption
+// signature (RSA 1024). crypto/x509 can no longer create such certificates, so
+// it was generated once with:
+//
+//	openssl req -x509 -newkey rsa:1024 -md5 -nodes -subj /CN=md5.test -days 36500
+const md5CertPEM = `-----BEGIN CERTIFICATE-----
+MIICBDCCAW2gAwIBAgIUS9zUXYhVSMHifaSKCwIaasS2mMcwDQYJKoZIhvcNAQEE
+BQAwEzERMA8GA1UEAwwIbWQ1LnRlc3QwIBcNMjYxMDIxMTA0MzE5WhgPMjEyNjA5
+MjcxMDQzMTlaMBMxETAPBgNVBAMMCG1kNS50ZXN0MIGfMA0GCSqGSIb3DQEBAQUA
+A4GNADCBiQKBgQDrPidON5lkzt7nyISRKrvbWSos/jvAfsPWEocA/aCyphySu776
+VmWqtKJEIcQyIYe3NIZrg18de5yBlm6gCzBqERvqqVKMF+nXyKSPcSxYGA+jKXDU
+oSDgmXBGW08kxxHmq3lPisPkPhPPjTPaqPArH2kv8fL2hi+DWAIwCHGtIQIDAQAB
+o1MwUTAdBgNVHQ4EFgQURY8shMedW9VDY98CLzQF6wR3zfkwHwYDVR0jBBgwFoAU
+RY8shMedW9VDY98CLzQF6wR3zfkwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0B
+AQQFAAOBgQDdQU+1mRJWxvWMDiPF1oNZPPYDk8j/e2TiAyayjE4o8KZsf1OMplrS
+JC8F4SFPwoOOLoFA80CoCczhHDcdww8Itor0pihOaPOF5lCMjt+PfhBtLG4v8g9q
+mkK3Hw8uUV27sr6g9XOJHrwSaiqIswhqo8PmChi8v51RZRKm3/Nb4w==
+-----END CERTIFICATE-----
+`
+
+// -----------------------------------------------------------------------
+// Pure certificate helpers
+// -----------------------------------------------------------------------
+
+func TestTLSProtocolName(t *testing.T) {
+	for v, want := range map[uint16]string{
+		0x0300:           "SSLv3",
+		tls.VersionTLS10: "TLSv1",
+		tls.VersionTLS11: "TLSv1.1",
+		tls.VersionTLS12: "TLSv1.2",
+		tls.VersionTLS13: "TLSv1.3",
+		0x7f1c:           "",
+	} {
+		if got := tlsProtocolName(v); got != want {
+			t.Errorf("tlsProtocolName(0x%04x) = %q, want %q", v, got, want)
+		}
+	}
+}
+
+// Every suite Go can negotiate — including the insecure ones the probe offers
+// — must have an OpenSSL name and a strength, or the report silently falls
+// back to IANA names for exactly the legacy servers it exists to describe.
+func TestOpenSSLCipherName(t *testing.T) {
+	suites := append(tls.CipherSuites(), tls.InsecureCipherSuites()...)
+	for _, s := range suites {
+		name, bits := openSSLCipherName(s.ID)
+		if bits <= 0 {
+			t.Errorf("%s: no strength in the OpenSSL table", s.Name)
+		}
+		if name == s.Name && !strings.HasPrefix(s.Name, "TLS_AES_") && !strings.HasPrefix(s.Name, "TLS_CHACHA20_") {
+			t.Errorf("%s: no OpenSSL name in the table", s.Name)
+		}
+	}
+
+	for id, want := range map[uint16]openSSLCipher{
+		tls.TLS_AES_128_GCM_SHA256:                {"TLS_AES_128_GCM_SHA256", 128},
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: {"ECDHE-RSA-AES128-GCM-SHA256", 128},
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA:          {"AES128-SHA", 128},
+		tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA:         {"DES-CBC3-SHA", 112},
+		tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA:        {"ECDHE-RSA-RC4-SHA", 128},
+	} {
+		if name, bits := openSSLCipherName(id); name != want.name || bits != want.bits {
+			t.Errorf("openSSLCipherName(0x%04x) = %q/%d, want %q/%d", id, name, bits, want.name, want.bits)
+		}
+	}
+
+	if name, bits := openSSLCipherName(0x00ff); name != tls.CipherSuiteName(0x00ff) || bits != 0 {
+		t.Errorf("unknown suite: got %q/%d, want the IANA fallback and 0 bits", name, bits)
+	}
+}
+
+func TestOpenSSLSigAlgName(t *testing.T) {
+	for alg, want := range map[x509.SignatureAlgorithm]string{
+		x509.MD2WithRSA:       "md2WithRSAEncryption",
+		x509.MD5WithRSA:       "md5WithRSAEncryption",
+		x509.SHA1WithRSA:      "sha1WithRSAEncryption",
+		x509.SHA256WithRSA:    "sha256WithRSAEncryption",
+		x509.SHA384WithRSA:    "sha384WithRSAEncryption",
+		x509.SHA512WithRSA:    "sha512WithRSAEncryption",
+		x509.SHA256WithRSAPSS: "rsassaPss",
+		x509.SHA384WithRSAPSS: "rsassaPss",
+		x509.SHA512WithRSAPSS: "rsassaPss",
+		x509.DSAWithSHA1:      "dsaWithSHA1",
+		x509.DSAWithSHA256:    "dsa_with_SHA256",
+		x509.ECDSAWithSHA1:    "ecdsa-with-SHA1",
+		x509.ECDSAWithSHA256:  "ecdsa-with-SHA256",
+		x509.ECDSAWithSHA384:  "ecdsa-with-SHA384",
+		x509.ECDSAWithSHA512:  "ecdsa-with-SHA512",
+		x509.PureEd25519:      "ED25519",
+	} {
+		if got := openSSLSigAlgName(alg); got != want {
+			t.Errorf("openSSLSigAlgName(%v) = %q, want %q", alg, got, want)
+		}
+	}
+	if got := openSSLSigAlgName(x509.UnknownSignatureAlgorithm); got != x509.UnknownSignatureAlgorithm.String() {
+		t.Errorf("unknown algorithm: got %q, want Go's own name", got)
+	}
+}
+
+func TestFormatDN(t *testing.T) {
+	oid := func(ids ...int) asn1.ObjectIdentifier { return ids }
+	atv := func(o asn1.ObjectIdentifier, v string) pkix.AttributeTypeAndValue {
+		return pkix.AttributeTypeAndValue{Type: o, Value: v}
+	}
+
+	// Parsed name: DER order, PHP's grouping of a repeated key at its first
+	// position, and a dotted OID for an attribute without a short name.
+	cert, _, _ := newCert(t, certOpts{extraNames: []pkix.AttributeTypeAndValue{
+		atv(oid(2, 5, 4, 6), "US"),
+		atv(oid(2, 5, 4, 11), "Domain Control Validated"),
+		atv(oid(2, 5, 4, 3), "*.badssl.com"),
+		atv(oid(2, 5, 4, 11), "PositiveSSL Wildcard"),
+		atv(oid(1, 2, 3, 4), "custom"),
+	}}, nil, nil)
+	want := "C=US, OU=Domain Control Validated, OU=PositiveSSL Wildcard, CN=*.badssl.com, 1.2.3.4=custom"
+	if got := formatDN(cert.Subject); got != want {
+		t.Errorf("formatDN(parsed) = %q\n want %q", got, want)
+	}
+
+	// A name built in code has no Names; the convenience fields still count.
+	built := pkix.Name{Country: []string{"DE"}, Organization: []string{"Example"}, CommonName: "example.com"}
+	if got := formatDN(built); got != "C=DE, O=Example, CN=example.com" {
+		t.Errorf("formatDN(built) = %q", got)
+	}
+	if got := formatDN(pkix.Name{}); got != "" {
+		t.Errorf("formatDN(empty) = %q, want empty", got)
+	}
+}
+
+func TestDaysUntil(t *testing.T) {
+	now := time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		t    time.Time
+		want int
+	}{
+		{now, 0},
+		{now.Add(time.Second), 0},
+		{now.Add(-time.Second), -1}, // floor, not truncation toward zero
+		{now.Add(24 * time.Hour), 1},
+		{now.Add(-24 * time.Hour), -1},
+		{now.Add(-24*time.Hour - time.Second), -2},
+		{time.Date(2049, 1, 1, 0, 0, 0, 0, time.UTC), 8108},
+		{time.Date(1950, 1, 1, 0, 0, 0, 0, time.UTC), -28052},
+		// RFC 5280's "no expiration": beyond time.Duration's ~292 years,
+		// where t.Sub(now) would saturate at 106751 days.
+		{time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC), 2912149},
+		{time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC), -739909},
+	} {
+		if got := daysUntil(tc.t, now); got != tc.want {
+			t.Errorf("daysUntil(%s) = %d, want %d", tc.t, got, tc.want)
+		}
+	}
+}
+
+func TestSetHopCert_FirstCN(t *testing.T) {
+	cn := asn1.ObjectIdentifier{2, 5, 4, 3}
+	leaf, _, _ := newCert(t, certOpts{extraNames: []pkix.AttributeTypeAndValue{
+		{Type: cn, Value: "a.example"},
+		{Type: cn, Value: "b.example"},
+	}}, nil, nil)
+	if leaf.Subject.CommonName != "b.example" {
+		t.Fatalf("precondition: pkix.Name.CommonName = %q, expected Go to keep the last CN", leaf.Subject.CommonName)
+	}
+	now := time.Now()
+	var hop pageHop
+	setHopCert(&hop, &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}, now)
+	if hop.CertCN != "a.example" {
+		t.Errorf("certCN = %q, want the first CN a.example (like PHP and chain[0].subject)", hop.CertCN)
+	}
+	if hop.CertDaysLeft == nil || *hop.CertDaysLeft != daysUntil(leaf.NotAfter, now) {
+		t.Errorf("certDaysLeft = %v", hop.CertDaysLeft)
+	}
+
+	// No CN at all: omitted, no O fallback.
+	orgOnly, _, _ := newCert(t, certOpts{org: "Only Org"}, nil, nil)
+	hop = pageHop{}
+	setHopCert(&hop, &tls.ConnectionState{PeerCertificates: []*x509.Certificate{orgOnly}}, now)
+	if hop.CertCN != "" {
+		t.Errorf("certCN = %q for a certificate without CN, want empty", hop.CertCN)
+	}
+}
+
+func TestDescribeCertificate(t *testing.T) {
+	now := time.Now()
+
+	t.Run("fields and formats", func(t *testing.T) {
+		cert, _, _ := newCert(t, certOpts{cn: "example.com", org: "Example Org",
+			dns: []string{"example.com", "www.example.com"}, ips: []net.IP{net.ParseIP("2001:db8::1")},
+			serial: big.NewInt(0x01EEE6)}, nil, nil)
+		link := describeCertificate(cert, now)
+
+		if link.Subject != "example.com" || link.SubjectOrg == nil || *link.SubjectOrg != "Example Org" {
+			t.Errorf("subject = %q / %v", link.Subject, link.SubjectOrg)
+		}
+		if link.SubjectDN != "O=Example Org, CN=example.com" {
+			t.Errorf("subjectDN = %q", link.SubjectDN)
+		}
+		if !link.SelfIssued || link.IsCA {
+			t.Errorf("selfIssued/isCA = %v/%v, want true/false", link.SelfIssued, link.IsCA)
+		}
+		if link.Serial != "01:EE:E6" {
+			t.Errorf("serial = %q, want 01:EE:E6", link.Serial)
+		}
+		sum := sha256.Sum256(cert.Raw)
+		if link.SHA256 != colonHex(sum[:]) || len(link.SHA256) != 95 || link.SHA256 != strings.ToUpper(link.SHA256) {
+			t.Errorf("sha256 = %q", link.SHA256)
+		}
+		if len(link.SHA1) != 59 {
+			t.Errorf("sha1 = %q", link.SHA1)
+		}
+		block, rest := pem.Decode([]byte(link.PEM))
+		if block == nil || !bytes.Equal(block.Bytes, cert.Raw) || len(rest) != 0 || !strings.HasSuffix(link.PEM, "\n") {
+			t.Error("PEM does not round-trip to the certificate's DER")
+		}
+		dateRE := regexp.MustCompile(`^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$`)
+		if !dateRE.MatchString(link.ValidFrom) || !dateRE.MatchString(link.ValidUntil) {
+			t.Errorf("dates = %q / %q", link.ValidFrom, link.ValidUntil)
+		}
+		if link.ValidUntilTs != cert.NotAfter.Unix() || link.ValidFromTs != cert.NotBefore.Unix() {
+			t.Error("timestamps do not match the certificate")
+		}
+		if strings.Join(link.SANs, ",") != "example.com,www.example.com,2001:db8::1" {
+			t.Errorf("sans = %v", link.SANs)
+		}
+		if link.SignatureAlgorithm != "ecdsa-with-SHA256" {
+			t.Errorf("signatureAlgorithm = %q", link.SignatureAlgorithm)
+		}
+	})
+
+	t.Run("subject falls back CN, O, Unknown", func(t *testing.T) {
+		orgOnly, _, _ := newCert(t, certOpts{org: "Only Org"}, nil, nil)
+		if got := describeCertificate(orgOnly, now).Subject; got != "Only Org" {
+			t.Errorf("O fallback: got %q", got)
+		}
+		nameless, _, _ := newCert(t, certOpts{dns: []string{"x.test"}}, nil, nil)
+		link := describeCertificate(nameless, now)
+		if link.Subject != "Unknown" || link.SubjectOrg != nil {
+			t.Errorf("no CN/O: got %q / %v", link.Subject, link.SubjectOrg)
+		}
+	})
+
+	t.Run("keys", func(t *testing.T) {
+		for _, tc := range []struct {
+			kind, want string
+			bits       *int
+		}{
+			{"rsa2048", "RSA 2048 bit", intPtr(2048)},
+			{"rsa1024", "RSA 1024 bit", intPtr(1024)},
+			{"p256", "EC P-256 (256 bit)", nil},
+			{"p384", "EC P-384 (384 bit)", nil},
+			{"ed25519", "Ed25519", nil},
+		} {
+			cert, _, _ := newCert(t, certOpts{cn: "key-" + tc.kind, key: tc.kind}, nil, nil)
+			link := describeCertificate(cert, now)
+			if link.Key != tc.want {
+				t.Errorf("%s: key = %q, want %q", tc.kind, link.Key, tc.want)
+			}
+			if (link.KeyBits == nil) != (tc.bits == nil) || (link.KeyBits != nil && *link.KeyBits != *tc.bits) {
+				t.Errorf("%s: keyBits = %v, want %v", tc.kind, link.KeyBits, tc.bits)
+			}
+		}
+	})
+
+	t.Run("daysLeft is floored", func(t *testing.T) {
+		expired, _, _ := newCert(t, certOpts{cn: "just-expired", notBefore: now.Add(-48 * time.Hour), notAfter: now.Add(-time.Hour)}, nil, nil)
+		if got := describeCertificate(expired, now).DaysLeft; got != -1 {
+			t.Errorf("an hour past NotAfter: daysLeft = %d, want -1", got)
+		}
+		soon, _, _ := newCert(t, certOpts{cn: "almost-two-days", notAfter: now.Add(47 * time.Hour)}, nil, nil)
+		if got := describeCertificate(soon, now).DaysLeft; got != 1 {
+			t.Errorf("47h left: daysLeft = %d, want 1", got)
+		}
+	})
+
+	t.Run("struct literal does not panic", func(t *testing.T) {
+		link := describeCertificate(&x509.Certificate{Subject: pkix.Name{CommonName: "literal"}}, now)
+		if link.Subject != "literal" || link.Serial != "" || link.Key != "Unknown" || link.PEM != "" || link.SelfIssued {
+			t.Errorf("got %+v", link)
+		}
+		if link.SANs == nil {
+			t.Error("sans must be [] rather than null")
+		}
+	})
+}
+
+func TestBuildCertificateChain(t *testing.T) {
+	now := time.Now()
+	p := newTestPKI(t)
+	leafDER, _ := p.leaf(t, certOpts{cn: "chain.test"})
+	leaf, _ := x509.ParseCertificate(leafDER)
+
+	labels := func(chain []chainLink) string {
+		var parts []string
+		for _, c := range chain {
+			parts = append(parts, fmt.Sprintf("%d:%s:%s", c.Position, c.Label, fmtBoolPtr(c.SignatureValid)))
+		}
+		return strings.Join(parts, " | ")
+	}
+
+	t.Run("leaf, intermediate, self-signed root", func(t *testing.T) {
+		got := labels(buildCertificateChain([]*x509.Certificate{leaf, p.inter, p.root}, now))
+		want := "1:Server certificate:true | 2:Intermediate CA:true | 3:Root CA (self-signed):true"
+		if got != want {
+			t.Errorf("got  %s\nwant %s", got, want)
+		}
+	})
+
+	t.Run("issuer of the last certificate not sent", func(t *testing.T) {
+		got := labels(buildCertificateChain([]*x509.Certificate{leaf, p.inter}, now))
+		if want := "1:Server certificate:true | 2:Intermediate CA:null"; got != want {
+			t.Errorf("got  %s\nwant %s", got, want)
+		}
+	})
+
+	t.Run("cross-signed root", func(t *testing.T) {
+		other, otherKey, _ := newCert(t, certOpts{cn: "Other Root CA", isCA: true}, nil, nil)
+		cross, crossKey, _ := newCert(t, certOpts{cn: "Example Root X2", isCA: true}, other, otherKey)
+		xleaf, _, _ := newCert(t, certOpts{cn: "cross.test"}, cross, crossKey)
+		got := labels(buildCertificateChain([]*x509.Certificate{xleaf, cross}, now))
+		if want := "1:Server certificate:true | 2:Cross-signed root (acts as intermediate):null"; got != want {
+			t.Errorf("got  %s\nwant %s", got, want)
+		}
+	})
+
+	t.Run("wrong order", func(t *testing.T) {
+		chain := buildCertificateChain([]*x509.Certificate{leaf, p.root, p.inter}, now)
+		got := labels(chain)
+		if want := "1:Server certificate:false | 2:Root CA (self-signed):true | 3:Intermediate CA:null"; got != want {
+			t.Errorf("got  %s\nwant %s", got, want)
+		}
+	})
+
+	t.Run("self-signed leaf alone", func(t *testing.T) {
+		self, _, _ := newCert(t, certOpts{cn: "self.test"}, nil, nil)
+		info := buildSSLInfo([]*x509.Certificate{self}, nil, "self.test", false, nil, nil, "probe", now)
+		if got := labels(info.Chain); got != "1:Server certificate:true" {
+			t.Errorf("got %s", got)
+		}
+		if !info.SelfSigned {
+			t.Error("expected selfSigned")
+		}
+	})
+
+	t.Run("capped at ten", func(t *testing.T) {
+		certs := make([]*x509.Certificate, 12)
+		for i := range certs {
+			certs[i] = p.inter
+		}
+		if n := len(buildCertificateChain(certs, now)); n != maxChainCerts {
+			t.Errorf("chain length %d, want %d", n, maxChainCerts)
+		}
+	})
+}
+
+func TestSignatureValid_LegacyAlgorithms(t *testing.T) {
+	sha1Cert, _, _ := newCert(t, certOpts{cn: "sha1.test", key: "rsa2048", sigAlg: x509.SHA1WithRSA}, nil, nil)
+	if !signatureValid(sha1Cert, sha1Cert) {
+		t.Error("a valid SHA-1 RSA signature must verify (OpenSSL parity)")
+	}
+
+	block, _ := pem.Decode([]byte(md5CertPEM))
+	md5Cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse MD5 fixture: %v", err)
+	}
+	if md5Cert.SignatureAlgorithm != x509.MD5WithRSA {
+		t.Fatalf("fixture algorithm = %v", md5Cert.SignatureAlgorithm)
+	}
+	if !signatureValid(md5Cert, md5Cert) {
+		t.Error("a valid MD5 RSA signature must verify through the fallback")
+	}
+	if got := describeCertificate(md5Cert, time.Now()).SignatureAlgorithm; got != "md5WithRSAEncryption" {
+		t.Errorf("signatureAlgorithm = %q", got)
+	}
+
+	for name, c := range map[string]*x509.Certificate{"sha1": sha1Cert, "md5": md5Cert} {
+		tampered := *c
+		tampered.Signature = append([]byte(nil), c.Signature...)
+		tampered.Signature[len(tampered.Signature)-1] ^= 0xff
+		if signatureValid(&tampered, c) {
+			t.Errorf("%s: a tampered signature must not verify", name)
+		}
+	}
+
+	if signatureValid(sha1Cert, &x509.Certificate{}) {
+		t.Error("a parent without a public key must not verify (and must not panic)")
+	}
+}
+
+func TestCertMatchesHost(t *testing.T) {
+	for _, tc := range []struct {
+		host string
+		sans []string
+		cn   string
+		want *bool
+	}{
+		{"a.b.example.com", []string{"*.example.com"}, "", boolPtr(false)},
+		{"example.com", []string{"*.example.com"}, "", boolPtr(false)},
+		{"www.example.com", []string{"*.example.com"}, "", boolPtr(true)},
+		{"Foo.Example.com.", []string{"foo.example.com"}, "", boolPtr(true)},
+		{"foo.example.com", []string{"f*.example.com"}, "", boolPtr(false)},
+		{"foo.example.com", []string{"FOO.EXAMPLE.COM."}, "", boolPtr(true)},
+		{"93.184.216.34", []string{"93.184.216.34"}, "", boolPtr(true)},
+		{"93.184.216.34", []string{"*.184.216.34"}, "", boolPtr(false)},
+		{"[2001:db8::1]", []string{"2001:DB8:0:0:0:0:0:1"}, "", boolPtr(true)},
+		{"2001:db8::1", []string{"2001:db8::2"}, "", boolPtr(false)},
+		{"example.com", nil, "example.com", boolPtr(true)},
+		{"example.com", []string{}, "Unknown", boolPtr(false)},
+		{"", []string{"example.com"}, "", nil},
+		{"bücher.de", []string{"xn--bcher-kva.de"}, "", nil},
+	} {
+		got := certMatchesHost(tc.host, tc.sans, tc.cn)
+		if fmtBoolPtr(got) != fmtBoolPtr(tc.want) {
+			t.Errorf("certMatchesHost(%q, %v, %q) = %s, want %s", tc.host, tc.sans, tc.cn, fmtBoolPtr(got), fmtBoolPtr(tc.want))
+		}
+	}
+}
+
+func TestCertificateIssues(t *testing.T) {
+	now := time.Now()
+	day := int64(86400)
+	link := func(pos int, subject string, mods ...func(*chainLink)) chainLink {
+		c := chainLink{
+			Position: pos, Subject: subject,
+			ValidFromTs: now.Unix() - 30*day, ValidUntilTs: now.Unix() + 60*day, DaysLeft: 60,
+			SignatureAlgorithm: "sha256WithRSAEncryption", KeyBits: intPtr(2048),
+		}
+		for _, m := range mods {
+			m(&c)
+		}
+		return c
+	}
+	sigOK := func(c *chainLink) { c.SignatureValid = boolPtr(true) }
+	sigBad := func(c *chainLink) { c.SignatureValid = boolPtr(false) }
+	msgs := func(issues []certIssue) []string {
+		out := []string{}
+		for _, i := range issues {
+			out = append(out, i.Type+": "+i.Msg)
+		}
+		return out
+	}
+	healthy := []chainLink{link(1, "leaf", sigOK), link(2, "inter")}
+
+	for _, tc := range []struct {
+		name       string
+		chain      []chainLink
+		hostMatch  *bool
+		selfSigned bool
+		want       []string
+	}{
+		{"healthy chain", healthy, boolPtr(true), false, []string{}},
+		{"expired", []chainLink{link(1, "leaf", sigOK, func(c *chainLink) {
+			c.ValidUntilTs, c.DaysLeft = now.Unix()-10*day, -10
+		}), link(2, "inter")}, nil, false,
+			[]string{"error: The certificate expired 10 days ago."}},
+		{"not yet valid, not also expiring", []chainLink{link(1, "leaf", sigOK, func(c *chainLink) {
+			c.ValidFromTs, c.DaysLeft = now.Unix()+day, 5
+		}), link(2, "inter")}, nil, false,
+			[]string{"error: The certificate is not valid yet."}},
+		{"expiring soon", []chainLink{link(1, "leaf", sigOK, func(c *chainLink) { c.DaysLeft = 14 }), link(2, "inter")}, nil, false,
+			[]string{"warning: The certificate expires in 14 days."}},
+		{"host not covered", healthy, boolPtr(false), false,
+			[]string{"error: The host name is not covered by the certificate (CN/SAN)."}},
+		{"self-signed leaf alone", []chainLink{link(1, "self", func(c *chainLink) {
+			c.SelfIssued, c.SignatureValid = true, boolPtr(true)
+		})}, boolPtr(true), true,
+			[]string{"error: The certificate is self-signed — browsers will not trust it."}},
+		{"weak algorithms and keys", []chainLink{
+			link(1, "leaf", sigOK, func(c *chainLink) { c.SignatureAlgorithm = "sha1WithRSAEncryption" }),
+			link(2, "inter", sigOK, func(c *chainLink) { c.SignatureAlgorithm, c.KeyBits = "ecdsa-with-SHA1", nil }),
+			link(3, "md5 inter", sigOK, func(c *chainLink) { c.SignatureAlgorithm, c.KeyBits = "md5WithRSAEncryption", intPtr(1024) }),
+			link(4, "old root", sigOK, func(c *chainLink) { c.SignatureAlgorithm, c.SelfIssued = "sha1WithRSAEncryption", true }),
+		}, nil, false, []string{
+			"warning: leaf: weak signature algorithm (sha1WithRSAEncryption).",
+			"warning: inter: weak signature algorithm (ecdsa-with-SHA1).",
+			"warning: md5 inter: weak signature algorithm (md5WithRSAEncryption).",
+			"warning: md5 inter: RSA key with only 1024 bit.",
+		}},
+		{"no intermediate sent", []chainLink{link(1, "leaf")}, nil, false,
+			[]string{"warning: The server sends no intermediate certificate — some clients cannot build the chain."}},
+		{"broken self-signature at the end", []chainLink{link(1, "leaf", sigOK), link(2, "root", sigBad, func(c *chainLink) { c.SelfIssued = true })}, nil, false,
+			[]string{"error: The chain is broken: root is not signed by the next certificate."}},
+		{"misordered, reported once", []chainLink{link(1, "leaf", sigBad), link(2, "root", sigBad), link(3, "inter")}, nil, false,
+			[]string{"error: Chain order or content is wrong: leaf is not signed by the following certificate."}},
+	} {
+		got := msgs(certificateIssues(tc.chain, tc.hostMatch, tc.selfSigned, now))
+		if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+			t.Errorf("%s:\n got  %q\n want %q", tc.name, got, tc.want)
+		}
+	}
+
+	if issues := certificateIssues(nil, nil, false, now); issues == nil || len(issues) != 0 {
+		t.Error("an empty chain must yield [] rather than null")
+	}
+}
+
+// -----------------------------------------------------------------------
+// Redirect targets, capped bodies
+// -----------------------------------------------------------------------
+
+func TestResolveRedirect(t *testing.T) {
+	base, _ := url.Parse("http://a/b/c/d;p?q")
+	// RFC 3986 §5.4.1 (normal) and §5.4.2 (abnormal) examples.
+	for ref, want := range map[string]string{
+		"g": "http://a/b/c/g", "./g": "http://a/b/c/g", "g/": "http://a/b/c/g/", "/g": "http://a/g",
+		"//g": "http://g", "?y": "http://a/b/c/d;p?y", "g?y": "http://a/b/c/g?y", "#s": "http://a/b/c/d;p?q#s",
+		"g#s": "http://a/b/c/g#s", "g?y#s": "http://a/b/c/g?y#s", ";x": "http://a/b/c/;x", "g;x": "http://a/b/c/g;x",
+		"g;x?y#s": "http://a/b/c/g;x?y#s", "": "http://a/b/c/d;p?q", ".": "http://a/b/c/", "./": "http://a/b/c/",
+		"..": "http://a/b/", "../": "http://a/b/", "../g": "http://a/b/g", "../..": "http://a/",
+		"../../": "http://a/", "../../g": "http://a/g",
+
+		"../../../g": "http://a/g", "../../../../g": "http://a/g", "/./g": "http://a/g", "/../g": "http://a/g",
+		"g.": "http://a/b/c/g.", ".g": "http://a/b/c/.g", "g..": "http://a/b/c/g..", "..g": "http://a/b/c/..g",
+		"./../g": "http://a/b/g", "./g/.": "http://a/b/c/g/", "g/./h": "http://a/b/c/g/h", "g/../h": "http://a/b/c/h",
+		"g;x=1/./y": "http://a/b/c/g;x=1/y", "g;x=1/../y": "http://a/b/c/y", "g?y/./x": "http://a/b/c/g?y/./x",
+		"g?y/../x": "http://a/b/c/g?y/../x", "g#s/./x": "http://a/b/c/g#s/./x", "g#s/../x": "http://a/b/c/g#s/../x",
+		"http:g": "http:g",
+	} {
+		got, err := resolveRedirect(base, ref)
+		if err != nil {
+			t.Errorf("%q: unexpected error %v", ref, err)
+			continue
+		}
+		if got.String() != want {
+			t.Errorf("%q: got %q, want %q", ref, got.String(), want)
+		}
+	}
+
+	for _, tc := range []struct{ base, loc, want string }{
+		{"https://user:pw@h/a", "/b", "https://h/b"},                                         // userinfo dropped
+		{"https://h/a", "https://u:p@x.example/", "https://x.example/"},                      // also from the target
+		{"https://[2001:db8::1]:8443/a/b", "../c", "https://[2001:db8::1]:8443/c"},           // IPv6 base
+		{"https://h/a/b", "  HTTPS://Example.com/x  ", "https://Example.com/x"},              // trimmed, scheme normalised
+		{"http://h/robots.txt", "//cdn.example/robots.txt", "http://cdn.example/robots.txt"}, // scheme-relative
+	} {
+		b, _ := url.Parse(tc.base)
+		got, err := resolveRedirect(b, tc.loc)
+		if err != nil || got.String() != tc.want {
+			t.Errorf("resolveRedirect(%q, %q) = %v, %v; want %q", tc.base, tc.loc, got, err, tc.want)
+		}
+	}
+
+	for _, loc := range []string{"g:h", "javascript:alert(1)", "data:text/html,x", "ftp://h/x"} {
+		if _, err := resolveRedirect(base, loc); !errors.Is(err, errUnsupportedRedirectScheme) {
+			t.Errorf("%q: expected errUnsupportedRedirectScheme, got %v", loc, err)
+		}
+	}
+
+	h := http.Header{}
+	if lastLocation(h) != "" {
+		t.Error("no Location must give an empty string")
+	}
+	h.Add("Location", "/first")
+	h.Add("Location", "/second")
+	if got := lastLocation(h); got != "/second" {
+		t.Errorf("lastLocation = %q, want the last value", got)
+	}
+}
+
+func TestReadCapped(t *testing.T) {
+	for _, tc := range []struct {
+		body      string
+		limit     int64
+		want      string
+		truncated bool
+	}{
+		{"abcd", 4, "abcd", false},
+		{"abcde", 4, "abcd", true},
+		{"ab", 4, "ab", false},
+		{"abcdef", 0, "abcdef", false}, // 0 = unlimited
+	} {
+		got, truncated, err := readCapped(strings.NewReader(tc.body), tc.limit)
+		if err != nil || string(got) != tc.want || truncated != tc.truncated {
+			t.Errorf("readCapped(%q, %d) = %q, %v, %v; want %q, %v", tc.body, tc.limit, got, truncated, err, tc.want, tc.truncated)
+		}
+	}
+}
+
+func TestTrimPartialUTF8(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"abc", "abc"},
+		{"ab\xc3", "ab"},         // first byte of ü
+		{"ab\xe2\x82", "ab"},     // two of three bytes of €
+		{"ab\xf0\x9f\x98", "ab"}, // three of four bytes of 😀
+		{"abü", "abü"},           // complete
+		{"ab😀", "ab😀"},           // complete four-byte rune
+		{"ab\xff", "ab\xff"},     // invalid, not partial: left alone
+		{"", ""},
+	} {
+		if got := string(trimPartialUTF8([]byte(tc.in))); got != tc.want {
+			t.Errorf("trimPartialUTF8(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestReadDecodedBody(t *testing.T) {
+	gz := func(s string) []byte {
+		var buf bytes.Buffer
+		w := gzip.NewWriter(&buf)
+		w.Write([]byte(s))
+		w.Close()
+		return buf.Bytes()
+	}
+
+	t.Run("gzip decoded", func(t *testing.T) {
+		raw := gz("<html>hello</html>")
+		b := readDecodedBody(bytes.NewReader(raw), "gzip", 1024)
+		if string(b.data) != "<html>hello</html>" || b.truncated || b.decodeError || b.rawSize != len(raw) {
+			t.Errorf("got %+v", b)
+		}
+	})
+
+	t.Run("undecodable encoding never yields raw bytes", func(t *testing.T) {
+		b := readDecodedBody(bytes.NewReader([]byte{0x1b, 0x2a, 0x00, 0xff}), "br", 1024)
+		if len(b.data) != 0 || !b.decodeError {
+			t.Errorf("got %+v", b)
+		}
+	})
+
+	t.Run("corrupt gzip", func(t *testing.T) {
+		b := readDecodedBody(bytes.NewReader([]byte("\x1f\x8bthis is not gzip at all")), "gzip", 1024)
+		if !b.decodeError || bytes.HasPrefix(b.data, []byte{0x1f, 0x8b}) {
+			t.Errorf("got %+v", b)
+		}
+	})
+
+	t.Run("gzip cut by the cap is truncation, not corruption", func(t *testing.T) {
+		raw := gz(strings.Repeat("Grüße ", 5000))
+		b := readDecodedBody(bytes.NewReader(raw), "gzip", int64(len(raw)/2))
+		if !b.truncated || b.decodeError || len(b.data) == 0 || !utf8.Valid(b.data) {
+			t.Errorf("truncated=%v decodeError=%v len=%d valid=%v", b.truncated, b.decodeError, len(b.data), utf8.Valid(b.data))
+		}
+	})
+
+	t.Run("decoded text capped and cut on a rune boundary", func(t *testing.T) {
+		text := strings.Repeat("ü", 100) // 200 bytes
+		b := readDecodedBody(bytes.NewReader(gz(text)), "gzip", 101)
+		if !b.truncated || len(b.data) != 100 || !utf8.Valid(b.data) {
+			t.Errorf("truncated=%v len=%d valid=%v", b.truncated, len(b.data), utf8.Valid(b.data))
+		}
+	})
+
+	t.Run("empty body with an encoding", func(t *testing.T) {
+		if b := readDecodedBody(bytes.NewReader(nil), "gzip", 1024); b.decodeError || b.truncated {
+			t.Errorf("got %+v", b)
+		}
+	})
+	// Misconfigured servers label plain bodies with tokens that are no
+	// content coding at all; v1.2.4 returned those pages, so must v1.3.0.
+	t.Run("unknown token with a plain UTF-8 body passes through", func(t *testing.T) {
+		const html = "<html><body>Grüße</body></html>"
+		for _, enc := range []string{"none", "UTF-8", "utf8", "text/html", "binary", "None, identity"} {
+			b := readDecodedBody(strings.NewReader(html), enc, 1024)
+			if string(b.data) != html || b.decodeError || b.truncated || b.rawSize != len(html) {
+				t.Errorf("%q: got data=%q decodeError=%v truncated=%v", enc, b.data, b.decodeError, b.truncated)
+			}
+		}
+	})
+
+	t.Run("unknown token with binary bytes is never passed on", func(t *testing.T) {
+		b := readDecodedBody(bytes.NewReader([]byte{0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe, 0x00}), "none", 1024)
+		if len(b.data) != 0 || !b.decodeError {
+			t.Errorf("got %+v", b)
+		}
+	})
+
+	t.Run("unknown token, UTF-8 body cut inside a character by the cap", func(t *testing.T) {
+		text := strings.Repeat("ü", 100) // 200 bytes
+		b := readDecodedBody(strings.NewReader(text), "UTF-8", 101)
+		if !b.truncated || b.decodeError || len(b.data) != 100 || !utf8.Valid(b.data) {
+			t.Errorf("truncated=%v decodeError=%v len=%d", b.truncated, b.decodeError, len(b.data))
+		}
+	})
+
+	t.Run("registered codings the stdlib cannot decode", func(t *testing.T) {
+		// Even a body that happens to be valid UTF-8 is not trusted here.
+		for _, enc := range []string{"br", "BR", "zstd", "compress", "x-compress", "dcb", "dcz", "aes128gcm", "exi", "pack200-gzip"} {
+			b := readDecodedBody(strings.NewReader("looks like text"), enc, 1024)
+			if len(b.data) != 0 || !b.decodeError {
+				t.Errorf("%q: got data=%q decodeError=%v", enc, b.data, b.decodeError)
+			}
+		}
+	})
+
+	t.Run("stacked codings are not decoded", func(t *testing.T) {
+		for _, enc := range []string{"gzip, br", "deflate, gzip", "none, gzip"} {
+			b := readDecodedBody(bytes.NewReader(gz("<html>x</html>")), enc, 1024)
+			if len(b.data) != 0 || !b.decodeError {
+				t.Errorf("%q: got data=%q decodeError=%v", enc, b.data, b.decodeError)
+			}
+		}
+	})
+
+	t.Run("identity in any spelling is plain", func(t *testing.T) {
+		for _, enc := range []string{"identity", " Identity ", ""} {
+			b := readDecodedBody(strings.NewReader("<p>x</p>"), enc, 1024)
+			if string(b.data) != "<p>x</p>" || b.decodeError {
+				t.Errorf("%q: got %+v", enc, b)
+			}
+		}
+	})
+}
+
+// -----------------------------------------------------------------------
+// Error classification: timeouts, typed errors
+// -----------------------------------------------------------------------
+
+type fakeTimeoutError struct{}
+
+func (fakeTimeoutError) Error() string   { return "i/o timeout" }
+func (fakeTimeoutError) Timeout() bool   { return true }
+func (fakeTimeoutError) Temporary() bool { return true }
+
+func TestClassifyUpstreamError_Timeout(t *testing.T) {
+	for name, err := range map[string]error{
+		"expired request context": &url.Error{Op: "Get", URL: "https://example.com/", Err: context.DeadlineExceeded},
+		"dial timeout":            &url.Error{Op: "Get", URL: "https://example.com/", Err: &net.OpError{Op: "dial", Net: "tcp", Err: fakeTimeoutError{}}},
+	} {
+		if code, _ := classifyUpstreamError(err); code != "timeout" {
+			t.Errorf("%s: expected timeout, got %q", name, code)
+		}
+	}
+	// A socket error that is not a timeout stays a connection error.
+	err := &url.Error{Op: "Get", URL: "https://example.com/", Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}}
+	if code, _ := classifyUpstreamError(err); code != "connection_error" {
+		t.Errorf("expected connection_error, got %q", code)
+	}
+}
+
+// The specific x509 messages used to be unreachable: the
+// *tls.CertificateVerificationError wrapping them was matched first.
+func TestClassifyUpstreamError_UnwrapsCertificateVerificationError(t *testing.T) {
+	for inner, want := range map[error]string{
+		x509.HostnameError{}:            "TLS certificate hostname mismatch",
+		x509.UnknownAuthorityError{}:    "TLS certificate signed by unknown authority",
+		x509.CertificateInvalidError{}:  "TLS certificate invalid",
+		errors.New("platform verifier"): "TLS certificate verification failed",
+	} {
+		code, msg := classifyUpstreamError(&tls.CertificateVerificationError{Err: inner})
+		if code != "tls_error" || msg != want {
+			t.Errorf("inner %T: got %q / %q, want tls_error / %q", inner, code, msg, want)
+		}
+	}
+}
+
+func TestUpstreamFailure(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		code   string
+		status int
+		typ    string
+	}{
+		{&net.DNSError{Err: "no such host", Name: "x.invalid"}, "dns_error", 502, "Could not resolve host"},
+		{&net.OpError{Op: "dial", Err: errors.New("refused")}, "connection_error", 502, "Could not connect to host"},
+		{context.DeadlineExceeded, "timeout", 504, "Connection timeout"},
+		{fmt.Errorf("%w: 10.0.0.1", errBlockedTarget), "blocked_target", 502, "Blocked target"},
+		{errors.New("weird"), "upstream_error", 502, "Upstream error"},
+		{&tls.CertificateVerificationError{Err: x509.HostnameError{}}, "tls_error", 502, "Host name does not match the certificate"},
+		{tls.RecordHeaderError{Msg: "not TLS"}, "tls_error", 502, "TLS protocol not supported"},
+	} {
+		pe := upstreamFailure(context.Background(), tc.err)
+		if pe.Error != tc.code || pe.Status != tc.status || pe.Type != tc.typ || pe.Message == "" {
+			t.Errorf("%v: got %+v, want %s/%d/%q", tc.err, pe, tc.code, tc.status, tc.typ)
+		}
+	}
+
+	// An expired request context wins over whatever shape the transport chose.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if pe := upstreamFailure(ctx, errors.New("net/http: request canceled")); pe.Error != "timeout" || pe.Status != 504 {
+		t.Errorf("expired context: got %+v", pe)
+	}
+}
+
+// -----------------------------------------------------------------------
+// TLS failure classification against real handshakes
+// -----------------------------------------------------------------------
+
+func TestClassifyTLSFailure_RealHandshakes(t *testing.T) {
+	p := newTestPKI(t)
+	now := time.Now()
+
+	type tc struct {
+		name           string
+		srv            func(t *testing.T) *httptest.Server
+		roots          *x509.CertPool
+		wantType       string
+		wantVerifyText string
+	}
+	leafServer := func(o certOpts, withInter bool) func(t *testing.T) *httptest.Server {
+		return func(t *testing.T) *httptest.Server {
+			der, key := p.leaf(t, o)
+			chain := [][]byte{der}
+			if withInter {
+				chain = append(chain, p.interDER)
+			}
+			return tlsServerWith(t, chain, key, nil, nil)
+		}
+	}
+
+	cases := []tc{
+		{"expired leaf", leafServer(certOpts{cn: "expired.test", notBefore: now.Add(-60 * 24 * time.Hour), notAfter: now.Add(-24 * time.Hour)}, true),
+			p.pool, "Certificate expired", "Certificate has expired"},
+		{"leaf not yet valid", leafServer(certOpts{cn: "future.test", notBefore: now.Add(24 * time.Hour), notAfter: now.Add(90 * 24 * time.Hour)}, true),
+			p.pool, "Certificate not yet valid", "Certificate is not yet valid"},
+		{"host mismatch", leafServer(certOpts{cn: "mismatch.test", ips: []net.IP{net.ParseIP("10.0.0.1")}}, true),
+			p.pool, "Host name does not match the certificate", "Hostname mismatch"},
+		{"self-signed leaf", func(t *testing.T) *httptest.Server {
+			_, key, der := newCert(t, certOpts{cn: "self-signed.test", ips: []net.IP{net.ParseIP("127.0.0.1")}}, nil, nil)
+			return tlsServerWith(t, [][]byte{der}, key, nil, nil)
+		}, x509.NewCertPool(), "Self-signed certificate", "Self-signed certificate"},
+		{"untrusted root sent", func(t *testing.T) *httptest.Server {
+			der, key := p.leaf(t, certOpts{cn: "untrusted-root.test"})
+			return tlsServerWith(t, [][]byte{der, p.interDER, p.rootDER}, key, nil, nil)
+		}, x509.NewCertPool(), "Untrusted root certificate in the chain", "Self-signed certificate in chain"},
+		{"intermediate not sent", leafServer(certOpts{cn: "incomplete.test"}, false),
+			p.pool, "Incomplete chain or unknown issuer", "Unable to get local issuer certificate"},
+		// The root is sent, but the leaf cannot reach it: OpenSSL's error 20,
+		// not 19 — whether the root is trusted or not.
+		{"root sent, intermediate missing", func(t *testing.T) *httptest.Server {
+			der, key := p.leaf(t, certOpts{cn: "root-no-inter.test"})
+			return tlsServerWith(t, [][]byte{der, p.rootDER}, key, nil, nil)
+		}, p.pool, "Incomplete chain or unknown issuer", "Unable to get local issuer certificate"},
+		{"untrusted root sent, intermediate missing", func(t *testing.T) *httptest.Server {
+			der, key := p.leaf(t, certOpts{cn: "untrusted-root-no-inter.test"})
+			return tlsServerWith(t, [][]byte{der, p.rootDER}, key, nil, nil)
+		}, x509.NewCertPool(), "Incomplete chain or unknown issuer", "Unable to get local issuer certificate"},
+		{"wrong intermediate and root sent", func(t *testing.T) *httptest.Server {
+			_, _, otherDER := newCert(t, certOpts{cn: "Other Intermediate CA", org: "Test PKI", isCA: true}, p.root, p.rootKey)
+			der, key := p.leaf(t, certOpts{cn: "wrong-inter.test"})
+			return tlsServerWith(t, [][]byte{der, otherDER, p.rootDER}, key, nil, nil)
+		}, p.pool, "Incomplete chain or unknown issuer", "Unable to get local issuer certificate"},
+		{"untrusted root sent out of order", func(t *testing.T) *httptest.Server {
+			der, key := p.leaf(t, certOpts{cn: "out-of-order.test"})
+			return tlsServerWith(t, [][]byte{der, p.rootDER, p.interDER}, key, nil, nil)
+		}, x509.NewCertPool(), "Untrusted root certificate in the chain", "Self-signed certificate in chain"},
+		{"TLS 1.0 only", func(t *testing.T) *httptest.Server {
+			der, key := p.leaf(t, certOpts{cn: "tls10.test", key: "rsa2048"})
+			return tlsServerWith(t, [][]byte{der, p.interDER}, key, func(c *tls.Config) {
+				c.MinVersion, c.MaxVersion = tls.VersionTLS10, tls.VersionTLS10
+				c.CipherSuites = []uint16{tls.TLS_RSA_WITH_AES_128_CBC_SHA}
+			}, nil)
+		}, p.pool, "TLS protocol not supported", "TLS protocol not supported"},
+		{"plain HTTP on the https port", func(t *testing.T) *httptest.Server {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+			t.Cleanup(srv.Close)
+			srv.URL = strings.Replace(srv.URL, "http://", "https://", 1)
+			return srv
+		}, p.pool, "TLS protocol not supported", "TLS protocol not supported"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := c.srv(t)
+			cfg := testCfg(t, c.roots)
+			resp, err := newUpstreamClient(cfg).Get(srv.URL)
+			if err == nil {
+				resp.Body.Close()
+				t.Fatal("expected the verified content request to fail")
+			}
+			if code, _ := classifyUpstreamError(err); code != "tls_error" {
+				t.Fatalf("classifyUpstreamError = %q, want tls_error (err: %v)", code, err)
+			}
+
+			// As in production: the chain comes from the probe.
+			var certs []*x509.Certificate
+			if cs, perr := probeTLS(context.Background(), cfg, "127.0.0.1", serverPort(t, srv), "127.0.0.1"); perr == nil {
+				certs = cs.PeerCertificates
+			}
+			errorType, verifyText := classifyTLSFailure(err, certs, time.Now())
+			if errorType != c.wantType || verifyText != c.wantVerifyText {
+				t.Errorf("got %q / %q, want %q / %q (err: %v)", errorType, verifyText, c.wantType, c.wantVerifyText, err)
+			}
+			// The 502 contract's "type" has no probe, only the chain crypto/tls
+			// attached to the error — which is the served chain, so it agrees.
+			if typ := proxyErrorType("tls_error", err); typ != errorType {
+				t.Errorf("proxyErrorType = %q, want %q", typ, errorType)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------
+// The handshake-only probe
+// -----------------------------------------------------------------------
+
+func TestProbeTLS_NoApplicationData(t *testing.T) {
+	var requests atomic.Int32
+	_, key, der := newCert(t, certOpts{cn: "probe.test"}, nil, nil)
+	srv := tlsServerWith(t, [][]byte{der}, key, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+	}))
+
+	cs, err := probeTLS(context.Background(), testCfg(t, nil), "probe.test", serverPort(t, srv), "127.0.0.1")
+	if err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if len(cs.PeerCertificates) != 1 || cs.PeerCertificates[0].Subject.CommonName != "probe.test" {
+		t.Errorf("unexpected peer certificates: %v", cs.PeerCertificates)
+	}
+	time.Sleep(50 * time.Millisecond) // a request, had one been sent, would have arrived by now
+	if n := requests.Load(); n != 0 {
+		t.Errorf("the probe must never send a request; the handler ran %d times", n)
+	}
+}
+
+func TestProbeTLS_SNI(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	_, key, der := newCert(t, certOpts{cn: "sni.test"}, nil, nil)
+	srv := tlsServerWith(t, [][]byte{der}, key, func(c *tls.Config) {
+		c.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			mu.Lock()
+			seen = append(seen, hello.ServerName)
+			mu.Unlock()
+			return nil, nil
+		}
+	}, nil)
+	cfg := testCfg(t, nil)
+	port := serverPort(t, srv)
+
+	for _, host := range []string{"sni.test", "127.0.0.1", "bücher.de"} {
+		if _, err := probeTLS(context.Background(), cfg, host, port, "127.0.0.1"); err != nil {
+			t.Fatalf("probe %q: %v", host, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(seen, ",") != "sni.test,," {
+		t.Errorf("server names seen = %q, want the host name, then none for an IP and a non-ASCII host", seen)
+	}
+}
+
+func TestProbeTLS_DefaultDialControlBlocksLoopback(t *testing.T) {
+	_, key, der := newCert(t, certOpts{cn: "blocked.test"}, nil, nil)
+	srv := tlsServerWith(t, [][]byte{der}, key, nil, nil)
+
+	cfg := newTestConfig() // dialControl nil: production's safeDialControl
+	_, err := probeTLS(context.Background(), cfg, "blocked.test", serverPort(t, srv), "127.0.0.1")
+	if !errors.Is(err, errBlockedTarget) {
+		t.Errorf("expected errBlockedTarget, got %v", err)
+	}
+}
+
+// Mirrors the empirical check behind the probe design: servers that only
+// speak legacy suites still yield protocol, cipher and chain.
+func TestProbeTLS_LegacyCiphers(t *testing.T) {
+	_, key, der := newCert(t, certOpts{cn: "legacy.test", key: "rsa2048"}, nil, nil)
+	for _, tc := range []struct {
+		name              string
+		minV, maxV, suite uint16
+		protocol, cipher  string
+		bits              int
+	}{
+		{"TLS 1.0 RSA key exchange", tls.VersionTLS10, tls.VersionTLS10, tls.TLS_RSA_WITH_AES_128_CBC_SHA, "TLSv1", "AES128-SHA", 128},
+		{"TLS 1.1 3DES", tls.VersionTLS10, tls.VersionTLS11, tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA, "TLSv1.1", "DES-CBC3-SHA", 112},
+		{"TLS 1.2 RC4", tls.VersionTLS12, tls.VersionTLS12, tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA, "TLSv1.2", "ECDHE-RSA-RC4-SHA", 128},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := tlsServerWith(t, [][]byte{der}, key, func(c *tls.Config) {
+				c.MinVersion, c.MaxVersion, c.CipherSuites = tc.minV, tc.maxV, []uint16{tc.suite}
+			}, nil)
+			cs, err := probeTLS(context.Background(), testCfg(t, nil), "legacy.test", serverPort(t, srv), "127.0.0.1")
+			if err != nil {
+				t.Fatalf("probe failed: %v", err)
+			}
+			info := buildSSLInfo(cs.PeerCertificates, cs, "legacy.test", false, nil, nil, "probe", time.Now())
+			if info.Protocol != tc.protocol || info.Cipher != tc.cipher || info.Bits != tc.bits {
+				t.Errorf("got %s / %s / %d, want %s / %s / %d", info.Protocol, info.Cipher, info.Bits, tc.protocol, tc.cipher, tc.bits)
+			}
+			if info.CipherSuite != tls.CipherSuiteName(tc.suite) {
+				t.Errorf("cipherSuite = %q", info.CipherSuite)
+			}
+		})
+	}
+}
+
+// The content client must never skip verification — with the test-only trust
+// store override or without it.
+func TestUpstreamClient_NeverSkipsVerification(t *testing.T) {
+	for name, cfg := range map[string]*config{
+		"production": {},
+		"test roots": {rootCAs: x509.NewCertPool()},
+	} {
+		tr, ok := newUpstreamClient(cfg).Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("%s: unexpected transport type", name)
+		}
+		if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+			t.Errorf("%s: the upstream client skips TLS verification", name)
+		}
+	}
+}
+
+func TestConnTrace_IgnoresFailedConnect(t *testing.T) {
+	ct := &connTrace{}
+	trace := httptrace.ContextClientTrace(ct.attach(context.Background()))
+	trace.ConnectDone("tcp", "192.0.2.1:443", nil)
+	trace.ConnectDone("tcp", "198.51.100.1:443", errors.New("lost the race"))
+	if ip := ct.remoteIP(); ip != "192.0.2.1" {
+		t.Errorf("remoteIP = %q, want the address that actually connected", ip)
+	}
+}
+
+// -----------------------------------------------------------------------
+// /inspect: TLS failures and diag=1
+// -----------------------------------------------------------------------
+
+func selfSignedServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	_, key, der := newCert(t, certOpts{cn: "self-signed.test", ips: []net.IP{net.ParseIP("127.0.0.1")}}, nil, nil)
+	return tlsServerWith(t, [][]byte{der}, key, nil, nil)
+}
+
+func TestInspect_TLSFailure_NoDiag_ContractUnchanged(t *testing.T) {
+	srv := selfSignedServer(t)
+	rr := doInspect(t, testCfg(t, x509.NewCertPool()), srv.URL, "")
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d — %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["error"] != "tls_error" || body["status"] != float64(502) || body["message"] == "" {
+		t.Errorf("unexpected error body: %v", body)
+	}
+	if body["type"] != "Self-signed certificate" {
+		t.Errorf("type = %v", body["type"])
+	}
+	for key := range body {
+		if key != "error" && key != "message" && key != "status" && key != "type" {
+			t.Errorf("unexpected key %q in the error contract", key)
+		}
+	}
+}
+
+func TestInspect_TLSFailure_Diag(t *testing.T) {
+	srv := selfSignedServer(t)
+	rr := doInspect(t, testCfg(t, x509.NewCertPool()), srv.URL, "&diag=1")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — %s", rr.Code, rr.Body.String())
+	}
+	resp := decodeInspect(t, rr)
+	if resp.Error == nil || resp.Error.Error != "tls_error" || resp.Error.Type != "Self-signed certificate" || resp.Error.Status != 502 {
+		t.Fatalf("error = %+v", resp.Error)
+	}
+	if resp.Status != 0 || resp.Method != "HEAD" || resp.IP != "127.0.0.1" || resp.Timing == nil || resp.Headers == nil {
+		t.Errorf("status=%d method=%q ip=%q timing=%v", resp.Status, resp.Method, resp.IP, resp.Timing)
+	}
+	s := resp.SSL
+	if s == nil {
+		t.Fatal("expected the certificate details of the failing server")
+	}
+	if s.Verified || s.Valid || s.CertSource != "probe" || s.ProbeError != "" {
+		t.Errorf("verified=%v valid=%v certSource=%q probeError=%q", s.Verified, s.Valid, s.CertSource, s.ProbeError)
+	}
+	if s.ErrorType == nil || *s.ErrorType != "Self-signed certificate" || s.Error == nil || *s.Error != "Self-signed certificate" {
+		t.Errorf("errorType=%v error=%v", s.ErrorType, s.Error)
+	}
+	if s.Protocol != "TLSv1.3" || s.Cipher == "" || s.Bits == 0 {
+		t.Errorf("protocol=%q cipher=%q bits=%d", s.Protocol, s.Cipher, s.Bits)
+	}
+	if len(s.Chain) != 1 || s.Chain[0].PEM == "" || s.Chain[0].Label != "Server certificate" {
+		t.Errorf("chain = %+v", s.Chain)
+	}
+	if s.HostMatch == nil || !*s.HostMatch || !s.SelfSigned {
+		t.Errorf("hostMatch=%s selfSigned=%v", fmtBoolPtr(s.HostMatch), s.SelfSigned)
+	}
+	found := false
+	for _, i := range s.Issues {
+		if i.Type == "error" && strings.Contains(i.Msg, "self-signed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("issues lack the self-signed error: %+v", s.Issues)
+	}
+}
+
+// closeNthListener closes the n-th accepted connection (1-based) right away.
+type closeNthListener struct {
+	net.Listener
+	n     int32
+	count atomic.Int32
+}
+
+func (l *closeNthListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.count.Add(1) == l.n {
+			c.Close()
+			continue
+		}
+		return c, nil
+	}
+}
+
+func TestInspect_Diag_ProbeFails_FallsBackToVerifyError(t *testing.T) {
+	_, key, der := newCert(t, certOpts{cn: "flaky.test", ips: []net.IP{net.ParseIP("127.0.0.1")}}, nil, nil)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.Listener = &closeNthListener{Listener: srv.Listener, n: 2} // the probe is the second connection
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	resp := decodeInspect(t, doInspect(t, testCfg(t, x509.NewCertPool()), srv.URL, "&diag=1"))
+	s := resp.SSL
+	if s == nil {
+		t.Fatalf("expected certificate details from the verification error; error=%+v", resp.Error)
+	}
+	if s.CertSource != "verify-error" || s.ProbeError == "" || s.Protocol != "" || s.Cipher != "" {
+		t.Errorf("certSource=%q probeError=%q protocol=%q cipher=%q", s.CertSource, s.ProbeError, s.Protocol, s.Cipher)
+	}
+	if len(s.Chain) != 1 || s.Chain[0].Subject != "flaky.test" || s.ErrorType == nil || *s.ErrorType != "Self-signed certificate" {
+		t.Errorf("chain=%+v errorType=%v", s.Chain, s.ErrorType)
+	}
+}
+
+// The probe works against the real shape of a legacy server end to end: the
+// verified content request cannot even negotiate, yet the report carries
+// protocol, cipher and the trusted chain.
+func TestInspect_Diag_LegacyTLS10Server(t *testing.T) {
+	p := newTestPKI(t)
+	der, key := p.leaf(t, certOpts{cn: "tls10.test", key: "rsa2048"})
+	srv := tlsServerWith(t, [][]byte{der, p.interDER}, key, func(c *tls.Config) {
+		c.MinVersion, c.MaxVersion = tls.VersionTLS10, tls.VersionTLS10
+		c.CipherSuites = []uint16{tls.TLS_RSA_WITH_AES_128_CBC_SHA}
+	}, nil)
+
+	resp := decodeInspect(t, doInspect(t, testCfg(t, p.pool), srv.URL, "&diag=1"))
+	if resp.Error == nil || resp.Error.Error != "tls_error" || resp.Error.Type != "TLS protocol not supported" {
+		t.Fatalf("error = %+v", resp.Error)
+	}
+	s := resp.SSL
+	if s == nil {
+		t.Fatal("expected certificate details from the probe")
+	}
+	if s.Protocol != "TLSv1" || s.Cipher != "AES128-SHA" || s.Bits != 128 || s.Version != "TLS 1.0" || s.CertSource != "probe" {
+		t.Errorf("protocol=%q cipher=%q bits=%d version=%q source=%q", s.Protocol, s.Cipher, s.Bits, s.Version, s.CertSource)
+	}
+	if s.Verified || s.ErrorType == nil || *s.ErrorType != "TLS protocol not supported" {
+		t.Errorf("verified=%v errorType=%v", s.Verified, s.ErrorType)
+	}
+	if len(s.Chain) != 2 || s.Chain[1].Label != "Intermediate CA" || s.Chain[0].Key != "RSA 2048 bit" {
+		t.Errorf("chain = %+v", s.Chain)
+	}
+}
+
+func TestInspect_Diag_NonTLSFailure(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	rr := doInspect(t, testCfg(t, nil), "http://"+addr+"/", "&diag=1")
+	resp := decodeInspect(t, rr)
+	if rr.Code != http.StatusOK || resp.Error == nil || resp.Error.Error != "connection_error" || resp.Error.Type != "Could not connect to host" {
+		t.Errorf("code=%d error=%+v", rr.Code, resp.Error)
+	}
+	if resp.SSL != nil {
+		t.Error("no certificate report for a non-TLS failure")
+	}
+}
+
+func TestInspect_Timeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := testCfg(t, nil)
+	cfg.requestTimeout = 200 * time.Millisecond
+
+	rr := doInspect(t, cfg, upstream.URL, "")
+	var pe proxyError
+	json.Unmarshal(rr.Body.Bytes(), &pe)
+	if rr.Code != http.StatusGatewayTimeout || pe.Error != "timeout" || pe.Type != "Connection timeout" {
+		t.Errorf("without diag: code=%d body=%+v", rr.Code, pe)
+	}
+
+	rr = doInspect(t, cfg, upstream.URL, "&diag=1")
+	resp := decodeInspect(t, rr)
+	if rr.Code != http.StatusOK || resp.Error == nil || resp.Error.Error != "timeout" || resp.Error.Status != 504 {
+		t.Errorf("with diag: code=%d error=%+v", rr.Code, resp.Error)
+	}
+}
+
+// -----------------------------------------------------------------------
+// /inspect: success path additions
+// -----------------------------------------------------------------------
+
+func TestInspect_Success_NewFields(t *testing.T) {
+	p := newTestPKI(t)
+	der, key := p.leaf(t, certOpts{cn: "trusted.test"})
+	srv := tlsServerWith(t, [][]byte{der, p.interDER}, key, nil, nil)
+	cfg := testCfg(t, p.pool)
+
+	rr := doInspect(t, cfg, srv.URL, "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — %s", rr.Code, rr.Body.String())
+	}
+
+	// Golden list: every key an old frontend reads is still there.
+	var raw map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, k := range []string{"status", "headers", "ssl", "timing", "ip", "protocol", "http3", "method", "truncated", "maxBodySize"} {
+		if _, ok := raw[k]; !ok {
+			t.Errorf("missing top-level key %q", k)
+		}
+	}
+	if _, ok := raw["error"]; ok {
+		t.Error("a successful response must not carry an error key")
+	}
+	rawSSL, _ := raw["ssl"].(map[string]any)
+	for _, k := range []string{"version", "subject", "issuer", "issuerOrg", "organization", "validFrom", "validTo",
+		"daysLeft", "sans", "chain", "signatureAlgorithm", "publicKeyAlgorithm",
+		"protocol", "cipher", "cipherSuite", "bits", "verified", "valid", "error", "errorType", "hostMatch",
+		"selfSigned", "issues", "certSource"} {
+		if _, ok := rawSSL[k]; !ok {
+			t.Errorf("missing ssl key %q", k)
+		}
+	}
+	if issues, ok := rawSSL["issues"].([]any); !ok || len(issues) != 0 {
+		t.Errorf("issues = %v, want []", rawSSL["issues"])
+	}
+
+	resp := decodeInspect(t, rr)
+	s := resp.SSL
+	if resp.Method != "HEAD" || resp.MaxBodySize != cfg.maxResponseBytes || resp.Truncated {
+		t.Errorf("method=%q maxBodySize=%d truncated=%v", resp.Method, resp.MaxBodySize, resp.Truncated)
+	}
+	if !s.Verified || !s.Valid || s.Error != nil || s.ErrorType != nil || s.CertSource != "connection" {
+		t.Errorf("verified=%v valid=%v error=%v errorType=%v source=%q", s.Verified, s.Valid, s.Error, s.ErrorType, s.CertSource)
+	}
+	if s.Protocol != "TLSv1.3" || s.Cipher == "" || s.Cipher != s.CipherSuite || s.Bits < 128 || s.Version != "TLS 1.3" {
+		t.Errorf("protocol=%q cipher=%q cipherSuite=%q bits=%d", s.Protocol, s.Cipher, s.CipherSuite, s.Bits)
+	}
+	if s.HostMatch == nil || !*s.HostMatch || s.SelfSigned {
+		t.Errorf("hostMatch=%s selfSigned=%v", fmtBoolPtr(s.HostMatch), s.SelfSigned)
+	}
+	if len(s.Chain) != 2 ||
+		s.Chain[0].Position != 1 || s.Chain[0].Label != "Server certificate" || fmtBoolPtr(s.Chain[0].SignatureValid) != "true" ||
+		s.Chain[1].Position != 2 || s.Chain[1].Label != "Intermediate CA" || s.Chain[1].SignatureValid != nil {
+		t.Errorf("chain = %+v", s.Chain)
+	}
+	if s.Subject != "trusted.test" || s.Chain[0].Subject != "trusted.test" || s.Chain[0].Issuer != "Test Intermediate CA" {
+		t.Errorf("subject=%q chain[0]=%q/%q", s.Subject, s.Chain[0].Subject, s.Chain[0].Issuer)
+	}
+}
+
+func TestInspect_HeadFallback(t *testing.T) {
+	for _, headStatus := range []int{http.StatusMethodNotAllowed, http.StatusNotImplemented} {
+		t.Run(strconv.Itoa(headStatus), func(t *testing.T) {
+			var getDone atomic.Bool
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(headStatus)
+					return
+				}
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				// A body that never ends: reading it would hang until the timeout.
+				for i := 0; i < 1000; i++ {
+					if _, err := w.Write(bytes.Repeat([]byte("x"), 64*1024)); err != nil {
+						break
+					}
+					select {
+					case <-r.Context().Done():
+						getDone.Store(true)
+						return
+					case <-time.After(10 * time.Millisecond):
+					}
+				}
+				getDone.Store(true)
+			}))
+			defer upstream.Close()
+
+			start := time.Now()
+			rr := doInspect(t, testCfg(t, nil), upstream.URL, "")
+			elapsed := time.Since(start)
+
+			resp := decodeInspect(t, rr)
+			if rr.Code != http.StatusOK || resp.Status != http.StatusOK || resp.Method != "GET" {
+				t.Errorf("code=%d status=%d method=%q", rr.Code, resp.Status, resp.Method)
+			}
+			if ct := resp.Headers["Content-Type"]; len(ct) != 1 || ct[0] != "text/html" {
+				t.Errorf("headers of the GET expected, got %v", resp.Headers)
+			}
+			if resp.Body != "" {
+				t.Error("the GET body must not be returned")
+			}
+			if elapsed > 3*time.Second {
+				t.Errorf("took %v: the GET body was read instead of closed", elapsed)
+			}
+		})
+	}
+
+	t.Run("404 is not retried", func(t *testing.T) {
+		var gets atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				gets.Add(1)
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer upstream.Close()
+
+		resp := decodeInspect(t, doInspect(t, testCfg(t, nil), upstream.URL, ""))
+		if resp.Status != http.StatusNotFound || resp.Method != "HEAD" || gets.Load() != 0 {
+			t.Errorf("status=%d method=%q gets=%d", resp.Status, resp.Method, gets.Load())
+		}
+	})
+}
+
+// get=1 asks for the headers of a GET (PHP fetchUrl headersOnly = cURL
+// CUSTOMREQUEST GET + NOBODY), because some servers answer HEAD with fewer
+// headers — www.google.com sends HSTS only on GET. The body stays unread.
+func TestInspect_HeadersViaGET(t *testing.T) {
+	var heads, gets atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			heads.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		gets.Add(1)
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		// A body that never ends: reading it would hang until the timeout.
+		for i := 0; i < 1000; i++ {
+			if _, err := w.Write(bytes.Repeat([]byte("x"), 64*1024)); err != nil {
+				return
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	start := time.Now()
+	rr := doInspect(t, testCfg(t, nil), upstream.URL, "&get=1")
+	elapsed := time.Since(start)
+
+	resp := decodeInspect(t, rr)
+	if rr.Code != http.StatusOK || resp.Status != http.StatusOK || resp.Method != "GET" {
+		t.Errorf("code=%d status=%d method=%q", rr.Code, resp.Status, resp.Method)
+	}
+	if heads.Load() != 0 || gets.Load() != 1 {
+		t.Errorf("want exactly one GET and no HEAD, got heads=%d gets=%d", heads.Load(), gets.Load())
+	}
+	if v := resp.Headers["Strict-Transport-Security"]; len(v) != 1 {
+		t.Errorf("headers of the GET expected, got %v", resp.Headers)
+	}
+	if resp.Body != "" || resp.Truncated {
+		t.Errorf("the GET body must not be returned (body=%d bytes, truncated=%v)", len(resp.Body), resp.Truncated)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("took %v: the GET body was read instead of closed", elapsed)
+	}
+
+	t.Run("without get=1 the request stays HEAD", func(t *testing.T) {
+		heads.Store(0)
+		gets.Store(0)
+		resp := decodeInspect(t, doInspect(t, testCfg(t, nil), upstream.URL, ""))
+		if resp.Method != "HEAD" || heads.Load() != 1 || gets.Load() != 0 {
+			t.Errorf("method=%q heads=%d gets=%d", resp.Method, heads.Load(), gets.Load())
+		}
+		if _, ok := resp.Headers["Strict-Transport-Security"]; ok {
+			t.Error("HEAD response must not carry the GET-only header")
+		}
+	})
+
+	t.Run("body=1 wins over get=1", func(t *testing.T) {
+		small := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "hello")
+		}))
+		defer small.Close()
+		resp := decodeInspect(t, doInspect(t, testCfg(t, nil), small.URL, "&get=1&body=1"))
+		if resp.Method != "GET" || resp.Body != "hello" {
+			t.Errorf("method=%q body=%q", resp.Method, resp.Body)
+		}
+	})
+}
+
+func TestInspect_Location(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/a/b/c":
+			w.Header().Add("Location", "/ignored")
+			w.Header().Add("Location", "../x?y=1")
+			w.WriteHeader(http.StatusFound)
+		case "/js":
+			w.Header().Set("Location", "javascript:alert(1)")
+			w.WriteHeader(http.StatusMovedPermanently)
+		default:
+			w.Header().Set("Location", "/not-a-redirect")
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer upstream.Close()
+	cfg := testCfg(t, nil)
+
+	resp := decodeInspect(t, doInspect(t, cfg, upstream.URL+"/a/b/c", ""))
+	if resp.Status != http.StatusFound || resp.Location != upstream.URL+"/a/x?y=1" {
+		t.Errorf("status=%d location=%q", resp.Status, resp.Location)
+	}
+	if got := resp.Headers["Location"]; len(got) != 2 {
+		t.Errorf("raw Location values must stay in headers, got %v", got)
+	}
+	if resp := decodeInspect(t, doInspect(t, cfg, upstream.URL+"/js", "")); resp.Location != "" {
+		t.Errorf("unsupported scheme: location = %q, want empty", resp.Location)
+	}
+	if resp := decodeInspect(t, doInspect(t, cfg, upstream.URL+"/ok", "")); resp.Location != "" {
+		t.Errorf("non-3xx: location = %q, want empty", resp.Location)
+	}
+}
+
+func TestInspect_BodyTruncated(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(bytes.Repeat([]byte("a"), 4096))
+	}))
+	defer upstream.Close()
+	cfg := testCfg(t, nil)
+	cfg.maxResponseBytes = 1024
+
+	resp := decodeInspect(t, doInspect(t, cfg, upstream.URL, "&body=1"))
+	if !resp.Truncated || len(resp.Body) != 1024 || resp.MaxBodySize != 1024 || resp.Method != "GET" {
+		t.Errorf("truncated=%v len=%d maxBodySize=%d method=%q", resp.Truncated, len(resp.Body), resp.MaxBodySize, resp.Method)
+	}
+
+	cfg.maxResponseBytes = 4096
+	if resp := decodeInspect(t, doInspect(t, cfg, upstream.URL, "&body=1")); resp.Truncated || len(resp.Body) != 4096 {
+		t.Errorf("exactly at the cap: truncated=%v len=%d", resp.Truncated, len(resp.Body))
+	}
+}
+
+// A server that ignores the restricted Accept-Encoding must not get its
+// compressed bytes passed off as the page text.
+func TestInspect_BodyUndecodableEncoding(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		w.Write([]byte{0x1b, 0x2a, 0x00, 0xf8, 0xff, 0x00})
+	}))
+	defer upstream.Close()
+
+	resp := decodeInspect(t, doInspect(t, testCfg(t, nil), upstream.URL, "&body=1"))
+	if !resp.DecodeError || resp.Body != "" {
+		t.Errorf("decodeError=%v body=%q", resp.DecodeError, resp.Body)
+	}
+	if ce := resp.Headers["Content-Encoding"]; len(ce) != 1 || ce[0] != "br" {
+		t.Errorf("Content-Encoding = %v", ce)
+	}
+}
+
+// With body=1 the reported timing and IP belong to the GET alone; the HEAD
+// encoding probe before it is not traced.
+func TestInspect_BodyTimingIsTheGET(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			time.Sleep(300 * time.Millisecond)
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	resp := decodeInspect(t, doInspect(t, testCfg(t, nil), upstream.URL, "&body=1"))
+	if resp.Timing["ttfb"] >= 300 || resp.Timing["total"] >= 300 {
+		t.Errorf("timing includes the HEAD probe: %v", resp.Timing)
+	}
+	if resp.IP != "127.0.0.1" {
+		t.Errorf("ip = %q", resp.IP)
+	}
+}
+
+// -----------------------------------------------------------------------
+// /page: redirect chain, TLS diagnosis, body handling
+// -----------------------------------------------------------------------
+
+// doPage runs one /page request through the real upstream client.
+func doPage(t *testing.T, cfg *config, target, extra string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/page?url="+url.QueryEscape(target)+extra, nil)
+	req.Header.Set("X-Proxy-Token", cfg.sessionToken)
+	rr := httptest.NewRecorder()
+	pageHandler(cfg, newUpstreamClient(cfg)).ServeHTTP(rr, req)
+	return rr
+}
+
+func decodePage(t *testing.T, rr *httptest.ResponseRecorder) pageResponse {
+	t.Helper()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — %s", rr.Code, rr.Body.String())
+	}
+	var resp pageResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode page response: %v — body: %s", err, rr.Body.String())
+	}
+	return resp
+}
+
+// closedPortURL returns an http URL on 127.0.0.1 nothing listens on.
+func closedPortURL(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return "http://" + addr + "/"
+}
+
+func TestPage_ChainHeadFallback(t *testing.T) {
+	for _, headStatus := range []int{http.StatusMethodNotAllowed, http.StatusNotImplemented} {
+		t.Run(strconv.Itoa(headStatus), func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(headStatus)
+					return
+				}
+				w.Header().Set("Location", "/final")
+				w.WriteHeader(http.StatusMovedPermanently)
+				w.Write(bytes.Repeat([]byte("x"), 256*1024)) // closed unread
+			})
+			mux.HandleFunc("/final", func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte("<html>final</html>"))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			resp := decodePage(t, doPage(t, testCfg(t, nil), srv.URL+"/start", ""))
+			if resp.Error != nil {
+				t.Fatalf("error = %+v", resp.Error)
+			}
+			if len(resp.RedirectChain) != 2 {
+				t.Fatalf("expected 2 hops, got %+v", resp.RedirectChain)
+			}
+			first, last := resp.RedirectChain[0], resp.RedirectChain[1]
+			if first.Method != "GET" || first.Status != http.StatusMovedPermanently || first.Location != srv.URL+"/final" {
+				t.Errorf("hop 1: method=%q status=%d location=%q", first.Method, first.Status, first.Location)
+			}
+			if last.Method != "GET" || last.Status != http.StatusOK || last.URL != srv.URL+"/final" {
+				t.Errorf("final hop: method=%q status=%d url=%q", last.Method, last.Status, last.URL)
+			}
+			if resp.FinalURL != srv.URL+"/final" || !strings.Contains(resp.HTML, "final") {
+				t.Errorf("finalUrl=%q html=%q", resp.FinalURL, resp.HTML)
+			}
+		})
+	}
+
+	t.Run("HEAD 404 is not retried", func(t *testing.T) {
+		var gets atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				gets.Add(1)
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		resp := decodePage(t, doPage(t, testCfg(t, nil), srv.URL, ""))
+		// Exactly one GET: the final page fetch, none from the tracer.
+		if resp.Status != http.StatusNotFound || len(resp.RedirectChain) != 1 || gets.Load() != 1 {
+			t.Errorf("status=%d hops=%d gets=%d", resp.Status, len(resp.RedirectChain), gets.Load())
+		}
+	})
+}
+
+func TestPage_TLSFailure(t *testing.T) {
+	tlsSrv := selfSignedServer(t)
+	secureURL := tlsSrv.URL + "/secure"
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, secureURL, http.StatusMovedPermanently)
+	}))
+	defer start.Close()
+	cfg := testCfg(t, x509.NewCertPool())
+
+	t.Run("without diag", func(t *testing.T) {
+		resp := decodePage(t, doPage(t, cfg, start.URL, ""))
+		pe := resp.Error
+		if pe == nil || pe.Error != "tls_error" || pe.Status != http.StatusBadGateway || pe.Type != "Self-signed certificate" ||
+			!strings.HasPrefix(pe.Message, "tls_error: ") {
+			t.Fatalf("error = %+v", pe)
+		}
+		if resp.SSL != nil {
+			t.Error("without diag=1 a failed chain must not carry a certificate report")
+		}
+		if len(resp.RedirectChain) != 2 {
+			t.Fatalf("expected 2 hops, got %+v", resp.RedirectChain)
+		}
+		first, failed := resp.RedirectChain[0], resp.RedirectChain[1]
+		if first.Location != secureURL || first.CertCN != "" || first.CertDaysLeft != nil {
+			t.Errorf("hop 1 = %+v", first)
+		}
+		if failed.ErrorCategory != "tls_error" || failed.ErrorType != "Self-signed certificate" || failed.Error != pe.Message ||
+			failed.Method != "HEAD" || failed.IP != "127.0.0.1" || !failed.SSL || failed.URL != secureURL {
+			t.Errorf("failed hop = %+v", failed)
+		}
+		if resp.IP != "127.0.0.1" {
+			t.Errorf("ip = %q", resp.IP)
+		}
+	})
+
+	t.Run("with diag", func(t *testing.T) {
+		resp := decodePage(t, doPage(t, cfg, start.URL, "&diag=1"))
+		if resp.Error == nil || resp.Error.Error != "tls_error" {
+			t.Fatalf("error = %+v", resp.Error)
+		}
+		if resp.FinalURL != secureURL {
+			t.Errorf("finalUrl = %q, want the failing URL %q", resp.FinalURL, secureURL)
+		}
+		s := resp.SSL
+		if s == nil {
+			t.Fatal("expected the certificate details of the failing server")
+		}
+		if s.Valid || s.Verified || s.CertSource != "probe" || s.ErrorType == nil || *s.ErrorType != "Self-signed certificate" {
+			t.Errorf("valid=%v verified=%v source=%q errorType=%v", s.Valid, s.Verified, s.CertSource, s.ErrorType)
+		}
+		if len(s.Chain) != 1 || s.Chain[0].Subject != "self-signed.test" || s.HostMatch == nil || !*s.HostMatch {
+			t.Errorf("chain=%+v hostMatch=%s", s.Chain, fmtBoolPtr(s.HostMatch))
+		}
+	})
+}
+
+func TestPage_TooManyRedirects(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		n, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/r/"))
+		w.Header().Set("Location", fmt.Sprintf("/r/%d", n+1))
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	resp := decodePage(t, doPage(t, testCfg(t, nil), srv.URL+"/r/0", ""))
+	if resp.Error == nil || resp.Error.Error != "too_many_redirects" || resp.Error.Type != "Too many redirects" ||
+		resp.Error.Status != http.StatusBadGateway {
+		t.Fatalf("error = %+v", resp.Error)
+	}
+	if len(resp.RedirectChain) != 22 {
+		t.Fatalf("expected 21 redirect hops + the error hop, got %d", len(resp.RedirectChain))
+	}
+	last := resp.RedirectChain[21]
+	if last.Hop != 22 || last.ErrorCategory != "too_many_redirects" || last.Error != "too_many_redirects: more than 20 redirects" ||
+		last.URL != srv.URL+"/r/21" || last.Method != "" || last.Status != 0 {
+		t.Errorf("error hop = %+v", last)
+	}
+	if hop := resp.RedirectChain[20]; hop.Status != http.StatusFound || hop.Location != srv.URL+"/r/21" {
+		t.Errorf("hop 21 = %+v", hop)
+	}
+	// The URL after the 21st redirect is reported, never requested — and
+	// there is no final GET.
+	if n := requests.Load(); n != 21 {
+		t.Errorf("upstream saw %d requests, want 21", n)
+	}
+}
+
+// Exactly 20 redirects are allowed, like the Fetch standard's limit.
+func TestPage_TwentyRedirectsSucceed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/r/"))
+		if n == 20 {
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("<html>done</html>"))
+			return
+		}
+		w.Header().Set("Location", fmt.Sprintf("/r/%d", n+1))
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	resp := decodePage(t, doPage(t, testCfg(t, nil), srv.URL+"/r/0", ""))
+	if resp.Error != nil {
+		t.Fatalf("error = %+v, want success after exactly 20 redirects", resp.Error)
+	}
+	if resp.FinalURL != srv.URL+"/r/20" || !strings.Contains(resp.HTML, "done") {
+		t.Errorf("finalUrl = %q, html = %q", resp.FinalURL, resp.HTML)
+	}
+	if len(resp.RedirectChain) != 21 {
+		t.Errorf("chain length = %d, want 20 redirects + the final hop", len(resp.RedirectChain))
+	}
+}
+
+// A redirect hop that passed the SSRF pre-check but whose connection the
+// dialer blocks (DNS rebinding) keeps the v1.2.x contract: 502 blocked_target,
+// with the type.
+func TestProxy_FollowDialerBlock(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the blocked hop must never be reached")
+	}))
+	defer target.Close()
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", target.URL+"/secret")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer start.Close()
+
+	cfg := testCfg(t, nil) // pre-check allows everything
+	blockedAddr := strings.TrimPrefix(target.URL, "http://")
+	cfg.dialControl = func(network, address string, c syscall.RawConn) error {
+		if address == blockedAddr {
+			return safeDialControl(network, address, c) // 127.0.0.1: blocked
+		}
+		return nil
+	}
+
+	rr := doProxy(t, cfg, http.MethodGet, start.URL+"/", "&follow=1", nil)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status %d, want 502", rr.Code)
+	}
+	var pe proxyError
+	if err := json.Unmarshal(rr.Body.Bytes(), &pe); err != nil {
+		t.Fatalf("decode error body: %v — %s", err, rr.Body.String())
+	}
+	if pe.Error != "blocked_target" || pe.Status != http.StatusBadGateway || pe.Type != "Blocked target" {
+		t.Errorf("error body = %+v", pe)
+	}
+	if rr.Header().Get("Access-Control-Allow-Origin") == "" {
+		t.Error("dialer-block error carries no CORS headers")
+	}
+}
+
+// Every way a chain can stop yields a non-empty error code that matches the
+// failed hop's errorCategory.
+func TestPage_ChainStopCategories(t *testing.T) {
+	refused := closedPortURL(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/loop", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/loop", http.StatusFound)
+	})
+	mux.HandleFunc("/blocked", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://blocked.test/x", http.StatusFound)
+	})
+	mux.HandleFunc("/js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "javascript:alert(1)")
+		w.WriteHeader(http.StatusFound)
+	})
+	mux.HandleFunc("/refused", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, refused, http.StatusFound)
+	})
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCfg(t, nil)
+	cfg.ssrfCheck = func(host string) bool { return host == "blocked.test" }
+	cfg.requestTimeout = 300 * time.Millisecond
+
+	tests := []struct {
+		path, code, typ, lastURL string
+		status, hops             int
+	}{
+		{"/loop", "redirect_loop", "Redirect loop detected", srv.URL + "/loop", 502, 2},
+		{"/blocked", "blocked_target", "Blocked target", "http://blocked.test/x", 502, 2},
+		{"/js", "blocked_target", "Blocked target", "javascript:alert(1)", 502, 2},
+		{"/refused", "connection_error", "Could not connect to host", refused, 502, 2},
+		{"/slow", "timeout", "Connection timeout", srv.URL + "/slow", 504, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			resp := decodePage(t, doPage(t, cfg, srv.URL+tc.path, ""))
+			if resp.Error == nil || resp.Error.Error != tc.code || resp.Error.Type != tc.typ || resp.Error.Status != tc.status {
+				t.Fatalf("error = %+v", resp.Error)
+			}
+			if len(resp.RedirectChain) != tc.hops {
+				t.Fatalf("hops = %+v", resp.RedirectChain)
+			}
+			last := resp.RedirectChain[len(resp.RedirectChain)-1]
+			if last.ErrorCategory != tc.code || last.Error != resp.Error.Message || last.URL != tc.lastURL {
+				t.Errorf("last hop = %+v", last)
+			}
+			if last.ErrorType != "" {
+				t.Errorf("errorType is for tls_error only, got %q", last.ErrorType)
+			}
+		})
+	}
+}
+
+func TestPage_FinalGETTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			return // the redirect trace and the encoding probe pass
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := testCfg(t, nil)
+	cfg.requestTimeout = 200 * time.Millisecond
+
+	start := time.Now()
+	resp := decodePage(t, doPage(t, cfg, upstream.URL, ""))
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("took %v", elapsed)
+	}
+	if resp.Error == nil || resp.Error.Error != "timeout" || resp.Error.Status != http.StatusGatewayTimeout ||
+		resp.Error.Type != "Connection timeout" {
+		t.Fatalf("error = %+v", resp.Error)
+	}
+	if resp.IP != "127.0.0.1" || resp.SSL != nil || resp.HTML != "" {
+		t.Errorf("ip=%q ssl=%v html=%q", resp.IP, resp.SSL, resp.HTML)
+	}
+	// No fake hop for the failed GET.
+	if len(resp.RedirectChain) != 0 {
+		t.Errorf("redirectChain = %+v", resp.RedirectChain)
+	}
+}
+
+func TestPage_Truncated(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/utf8" {
+			w.Write([]byte(strings.Repeat("ä", 2048))) // 2 bytes per rune
+			return
+		}
+		w.Write(bytes.Repeat([]byte("a"), 4096))
+	}))
+	defer upstream.Close()
+	cfg := testCfg(t, nil)
+	cfg.maxResponseBytes = 1024
+
+	resp := decodePage(t, doPage(t, cfg, upstream.URL, ""))
+	if !resp.Truncated || resp.MaxBodySize != 1024 || len(resp.HTML) != 1024 || resp.Size != 1024 {
+		t.Errorf("truncated=%v maxBodySize=%d len=%d size=%d", resp.Truncated, resp.MaxBodySize, len(resp.HTML), resp.Size)
+	}
+
+	cfg.maxResponseBytes = 1025 // cuts through the 513th "ä"
+	resp = decodePage(t, doPage(t, cfg, upstream.URL+"/utf8", ""))
+	if !resp.Truncated || len(resp.HTML) != 1024 || !utf8.ValidString(resp.HTML) {
+		t.Errorf("truncated=%v len=%d valid=%v", resp.Truncated, len(resp.HTML), utf8.ValidString(resp.HTML))
+	}
+
+	cfg.maxResponseBytes = 4096
+	if resp := decodePage(t, doPage(t, cfg, upstream.URL, "")); resp.Truncated || len(resp.HTML) != 4096 {
+		t.Errorf("exactly at the cap: truncated=%v len=%d", resp.Truncated, len(resp.HTML))
+	}
+}
+
+func TestPage_CorruptGzipNeverRaw(t *testing.T) {
+	var page strings.Builder
+	page.WriteString("<html><body>")
+	for i := 0; i < 2000; i++ {
+		fmt.Fprintf(&page, "<p>paragraph %d</p>", i)
+	}
+	page.WriteString("</body></html>")
+	original := page.String()
+
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte(original))
+	zw.Close()
+	compressed := gz.Bytes()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/corrupt":
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Write(compressed[:len(compressed)/2])
+		case "/br":
+			w.Header().Set("Content-Encoding", "br")
+			w.Write([]byte{0x1b, 0x2a, 0x00, 0xf8, 0xff, 0x00})
+		default:
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Write(compressed)
+		}
+	}))
+	defer upstream.Close()
+	cfg := testCfg(t, nil)
+
+	resp := decodePage(t, doPage(t, cfg, upstream.URL+"/corrupt", ""))
+	if !resp.DecodeError || strings.HasPrefix(resp.HTML, "\x1f\x8b") || !strings.HasPrefix(original, resp.HTML) {
+		t.Errorf("corrupt gzip: decodeError=%v html starts %q", resp.DecodeError, resp.HTML[:min(len(resp.HTML), 16)])
+	}
+
+	resp = decodePage(t, doPage(t, cfg, upstream.URL+"/br", ""))
+	if !resp.DecodeError || resp.HTML != "" || resp.ContentEncoding != "br" {
+		t.Errorf("br: decodeError=%v html=%q contentEncoding=%q", resp.DecodeError, resp.HTML, resp.ContentEncoding)
+	}
+
+	resp = decodePage(t, doPage(t, cfg, upstream.URL+"/ok", ""))
+	if resp.DecodeError || resp.HTML != original || resp.Size != len(original) || resp.TransferSize != len(compressed) {
+		t.Errorf("valid gzip: decodeError=%v size=%d transferSize=%d", resp.DecodeError, resp.Size, resp.TransferSize)
+	}
+}
+
+// Regression against v1.2.4: a plain page behind a bogus Content-Encoding
+// ("none", "UTF-8") must still arrive as html; real but undecodable codings
+// and binary bytes behind a bogus token never do.
+func TestPage_UnknownContentEncoding(t *testing.T) {
+	const html = "<html><head><title>Grüße</title></head><body>ok</body></html>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/none":
+			w.Header().Set("Content-Encoding", "none")
+			w.Write([]byte(html))
+		case "/utf8":
+			w.Header().Set("Content-Encoding", "UTF-8")
+			w.Write([]byte(html))
+		case "/br":
+			w.Header().Set("Content-Encoding", "br")
+			w.Write([]byte{0x1b, 0x2a, 0x00, 0xf8, 0xff, 0x00})
+		case "/binary":
+			w.Header().Set("Content-Encoding", "x-custom")
+			w.Write([]byte{0x00, 0x9c, 0xff, 0xfe, 0x80, 0x81})
+		}
+	}))
+	defer upstream.Close()
+	cfg := testCfg(t, nil)
+
+	for _, path := range []string{"/none", "/utf8"} {
+		resp := decodePage(t, doPage(t, cfg, upstream.URL+path, ""))
+		if resp.DecodeError || resp.HTML != html {
+			t.Errorf("%s: decodeError=%v html=%q", path, resp.DecodeError, resp.HTML)
+		}
+	}
+	for _, path := range []string{"/br", "/binary"} {
+		resp := decodePage(t, doPage(t, cfg, upstream.URL+path, ""))
+		if !resp.DecodeError || resp.HTML != "" {
+			t.Errorf("%s: decodeError=%v html=%q", path, resp.DecodeError, resp.HTML)
+		}
+	}
+
+	// Same rule on /inspect?body=1.
+	ins := decodeInspect(t, doInspect(t, cfg, upstream.URL+"/none", "&body=1"))
+	if ins.DecodeError || ins.Body != html {
+		t.Errorf("/inspect none: decodeError=%v body=%q", ins.DecodeError, ins.Body)
+	}
+}
+
+func TestPage_HopCertSummary(t *testing.T) {
+	p := newTestPKI(t)
+	der, key := p.leaf(t, certOpts{cn: "hop.test"})
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/final", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/final", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html>secure</html>"))
+	})
+	srv := tlsServerWith(t, [][]byte{der, p.interDER}, key, nil, mux)
+
+	rr := doPage(t, testCfg(t, p.pool), srv.URL+"/start", "")
+	resp := decodePage(t, rr)
+	if resp.Error != nil || len(resp.RedirectChain) != 2 {
+		t.Fatalf("error=%+v hops=%+v", resp.Error, resp.RedirectChain)
+	}
+	wantExpiry := leaf.NotAfter.UTC().Format("2006-01-02")
+	// NotAfter is now+90 days at whole seconds, like PHP's time(): 90 while
+	// the clock is still in the second the leaf was issued, 89 after that.
+	for i, hop := range resp.RedirectChain {
+		if hop.CertCN != "hop.test" || hop.CertExpiry != wantExpiry || hop.CertDaysLeft == nil ||
+			(*hop.CertDaysLeft != 89 && *hop.CertDaysLeft != 90) {
+			t.Errorf("hop %d: certCN=%q certExpiry=%q certDaysLeft=%v", i+1, hop.CertCN, hop.CertExpiry, hop.CertDaysLeft)
+		}
+	}
+	s := resp.SSL
+	if s == nil || !s.Verified || s.CertSource != "connection" || s.HostMatch == nil || !*s.HostMatch {
+		t.Fatalf("ssl = %+v", s)
+	}
+
+	// New keys present on success, decodeError only when set.
+	var raw map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, k := range []string{"truncated", "maxBodySize"} {
+		if _, ok := raw[k]; !ok {
+			t.Errorf("missing key %q", k)
+		}
+	}
+	if _, ok := raw["decodeError"]; ok {
+		t.Error("decodeError must be omitted when false")
+	}
+}
+
+func TestPage_RawHeadersStatusLine(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Zeta", "z")
+		w.Header().Set("X-Alpha", "a")
+		w.Header().Set("Location", "/final")
+		w.WriteHeader(http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/final", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Server", "FinalServer")
+		w.Write([]byte("<html>final</html>"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp := decodePage(t, doPage(t, testCfg(t, nil), srv.URL+"/start", ""))
+	if len(resp.RedirectChain) != 2 {
+		t.Fatalf("hops = %+v", resp.RedirectChain)
+	}
+	lines := strings.Split(strings.TrimSuffix(resp.RedirectChain[0].RawHeaders, "\n"), "\n")
+	if lines[0] != "HTTP/1.1 301 Moved Permanently" {
+		t.Errorf("status line = %q", lines[0])
+	}
+	var keys []string
+	for _, l := range lines[1:] {
+		k, _, ok := strings.Cut(l, ": ")
+		if !ok {
+			t.Errorf("malformed header line %q", l)
+		}
+		keys = append(keys, k)
+	}
+	if !slices.IsSorted(keys) || !slices.Contains(keys, "X-Alpha") || !slices.Contains(keys, "Location") {
+		t.Errorf("header keys = %v, want sorted", keys)
+	}
+	if !strings.HasPrefix(resp.RawHeaders, "HTTP/1.1 200 OK\n") || resp.RedirectChain[1].RawHeaders != resp.RawHeaders {
+		t.Errorf("page rawHeaders = %q", resp.RawHeaders)
+	}
+}
+
+func TestStatusLine(t *testing.T) {
+	tests := []struct {
+		resp *http.Response
+		want string
+	}{
+		{&http.Response{Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Status: "301 Moved Permanently", StatusCode: 301}, "HTTP/1.1 301 Moved Permanently"},
+		{&http.Response{Proto: "HTTP/1.0", ProtoMajor: 1, Status: "404 Not Found", StatusCode: 404}, "HTTP/1.0 404 Not Found"},
+		{&http.Response{Proto: "HTTP/2.0", ProtoMajor: 2, Status: "200 OK", StatusCode: 200}, "HTTP/2 200"},
+		{&http.Response{StatusCode: 204}, "HTTP/1.1 204 No Content"},
+		{&http.Response{StatusCode: 599}, "HTTP/1.1 599"},
+	}
+	for _, tc := range tests {
+		if got := statusLine(tc.resp); got != tc.want {
+			t.Errorf("statusLine(%s/%d) = %q, want %q", tc.resp.Proto, tc.resp.StatusCode, got, tc.want)
+		}
+	}
+}
+
+func TestFormatRawHeaders_SortedAndKeepsValueOrder(t *testing.T) {
+	h := http.Header{}
+	h.Add("Set-Cookie", "b=2")
+	h.Add("Set-Cookie", "a=1")
+	h.Set("Age", "5")
+	if got, want := formatRawHeaders(h), "Age: 5\nSet-Cookie: b=2\nSet-Cookie: a=1\n"; got != want {
+		t.Errorf("formatRawHeaders = %q, want %q", got, want)
+	}
+}
+
+// -----------------------------------------------------------------------
+// /proxy redirects: Location, X-Upstream-Location and follow=1
+// -----------------------------------------------------------------------
+
+// doProxy runs one /proxy request through the real upstream client.
+func doProxy(t *testing.T, cfg *config, method, target, extra string, body io.Reader) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, "/proxy?url="+url.QueryEscape(target)+extra, body)
+	req.Header.Set("X-Proxy-Token", cfg.sessionToken)
+	rr := httptest.NewRecorder()
+	proxyHandler(cfg, newUpstreamClient(cfg)).ServeHTTP(rr, req)
+	return rr
+}
+
+// exposed reports whether name is listed in Access-Control-Expose-Headers.
+func exposed(rr *httptest.ResponseRecorder, name string) bool {
+	for _, h := range strings.Split(rr.Header().Get("Access-Control-Expose-Headers"), ",") {
+		if strings.EqualFold(strings.TrimSpace(h), name) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestProxy_LocationNotForwarded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/a/b":
+			w.Header().Set("Location", "../x")
+			w.WriteHeader(http.StatusFound)
+		case "/multi":
+			// Several Location values: the last one wins, as in PHP.
+			w.Header().Add("Location", "/first")
+			w.Header().Add("Location", "/last")
+			w.WriteHeader(http.StatusMovedPermanently)
+		case "/ok":
+			// A Location on a non-3xx is dropped as well, with no replacement.
+			w.Header().Set("Location", "/elsewhere")
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Errorf("unexpected upstream request %s — redirects must not be followed without follow=1", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+	cfg := testCfg(t, nil)
+
+	tests := []struct {
+		path       string
+		wantStatus int
+		wantLoc    string
+	}{
+		{"/a/b", http.StatusFound, upstream.URL + "/x"},
+		{"/multi", http.StatusMovedPermanently, upstream.URL + "/last"},
+		{"/ok", http.StatusCreated, ""},
+	}
+	for _, tc := range tests {
+		rr := doProxy(t, cfg, http.MethodGet, upstream.URL+tc.path, "", nil)
+		if rr.Code != tc.wantStatus {
+			t.Errorf("%s: status %d, want %d", tc.path, rr.Code, tc.wantStatus)
+		}
+		if got := rr.Header().Values("Location"); len(got) != 0 {
+			t.Errorf("%s: Location forwarded to the browser: %q", tc.path, got)
+		}
+		if got := rr.Header().Get("X-Upstream-Location"); got != tc.wantLoc {
+			t.Errorf("%s: X-Upstream-Location = %q, want %q", tc.path, got, tc.wantLoc)
+		}
+		if exposed(rr, "Location") {
+			t.Errorf("%s: Location listed in Access-Control-Expose-Headers", tc.path)
+		}
+		if !exposed(rr, "X-Upstream-Location") {
+			t.Errorf("%s: X-Upstream-Location not exposed: %q", tc.path, rr.Header().Get("Access-Control-Expose-Headers"))
+		}
+		// Without follow=1 there is no follow report.
+		if got := rr.Header().Get("X-Upstream-Final-URL"); got != "" {
+			t.Errorf("%s: X-Upstream-Final-URL = %q without follow=1", tc.path, got)
+		}
+		if got := rr.Header().Get("X-Upstream-Redirects"); got != "" {
+			t.Errorf("%s: X-Upstream-Redirects = %q without follow=1", tc.path, got)
+		}
+	}
+}
+
+func TestProxy_Follow(t *testing.T) {
+	var hits atomic.Int32
+	var lastMethod, lastBody atomic.Value
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		lastMethod.Store(r.Method)
+		b, _ := io.ReadAll(r.Body)
+		lastBody.Store(string(b))
+		w.Header().Set("X-Hop", r.URL.Path)
+		switch {
+		case r.URL.Path == "/start":
+			w.Header().Set("Location", "final") // relative to /start
+			w.WriteHeader(http.StatusMovedPermanently)
+		case r.URL.Path == "/final":
+			w.Header().Set("Content-Type", "text/plain")
+			if r.Method != http.MethodHead {
+				w.Write([]byte("final-body"))
+			}
+		case r.URL.Path == "/to-blocked":
+			w.Header().Set("Location", "http://blocked.test/secret")
+			w.WriteHeader(http.StatusFound)
+		case r.URL.Path == "/loop-a":
+			w.Header().Set("Location", "/loop-b")
+			w.WriteHeader(http.StatusFound)
+		case r.URL.Path == "/loop-b":
+			w.Header().Set("Location", "/loop-a")
+			w.WriteHeader(http.StatusFound)
+		case strings.HasPrefix(r.URL.Path, "/chain/"):
+			n, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/chain/"))
+			w.Header().Set("Location", fmt.Sprintf("/chain/%d", n+1))
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		case r.URL.Path == "/post":
+			w.Header().Set("Location", "/final")
+			w.WriteHeader(http.StatusSeeOther)
+		case r.URL.Path == "/js":
+			w.Header().Set("Location", "javascript:alert(1)")
+			w.WriteHeader(http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	cfg := testCfg(t, nil)
+	cfg.ssrfCheck = func(host string) bool { return host == "blocked.test" }
+
+	run := func(t *testing.T, method, path, extra, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		hits.Store(0)
+		var rb io.Reader
+		if body != "" {
+			rb = strings.NewReader(body)
+		}
+		return doProxy(t, cfg, method, upstream.URL+path, extra, rb)
+	}
+
+	t.Run("relative 301 is followed", func(t *testing.T) {
+		rr := run(t, http.MethodGet, "/start", "&follow=1", "")
+		if rr.Code != http.StatusOK || rr.Body.String() != "final-body" {
+			t.Fatalf("got %d %q, want 200 final-body", rr.Code, rr.Body.String())
+		}
+		if got := rr.Header().Get("X-Upstream-Final-URL"); got != upstream.URL+"/final" {
+			t.Errorf("X-Upstream-Final-URL = %q", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Redirects"); got != "1" {
+			t.Errorf("X-Upstream-Redirects = %q, want 1", got)
+		}
+		// Headers and metadata describe the final hop.
+		if got := rr.Header().Get("X-Hop"); got != "/final" {
+			t.Errorf("X-Hop = %q, want the final hop's headers", got)
+		}
+		if got := rr.Header().Get("X-Upstream-IP"); got != "127.0.0.1" {
+			t.Errorf("X-Upstream-IP = %q", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Location"); got != "" {
+			t.Errorf("X-Upstream-Location = %q on a 200", got)
+		}
+		for _, h := range []string{"X-Upstream-Location", "X-Upstream-Final-URL", "X-Upstream-Redirects"} {
+			if !exposed(rr, h) {
+				t.Errorf("%s not exposed: %q", h, rr.Header().Get("Access-Control-Expose-Headers"))
+			}
+		}
+		if n := hits.Load(); n != 2 {
+			t.Errorf("upstream hits = %d, want 2", n)
+		}
+	})
+
+	t.Run("no redirect reports zero", func(t *testing.T) {
+		rr := run(t, http.MethodGet, "/final", "&follow=1", "")
+		if got := rr.Header().Get("X-Upstream-Final-URL"); got != upstream.URL+"/final" {
+			t.Errorf("X-Upstream-Final-URL = %q", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Redirects"); got != "0" {
+			t.Errorf("X-Upstream-Redirects = %q, want 0", got)
+		}
+	})
+
+	t.Run("HEAD keeps its method", func(t *testing.T) {
+		rr := run(t, http.MethodHead, "/start", "&follow=1", "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200", rr.Code)
+		}
+		if got := lastMethod.Load(); got != http.MethodHead {
+			t.Errorf("final hop method = %v, want HEAD", got)
+		}
+	})
+
+	t.Run("blocked hop", func(t *testing.T) {
+		rr := run(t, http.MethodGet, "/to-blocked", "&follow=1", "")
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("status %d, want 403", rr.Code)
+		}
+		var pe proxyError
+		if err := json.Unmarshal(rr.Body.Bytes(), &pe); err != nil {
+			t.Fatalf("decode error body: %v — %s", err, rr.Body.String())
+		}
+		if pe.Error != "blocked_target" || pe.Status != http.StatusForbidden || pe.Type != "Blocked target" {
+			t.Errorf("error body = %+v", pe)
+		}
+		if rr.Header().Get("Access-Control-Allow-Origin") == "" {
+			t.Error("blocked-hop error carries no CORS headers")
+		}
+		if n := hits.Load(); n != 1 {
+			t.Errorf("upstream hits = %d, want 1", n)
+		}
+	})
+
+	t.Run("loop returns the last 3xx", func(t *testing.T) {
+		rr := run(t, http.MethodGet, "/loop-a", "&follow=1", "")
+		if rr.Code != http.StatusFound {
+			t.Fatalf("status %d, want 302", rr.Code)
+		}
+		if got := rr.Header().Get("X-Upstream-Location"); got != upstream.URL+"/loop-a" {
+			t.Errorf("X-Upstream-Location = %q", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Final-URL"); got != upstream.URL+"/loop-b" {
+			t.Errorf("X-Upstream-Final-URL = %q", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Redirects"); got != "1" {
+			t.Errorf("X-Upstream-Redirects = %q, want 1", got)
+		}
+		if n := hits.Load(); n != 2 {
+			t.Errorf("upstream hits = %d, want 2", n)
+		}
+	})
+
+	t.Run("more than five redirects", func(t *testing.T) {
+		rr := run(t, http.MethodGet, "/chain/0", "&follow=1", "")
+		if rr.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("status %d, want 307", rr.Code)
+		}
+		if got := rr.Header().Get("X-Upstream-Redirects"); got != strconv.Itoa(maxProxyRedirects) {
+			t.Errorf("X-Upstream-Redirects = %q, want %d", got, maxProxyRedirects)
+		}
+		if got := rr.Header().Get("X-Upstream-Final-URL"); got != upstream.URL+"/chain/5" {
+			t.Errorf("X-Upstream-Final-URL = %q", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Location"); got != upstream.URL+"/chain/6" {
+			t.Errorf("X-Upstream-Location = %q", got)
+		}
+		if n := hits.Load(); n != maxProxyRedirects+1 {
+			t.Errorf("upstream hits = %d, want %d", n, maxProxyRedirects+1)
+		}
+	})
+
+	t.Run("unsupported scheme is not followed", func(t *testing.T) {
+		rr := run(t, http.MethodGet, "/js", "&follow=1", "")
+		if rr.Code != http.StatusFound {
+			t.Fatalf("status %d, want 302", rr.Code)
+		}
+		if got := rr.Header().Get("X-Upstream-Location"); got != "" {
+			t.Errorf("X-Upstream-Location = %q for a javascript: target", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Redirects"); got != "0" {
+			t.Errorf("X-Upstream-Redirects = %q, want 0", got)
+		}
+	})
+
+	t.Run("POST is not followed", func(t *testing.T) {
+		rr := run(t, http.MethodPost, "/post", "&follow=1", "payload")
+		if rr.Code != http.StatusSeeOther {
+			t.Fatalf("status %d, want 303", rr.Code)
+		}
+		if got := lastBody.Load(); got != "payload" {
+			t.Errorf("upstream body = %v, want the POST payload", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Location"); got != upstream.URL+"/final" {
+			t.Errorf("X-Upstream-Location = %q", got)
+		}
+		if got := rr.Header().Get("X-Upstream-Final-URL"); got != "" {
+			t.Errorf("X-Upstream-Final-URL = %q for a POST", got)
+		}
+		if n := hits.Load(); n != 1 {
+			t.Errorf("upstream hits = %d, want 1", n)
+		}
+	})
 }

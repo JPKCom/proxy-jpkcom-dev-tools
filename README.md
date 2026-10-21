@@ -64,7 +64,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.2.4  —  ready                         ║
+║              localproxy v1.3.0  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -132,11 +132,14 @@ the check.
 | Endpoint | Auth required | Description |
 |---|---|---|
 | `GET /proxy?url=...` | Yes (`X-Proxy-Token`) | Forward request to the target URL |
-| `POST /proxy?url=...` | Yes (`X-Proxy-Token`) | Forward POST request with body to the target URL |
+| `GET /proxy?url=...&follow=1` | Yes (`X-Proxy-Token`) | Same, but the proxy follows up to 5 redirects itself (GET and HEAD only) |
+| `POST /proxy?url=...` | Yes (`X-Proxy-Token`) | Forward POST request with body to the target URL (`follow` is ignored) |
 | `HEAD /proxy?url=...` | Yes (`X-Proxy-Token`) | Forward HEAD request to the target URL |
 | `GET /inspect?url=...` | Yes (`X-Proxy-Token`) | Return connection metadata as JSON (SSL, timing, IP, headers) |
 | `GET /inspect?url=...&body=1` | Yes (`X-Proxy-Token`) | Same as above, but includes the response body |
+| `GET /inspect?url=...&diag=1` | Yes (`X-Proxy-Token`) | Report upstream failures inline (HTTP 200); a `tls_error` also carries the failing server's certificate details |
 | `GET /page?url=...` | Yes (`X-Proxy-Token`) | Full page analysis: redirect chain + body + SSL + timing (single JSON) |
+| `GET /page?url=...&diag=1` | Yes (`X-Proxy-Token`) | Same; a `tls_error` also carries the failing server's certificate details |
 | `OPTIONS /proxy`, `OPTIONS /inspect`, `OPTIONS /page` | No | CORS preflight (returns 204 with CORS + PNA headers) |
 | `GET /ping` | No | Health check (returns `localproxy ok`) |
 | `GET /version` | No | Version info as JSON (version, license, author, repo) |
@@ -153,12 +156,49 @@ Every `/proxy` response includes upstream connection metadata as custom headers:
 | `X-Upstream-IP` | `93.184.216.34` | Resolved IP address of the upstream server |
 | `X-Upstream-Timing` | `dns=12;tcp=45;ssl=23;ttfb=156;total=234` | Connection timing breakdown in milliseconds |
 | `X-Upstream-Content-Encoding` | `gzip` | Original `Content-Encoding` from upstream |
-| `X-Upstream-Content-Length` | `34567` | Transfer size in bytes (from `Content-Length` or counted for chunked responses) |
-| `X-Upstream-Truncated` | `1` | Present only when the body exceeded `--max-mb` and was cut short |
+| `X-Upstream-Content-Length` | `34567` | Transfer size in bytes (from `Content-Length`, or counted for compressed chunked responses — then the capped size when `X-Upstream-Truncated` is set) |
+| `X-Upstream-Truncated` | `1` | Present only when the body exceeded `--max-mb` and was cut short. Not set for a chunked body **without** `Content-Encoding` (see the v1.3.0 known limitations) |
+| `X-Upstream-Location` | `https://www.example.com/` | On any 3xx: the target's last `Location` value, resolved against the URL that returned it (absolute, http/https only, userinfo dropped); absent when there is no usable `Location`. Replaces `Location`, which is never forwarded |
+| `X-Upstream-Final-URL` | `https://www.example.com/` | With `follow=1` only: the URL the returned response came from |
+| `X-Upstream-Redirects` | `1` | With `follow=1` only: how many redirects were followed (`0` if none) |
 
-All upstream response headers are readable by JavaScript — `Access-Control-Expose-Headers` is dynamically built from the actual upstream response headers plus the `X-Upstream-*` metadata headers.
+All upstream response headers are readable by JavaScript — `Access-Control-Expose-Headers` is dynamically built from the forwarded upstream response headers plus the nine `X-Upstream-*` metadata headers. With `follow=1`, all metadata headers describe the final hop.
 
-**Timing values:** `dns` = DNS lookup, `tcp` = TCP connect, `ssl` = TLS handshake, `ttfb` = time to first byte, `total` = total request time. Every request uses a fresh connection, so all timing phases are always populated.
+**Timing values:** `dns` = DNS lookup, `tcp` = TCP connect, `ssl` = TLS handshake, `ttfb` = time to first byte (measured from the start of the request), `total` = total request time. Every request uses a fresh connection, so all timing phases are always populated.
+
+### Redirects on `/proxy`
+
+The upstream `Location` header is **never** passed to the browser (since
+v1.3.0). With `Location` present, `fetch()` would follow the redirect straight
+to the target — carrying the `X-Proxy-Token` header to a third party whenever
+that target's CORS policy let the preflight through. A 3xx therefore reaches the
+caller as a plain response, with the resolved target in `X-Upstream-Location`.
+
+With `follow=1` the proxy follows the redirect itself instead:
+
+- **Statuses:** 301, 302, 303, 307 and 308. 300 and 304 are returned as they are.
+- **Limit:** 5 redirects (the PHP proxy's limit). The sixth 3xx is returned with
+  `X-Upstream-Location`.
+- **Stops without an error** — the 3xx is returned as it is — when the
+  `Location` is missing, cannot be parsed or leaves http/https (`javascript:`,
+  `data:`, …), or when it points to a URL already visited (loop).
+- **SSRF:** each redirect target passes the hostname pre-check before it is
+  requested; a private or reserved target ends the request with
+  `403 blocked_target` (`"type": "Blocked target"`). The dialer enforces the
+  same rule for the actual connection.
+- **Method:** GET and HEAD keep their method on every hop. POST is never
+  followed — a request body must not be replayed — and gets no
+  `X-Upstream-Final-URL` / `X-Upstream-Redirects`.
+- **Time:** all hops share one `--timeout`.
+
+```bash
+curl -sD- -o /dev/null -H "X-Proxy-Token: $TOKEN" \
+  "http://127.0.0.1:8765/proxy?url=http://example.com/robots.txt&follow=1"
+# Example output for a target that redirects http → https → www:
+# HTTP/1.1 200 OK
+# X-Upstream-Final-Url: https://www.example.com/robots.txt
+# X-Upstream-Redirects: 2
+```
 
 ---
 
@@ -166,15 +206,30 @@ All upstream response headers are readable by JavaScript — `Access-Control-Exp
 
 The `/inspect` endpoint returns detailed connection metadata as JSON — including SSL certificate information that browsers cannot access through the Fetch API.
 
+Since v1.3.0 the certificate report has the same content as the PHP proxy of the JPKCom Tools: the full chain with labels and signature checks, PEM and fingerprints per certificate, the host-name check, a list of issues, and the negotiated protocol and cipher in OpenSSL notation. With `diag=1` this also works for a server whose certificate or TLS setup is broken.
+
 ### Request
 
 ```
 GET http://127.0.0.1:{PORT}/inspect?url={ENCODED_TARGET_URL}
 GET http://127.0.0.1:{PORT}/inspect?url={ENCODED_TARGET_URL}&body=1
+GET http://127.0.0.1:{PORT}/inspect?url={ENCODED_TARGET_URL}&get=1
+GET http://127.0.0.1:{PORT}/inspect?url={ENCODED_TARGET_URL}&diag=1
 Header: X-Proxy-Token: {TOKEN}
 ```
 
-Without `body=1`, the proxy sends a HEAD request upstream (faster, no body download). With `body=1`, it sends a GET request, decompresses the body if needed (gzip/deflate), and includes the plain-text body in the JSON. The original `Content-Encoding` header is preserved in the `headers` map.
+| Parameter | Effect |
+|---|---|
+| `url` | Target URL (http/https). Send internationalised host names in punycode (`new URL(u).href` in JavaScript): Go's standard library has no IDNA, so for a non-ASCII host `hostMatch` is `null` and the diagnostic probe sends no SNI |
+| `body=1` | GET instead of HEAD; the body is included (see below) |
+| `get=1` | GET instead of HEAD, for the headers only: the body is closed unread. Ignored with `body=1` (since v1.3.0) |
+| `diag=1` | Report an upstream failure inline — HTTP 200 with an `error` object instead of 502/504. A `tls_error` additionally runs the [TLS diagnostic probe](#tls-diagnostic-probe) and fills `ssl` with the failing server's certificate details |
+
+Without `body=1`, the proxy sends a HEAD request upstream (faster, no body download). A server that refuses HEAD with **405 or 501** is asked again with GET, for the headers only: the GET body is closed unread, so a large page is never downloaded. `method` tells which request the result describes.
+
+With `get=1`, the proxy skips the HEAD and sends that headers-only GET straight away. Some servers answer HEAD with fewer headers than GET — `www.google.com`, for example, sends `Strict-Transport-Security` only on GET — so a security-header check should use `get=1`. It is also what the PHP proxy of the JPKCom Tools puts on the wire for a headers-only fetch (cURL `CURLOPT_CUSTOMREQUEST "GET"` plus `CURLOPT_NOBODY`). As with the fallback, the body is closed unread and the connection is dropped (keep-alives are disabled), so the page is never downloaded.
+
+With `body=1`, the proxy first sends an untraced HEAD with the browser's full `Accept-Encoding` to learn the server's preferred compression, then a GET with `Accept-Encoding: gzip, deflate`. It decompresses the body (gzip/deflate) and includes the plain text in the JSON; `timing` and `ip` describe that GET. The HEAD-detected `Content-Encoding` is restored in the `headers` map. The body is capped at `--max-mb`, on the wire and after decoding, and cut on a UTF-8 character boundary. A registered encoding the standard library cannot decode (br, zstd, compress, dcb, dcz, …), stacked encodings (`gzip, br`) or a corrupt stream set `decodeError: true`, and `body` then holds only what was decoded — never raw compressed bytes. An unregistered token (`none`, `UTF-8`, …) is treated as a mislabelled plain body: passed through if it is valid UTF-8, otherwise `decodeError: true` and an empty `body` (see [Compression](#compression)).
 
 ### Response
 
@@ -182,9 +237,9 @@ Without `body=1`, the proxy sends a HEAD request upstream (faster, no body downl
 {
   "status": 200,
   "headers": {
-    "Content-Type": "text/html; charset=utf-8",
-    "Server": "nginx",
-    "Strict-Transport-Security": "max-age=31536000"
+    "Content-Type": ["text/html; charset=utf-8"],
+    "Server": ["nginx"],
+    "Strict-Transport-Security": ["max-age=31536000"]
   },
   "ssl": {
     "version": "TLS 1.3",
@@ -197,11 +252,55 @@ Without `body=1`, the proxy sends a HEAD request upstream (faster, no body downl
     "daysLeft": 87,
     "sans": ["example.com", "www.example.com"],
     "chain": [
-      { "subject": "example.com", "issuer": "R3" },
-      { "subject": "R3", "issuer": "ISRG Root X1" }
+      {
+        "subject": "example.com",
+        "issuer": "R3",
+        "position": 1,
+        "label": "Server certificate",
+        "signatureValid": true,
+        "subjectOrg": null,
+        "subjectDN": "CN=example.com",
+        "issuerOrg": "Let's Encrypt",
+        "issuerDN": "C=US, O=Let's Encrypt, CN=R3",
+        "selfIssued": false,
+        "isCA": false,
+        "validFrom": "2024-01-23 10:23:23 UTC",
+        "validUntil": "2024-04-21 10:23:22 UTC",
+        "validFromTs": 1706005403,
+        "validUntilTs": 1713695002,
+        "daysLeft": 87,
+        "serial": "04:A1:3F:…",
+        "signatureAlgorithm": "sha256WithRSAEncryption",
+        "key": "EC P-256 (256 bit)",
+        "keyBits": null,
+        "sans": ["example.com", "www.example.com"],
+        "sha256": "4A:3E:C1:…",
+        "sha1": "32:8B:91:…",
+        "pem": "-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----\n"
+      },
+      {
+        "subject": "R3",
+        "issuer": "ISRG Root X1",
+        "position": 2,
+        "label": "Intermediate CA",
+        "signatureValid": null,
+        "…": "…"
+      }
     ],
     "signatureAlgorithm": "SHA256-RSA",
-    "publicKeyAlgorithm": "RSA"
+    "publicKeyAlgorithm": "ECDSA",
+    "protocol": "TLSv1.3",
+    "cipher": "TLS_AES_128_GCM_SHA256",
+    "cipherSuite": "TLS_AES_128_GCM_SHA256",
+    "bits": 128,
+    "verified": true,
+    "valid": true,
+    "error": null,
+    "errorType": null,
+    "hostMatch": true,
+    "selfSigned": false,
+    "issues": [],
+    "certSource": "connection"
   },
   "timing": {
     "dnsLookup": 12.3,
@@ -213,20 +312,129 @@ Without `body=1`, the proxy sends a HEAD request upstream (faster, no body downl
   "ip": "93.184.216.34",
   "protocol": "HTTP/2.0",
   "http3": true,
-  "body": "<html>..."
+  "body": "<html>...",
+  "method": "GET",
+  "truncated": false,
+  "maxBodySize": 52428800
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `status` | int | Upstream HTTP status code |
-| `headers` | object | All upstream response headers |
-| `ssl` | object / null | TLS certificate details (`null` for HTTP targets) |
-| `timing` | object | Connection timing in milliseconds (1 decimal precision) |
-| `ip` | string | Resolved IP address of the upstream server |
-| `protocol` | string | HTTP protocol version actually used for this request (e.g. `HTTP/1.1`, `HTTP/2.0`) |
+| `status` | int | Upstream HTTP status code; `0` when the request failed (`diag=1`) |
+| `headers` | object | All upstream response headers, each value an array |
+| `ssl` | object / null | Certificate report — see below. `null` for HTTP targets, and for a failed request unless `diag=1` produced one |
+| `timing` | object | Connection timing in milliseconds (1 decimal): `dnsLookup`, `tcpConnect`, `sslHandshake`, `ttfb` (from the start of the request), `total` |
+| `ip` | string | IP address the request connected to |
+| `protocol` | string | HTTP protocol version actually used for this request (e.g. `HTTP/1.1`, `HTTP/2.0`); `""` on failure |
 | `http3` | bool | Whether the target **advertises** HTTP/3 — see [HTTP/3 detection](#http3-detection) |
 | `body` | string | Response body (only present when `body=1` is requested) |
+| `method` | string | `"HEAD"`, or `"GET"` with `body=1`, with `get=1`, or after the target refused HEAD with 405/501 |
+| `location` | string | 3xx only: the last `Location` value resolved against the target URL (RFC 3986) — absolute, http/https only, userinfo dropped. Absent when there is no usable `Location`; the raw value stays in `headers` |
+| `truncated` | bool | `body=1`: the body hit `maxBodySize` |
+| `maxBodySize` | int | The `--max-mb` cap in bytes; `0` means unlimited |
+| `decodeError` | bool | `body=1`: the `Content-Encoding` could not be decoded (br, zstd, stacked, corrupt, or an unknown token with a non-UTF-8 body). Only present when `true` |
+| `error` | object | `diag=1` only, when the upstream request failed: `{error, message, status, type}` as in [Error responses](#error-responses) |
+
+#### `ssl` object
+
+The first twelve fields are the original v1.0 shape and keep Go's naming; the rest (since v1.3.0) mirror the PHP proxy.
+
+| Field | Description |
+|---|---|
+| `version` | TLS version, Go style: `"TLS 1.3"` |
+| `subject`, `issuer` | Common name of the leaf and of its issuer |
+| `organization`, `issuerOrg` | First `O` of the leaf's subject and issuer, `""` if none |
+| `validFrom`, `validTo` | Leaf validity, RFC 3339 |
+| `daysLeft` | Whole days until the leaf expires, floored — negative once expired |
+| `sans` | DNS names, then IP addresses |
+| `chain` | The certificates as the server sent them, leaf first (max. 10) — see below |
+| `signatureAlgorithm`, `publicKeyAlgorithm` | Go names: `"SHA256-RSA"`, `"ECDSA"` |
+| `protocol` | TLS version in OpenSSL notation: `"TLSv1"`, `"TLSv1.1"`, `"TLSv1.2"`, `"TLSv1.3"`. `""` when no handshake state is known (`certSource: "verify-error"`) |
+| `cipher` | OpenSSL name of the negotiated suite, e.g. `"ECDHE-RSA-AES128-GCM-SHA256"` |
+| `cipherSuite` | IANA name, e.g. `"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"` |
+| `bits` | Symmetric strength of the suite |
+| `verified` | The content connection passed verification against the system trust store |
+| `valid` | Same value as `verified`, under the name the PHP proxy's SEO report uses |
+| `error` | Why verification failed, in OpenSSL's verify-result wording: `"Certificate has expired"`, `"Certificate is not yet valid"`, `"Hostname mismatch"`, `"Self-signed certificate"`, `"Self-signed certificate in chain"`, `"Unable to get local issuer certificate"`, `"Certificate not trusted"`, `"TLS protocol not supported"`, `"TLS handshake failed"`. `null` if verified |
+| `errorType` | The classified failure — the same text as `error.type` (see [Error responses](#error-responses)). `null` if verified |
+| `hostMatch` | Whether the leaf covers the requested host (RFC 6125: SANs, or the subject if there are none; `*.` matches exactly one label; IPs compared as IPs). `null` when the host is unknown or not ASCII |
+| `selfSigned` | The leaf is self-issued and its self-signature is valid |
+| `issues` | `[{ "type": "error" \| "warning", "msg": "…" }]` — expired / not yet valid / expires within 14 days, host not covered, self-signed, weak signature algorithm (MD5, SHA-1; self-signed roots exempt), RSA key below 2048 bit, no intermediate sent, broken chain or wrong order. Same rules and English messages as the PHP proxy |
+| `certSource` | Where the chain came from: `"connection"` (the verified connection), `"probe"` (the [TLS diagnostic probe](#tls-diagnostic-probe)) or `"verify-error"` (the unverified chain attached to the verification error, when the probe failed) |
+| `probeError` | Only present when the probe failed: a generic note; details go to the proxy's terminal |
+
+#### `chain` entries
+
+| Field | Description |
+|---|---|
+| `subject`, `issuer` | First `CN`, else first `O`, else `"Unknown"` |
+| `position` | 1-based position in the served chain |
+| `label` | `"Server certificate"`, `"Intermediate CA"`, `"Root CA (self-signed)"`, `"Cross-signed root (acts as intermediate)"` or `"Certificate"` |
+| `signatureValid` | Whether the next certificate (or, for a self-issued one, the certificate itself) signed it; `null` when the issuer was not sent |
+| `subjectOrg`, `issuerOrg` | First `O`, or `null` |
+| `subjectDN`, `issuerDN` | Full name in DER order, e.g. `"C=US, O=Let's Encrypt, CN=R3"` |
+| `selfIssued`, `isCA` | Subject equals issuer; basic constraints say CA |
+| `validFrom`, `validUntil` | `"YYYY-MM-DD hh:mm:ss UTC"` |
+| `validFromTs`, `validUntilTs` | Unix seconds |
+| `daysLeft` | Floored, negative once expired |
+| `serial` | Upper-case hex pairs, `"04:A1:3F:…"` |
+| `signatureAlgorithm` | OpenSSL long name: `sha256WithRSAEncryption`, `ecdsa-with-SHA256`, `rsassaPss`, `ED25519`, … |
+| `key` | `"RSA 2048 bit"`, `"EC P-256 (256 bit)"`, `"Ed25519"`, `"DSA 1024 bit"` or `"Unknown"` |
+| `keyBits` | RSA key size, `null` for other key types |
+| `sans` | DNS names, then IP addresses |
+| `sha256`, `sha1` | Fingerprints, upper-case hex pairs |
+| `pem` | The certificate in PEM encoding |
+
+#### Failures with `diag=1`
+
+Without `diag=1`, a failed upstream request is answered with 502/504 and the
+JSON error body — unchanged from earlier versions apart from the added `type`.
+With `diag=1` the answer is HTTP 200, `status: 0` and an `error` object; for a
+`tls_error`, `ssl` describes what the failing server presented:
+
+```json
+{
+  "status": 0,
+  "headers": {},
+  "ssl": {
+    "subject": "localhost",
+    "issuer": "localhost",
+    "chain": [{ "label": "Server certificate", "selfIssued": true, "signatureValid": true, "pem": "…", "…": "…" }],
+    "protocol": "TLSv1.3",
+    "cipher": "TLS_AES_128_GCM_SHA256",
+    "verified": false,
+    "valid": false,
+    "error": "Hostname mismatch",
+    "errorType": "Host name does not match the certificate",
+    "hostMatch": false,
+    "selfSigned": true,
+    "issues": [
+      { "type": "error", "msg": "The host name is not covered by the certificate (CN/SAN)." },
+      { "type": "error", "msg": "The certificate is self-signed — browsers will not trust it." }
+    ],
+    "certSource": "probe",
+    "…": "…"
+  },
+  "timing": { "dnsLookup": 0, "tcpConnect": 0.4, "sslHandshake": 1.5, "ttfb": 0, "total": 2.3 },
+  "ip": "93.184.216.34",
+  "protocol": "",
+  "http3": false,
+  "method": "HEAD",
+  "truncated": false,
+  "maxBodySize": 52428800,
+  "error": {
+    "error": "tls_error",
+    "message": "TLS certificate hostname mismatch",
+    "status": 502,
+    "type": "Host name does not match the certificate"
+  }
+}
+```
+
+The verdict (`verified`, `error`, `errorType`) always comes from the real,
+verified connection; the probe only supplies the details. A failure other than
+`tls_error` returns `ssl: null`.
 
 ---
 
@@ -238,8 +446,15 @@ The `/page` endpoint performs a complete page analysis in a single request — r
 
 ```
 GET http://127.0.0.1:{PORT}/page?url={ENCODED_TARGET_URL}
+GET http://127.0.0.1:{PORT}/page?url={ENCODED_TARGET_URL}&diag=1
 Header: X-Proxy-Token: {TOKEN}
 ```
+
+`diag=1` adds the [TLS diagnostic probe](#tls-diagnostic-probe): when the chain
+or the final GET fails with a `tls_error`, `ssl` describes the certificate the
+failing server presented and `finalUrl` names that server's URL. Upstream
+failures on `/page` are always reported inline (HTTP 200 with `error`), with or
+without `diag`.
 
 ### Response
 
@@ -251,11 +466,11 @@ Header: X-Proxy-Token: {TOKEN}
   "httpVersion": "HTTP/2.0",
   "http3": true,
   "headers": {
-    "Content-Type": "text/html; charset=utf-8",
-    "Strict-Transport-Security": "max-age=31536000",
-    "Server": "Apache/2.4.66 (Unix)"
+    "Content-Type": ["text/html; charset=utf-8"],
+    "Strict-Transport-Security": ["max-age=31536000"],
+    "Server": ["Apache/2.4.66 (Unix)"]
   },
-  "rawHeaders": "Content-Type: text/html; charset=utf-8\nServer: Apache/2.4.66 (Unix)\n...",
+  "rawHeaders": "HTTP/2 200\nContent-Type: text/html; charset=utf-8\nServer: Apache/2.4.66 (Unix)\n...",
   "html": "<!DOCTYPE html>...",
   "redirectChain": [
     {
@@ -266,7 +481,9 @@ Header: X-Proxy-Token: {TOKEN}
       "ssl": false,
       "ip": "93.184.216.34",
       "server": "Apache/2.4.66 (Unix)",
-      "rawHeaders": "Location: https://example.com/\n..."
+      "rawHeaders": "HTTP/1.1 301 Moved Permanently\nLocation: https://www.example.com/\n...",
+      "method": "HEAD",
+      "location": "https://www.example.com/"
     },
     {
       "hop": 2,
@@ -276,10 +493,14 @@ Header: X-Proxy-Token: {TOKEN}
       "ssl": true,
       "ip": "93.184.216.34",
       "server": "Apache/2.4.66 (Unix)",
-      "rawHeaders": "Content-Type: text/html; charset=utf-8\n..."
+      "rawHeaders": "HTTP/2 200\nContent-Type: text/html; charset=utf-8\n...",
+      "method": "GET",
+      "certCN": "www.example.com",
+      "certExpiry": "2024-04-21",
+      "certDaysLeft": 87
     }
   ],
-  "ssl": { "version": "TLS 1.3", "subject": "www.example.com", "..." : "..." },
+  "ssl": { "version": "TLS 1.3", "subject": "www.example.com", "protocol": "TLSv1.3", "verified": true, "chain": [ "…" ], "…" : "…" },
   "timing": {
     "dnsLookup": 12.1,
     "tcpConnect": 23.4,
@@ -293,34 +514,95 @@ Header: X-Proxy-Token: {TOKEN}
   "size": 48230,
   "transferSize": 12450,
   "contentEncoding": "gzip",
-  "error": null
+  "error": null,
+  "truncated": false,
+  "maxBodySize": 52428800
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `url` | string | Original input URL |
-| `finalUrl` | string | Final URL after following all redirects |
-| `status` | int | HTTP status code of the final page |
+| `finalUrl` | string | Final URL after following all redirects; on a chain failure the last URL reached (with `diag=1` and a `tls_error`: the failing URL) |
+| `status` | int | HTTP status code of the final page (`0` on failure) |
 | `httpVersion` | string | HTTP protocol version actually used for this request (e.g. `HTTP/2.0`) |
 | `http3` | bool | Whether the final page **advertises** HTTP/3 — see [HTTP/3 detection](#http3-detection) |
-| `headers` | object | Response headers of the final page |
-| `rawHeaders` | string | Raw headers as multi-line string |
-| `html` | string | Decompressed response body |
-| `redirectChain` | array | Each hop with status, timing, IP, server, headers |
-| `ssl` | object / null | TLS certificate details of the final page |
+| `headers` | object | Response headers of the final page, each value an array |
+| `rawHeaders` | string | Status line (`HTTP/1.1 200 OK`, `HTTP/2 200`) followed by the headers, one per line, sorted by name |
+| `html` | string | Decompressed response body, capped at `maxBodySize` on a UTF-8 boundary. Never raw compressed bytes — see `decodeError` |
+| `redirectChain` | array | Each hop — see below. On success the last entry is the final GET |
+| `ssl` | object / null | Certificate report of the final page, same shape as on [`/inspect`](#ssl-object). On failure `null`, or with `diag=1` and a `tls_error` the failing server's certificate |
 | `timing` | object | Connection timing of the final GET request (ms) |
-| `ip` | string | Resolved IP of the final server |
+| `ip` | string | IP of the final server — on failure, of the server that failed |
 | `size` | int | Decompressed body size in bytes |
-| `transferSize` | int | Compressed transfer size in bytes |
+| `transferSize` | int | Transfer size in bytes: the upstream `Content-Length` when sane, else the bytes received |
 | `contentEncoding` | string | Server's preferred compression (from HEAD probe) |
-| `error` | object / null | Error details if the request failed |
+| `error` | object / null | `{error, message, status, type}` if the request failed — see [Error responses](#error-responses) |
+| `truncated` | bool | The body hit `maxBodySize` |
+| `maxBodySize` | int | The `--max-mb` cap in bytes; `0` means unlimited |
+| `decodeError` | bool | The `Content-Encoding` could not be decoded (br, zstd, stacked, corrupt, or an unknown token with a non-UTF-8 body); `html` holds only what was decoded. Only present when `true` |
+
+**Redirect chain hops:**
+
+| Field | Description |
+|---|---|
+| `hop`, `url`, `status`, `timing`, `ssl`, `ip`, `server` | Position, URL, status code, total time (ms), whether the URL is https, connected IP, `Server` header |
+| `rawHeaders` | Status line plus sorted headers, as above |
+| `method` | `"HEAD"`, or `"GET"` when the target refused HEAD with 405/501, and for the final hop. Absent on error-only hops the tracer adds without making a request (loop, hop limit, blocked target) |
+| `location` | 3xx hops: the resolved, absolute target |
+| `certCN`, `certExpiry`, `certDaysLeft` | https hops: the leaf's common name (CN only), expiry date `YYYY-MM-DD` and floored days left |
+| `error` | Why the chain stopped here, e.g. `"tls_error: TLS certificate verification failed"` or `"redirect loop detected"` |
+| `errorCategory` | The error code of a failed hop: `tls_error`, `dns_error`, `connection_error`, `timeout`, `upstream_error`, `blocked_target`, `redirect_loop`, `too_many_redirects`, `bad_request` |
+| `errorType` | `tls_error` hops only: the classified failure (`"Certificate expired"`, …) |
+
+**When the chain stops early** — a transport error, a loop, more than 20
+redirects, a private or non-http(s) redirect target, an unparseable `Location`
+or the overall time budget — the last hop carries the error, `error.error` is
+that hop's `errorCategory`, `error.message` its `error` text, and the final GET
+is skipped:
+
+```json
+{
+  "url": "https://example.com/start",
+  "finalUrl": "https://example.com/start",
+  "status": 0,
+  "redirectChain": [
+    {
+      "hop": 1,
+      "url": "https://example.com/start",
+      "status": 0,
+      "timing": 4.0,
+      "ssl": true,
+      "ip": "93.184.216.34",
+      "error": "tls_error: TLS certificate hostname mismatch",
+      "method": "HEAD",
+      "errorCategory": "tls_error",
+      "errorType": "Host name does not match the certificate"
+    }
+  ],
+  "ssl": null,
+  "ip": "93.184.216.34",
+  "error": {
+    "error": "tls_error",
+    "message": "tls_error: TLS certificate hostname mismatch",
+    "status": 502,
+    "type": "Host name does not match the certificate"
+  },
+  "truncated": false,
+  "maxBodySize": 52428800,
+  "…": "…"
+}
+```
+
+If the chain succeeds but the final GET fails, `error` carries that failure
+with its own code and the chain is returned as traced, without a final hop.
 
 ### How it works
 
-1. **Phase 1 — Redirect chain:** HEAD requests trace each redirect hop (up to 20), recording timing, IP, status, and headers per hop. SSRF checks run on each redirect target.
-2. **Phase 2 — Encoding probe:** A HEAD request with the browser's full `Accept-Encoding` detects the server's true preferred compression (e.g. `zstd`, `br`).
-3. **Phase 3 — Page fetch:** A GET request with `Accept-Encoding: gzip, deflate` downloads the body, which is decompressed via stdlib. The HEAD-detected encoding is reported in `contentEncoding` and the `headers` map.
+1. **Phase 1 — Redirect chain:** HEAD requests trace each redirect hop, recording timing, IP, status, headers and the certificate summary per hop. A server that refuses HEAD with 405/501 is asked again with GET (body closed unread). The next URL is the last `Location` value resolved per RFC 3986; it must be http/https and passes the SSRF pre-check before it is requested. Loops are detected. Up to 20 redirects are followed (like the Fetch standard); if the 21st request redirects again, the chain stops with `too_many_redirects` and the URL it points to is not requested. Each hop has its own `--timeout`, all of them share the overall budget of `3 × --timeout`.
+2. **Phase 2 — Encoding probe:** An untraced HEAD request with the browser's full `Accept-Encoding` detects the server's true preferred compression (e.g. `zstd`, `br`).
+3. **Phase 3 — Page fetch:** A GET request with `Accept-Encoding: gzip, deflate` downloads the body under the `--max-mb` cap, which is decompressed via stdlib. The HEAD-detected encoding is reported in `contentEncoding` and the `headers` map.
+4. **Diagnosis (`diag=1` only):** if phase 1 or 3 failed with a `tls_error`, the [TLS diagnostic probe](#tls-diagnostic-probe) reads the failing server's certificate chain, protocol and cipher.
 
 ---
 
@@ -341,67 +623,138 @@ text and deliberately carries no CORS headers, because it is not meant to be
 readable by the origin that was just turned away.
 
 ```json
-{ "error": "dns_error", "message": "could not resolve hostname", "status": 502 }
+{ "error": "dns_error", "message": "could not resolve hostname", "status": 502, "type": "Could not resolve host" }
 ```
+
+Where the error object appears:
+
+- **`/proxy`, and `/inspect` without `diag=1`:** as the response body; the HTTP
+  status equals `status`.
+- **`/inspect?diag=1` and `/page`:** inline as the `error` field of an HTTP 200
+  response, so the rest of the result (timing, IP, the chain so far, and with
+  `diag=1` the certificate report) arrives with it. `status` still says 502 or
+  504.
 
 | Code | HTTP | Meaning |
 |---|---|---|
-| `bad_request` | 400 | `url` parameter missing or not a valid http/https URL |
+| `bad_request` | 400 | `url` parameter missing or not a valid http/https URL. On `/page` also a redirect `Location` that cannot be parsed (inline, `status` 502) |
 | `forbidden` | 403 | Invalid or missing `X-Proxy-Token` |
-| `blocked_target` | 403 | Target resolves to a private or reserved address |
+| `blocked_target` | 403 / 502 | Target resolves to a private or reserved address. **403** when the SSRF pre-check catches it — the URL itself, or a redirect target on `/proxy?follow=1`. **502** (with `type` `Blocked target`) when the pre-check passed but the dialer blocks the connection after DNS resolution (e.g. DNS rebinding) on `/proxy` or `/inspect`. On `/page` a private redirect target, one with a scheme other than http/https, or a dialer block (inline, `status` 502) |
 | `method_not_allowed` | 405 | HTTP method not accepted on this endpoint |
 | `dns_error` | 502 | Hostname could not be resolved |
 | `tls_error` | 502 | Any TLS failure: certificate (expired, hostname mismatch, unknown CA) **or** handshake (no mutually supported protocol version or cipher suite, peer alert, target not speaking TLS) |
 | `connection_error` | 502 | TCP connection failed |
 | `upstream_error` | 502 | Any other upstream failure |
-| `timeout` | 504 | Upstream request timed out |
+| `redirect_loop` | 502 | `/page` only: the redirect chain returned to a URL already visited |
+| `too_many_redirects` | 502 | `/page` only: more than 20 redirects (the 21st request redirected again) |
+| `timeout` | 504 | Upstream request timed out — the request's own deadline, the `/page` budget, or a DNS-lookup, dial, TLS-handshake or response-header timeout of the transport |
 
 `message` is safe to display; full error details are logged to the proxy's
 terminal only.
+
+**`type`** (since v1.3.0) is a human-readable class with the same texts as the
+PHP proxy's `error.type`. It is set on every upstream failure, on every `/page`
+chain stop (including the 502 when the dialer blocks a target) and on the
+`/proxy` 403 for a blocked redirect target; the
+request-validation errors (`bad_request`, `forbidden`, `blocked_target` for the
+URL itself, `method_not_allowed`) carry none.
+
+| Code | `type` |
+|---|---|
+| `tls_error` | The classified failure: `Certificate expired`, `Certificate not yet valid`, `Host name does not match the certificate`, `Self-signed certificate`, `Untrusted root certificate in the chain`, `Incomplete chain or unknown issuer`, `TLS protocol not supported` (no common protocol version, or a plain-HTTP server behind `https://`) or `TLS/SSL error` (anything else, e.g. a distrusted CA) |
+| `dns_error` | `Could not resolve host` |
+| `connection_error` | `Could not connect to host` |
+| `timeout` | `Connection timeout` |
+| `blocked_target` | `Blocked target` |
+| `redirect_loop` | `Redirect loop detected` |
+| `too_many_redirects` | `Too many redirects` |
+| `bad_request` (`/page` chain) | `Invalid URL` |
+| `upstream_error` | `Upstream error` |
+
+**Timeout detection.** An upstream error counts as `timeout` when the request's
+context deadline expired or the error itself reports a timeout (`net.Error`
+with `Timeout()`), whatever shape the transport gave it. This check runs before
+the DNS check, so a DNS lookup that times out (e.g. an unreachable `--dns`
+server) is a `timeout` too, like cURL's errno 28. Before v1.3.0 only an
+expired request context was recognised; a dial timeout was reported as
+`connection_error`, a TLS-handshake or response-header timeout as
+`upstream_error`, and a timed-out DNS lookup as `dns_error`, all with 502.
 
 ### JavaScript example
 
 ```javascript
 const PROXY_BASE = "http://127.0.0.1:8765"; // entered by user
 const PROXY_TOKEN = "a3f8c2...";             // entered by user
+const HEADERS = { "X-Proxy-Token": PROXY_TOKEN };
 
-// Fetch content via /proxy (body streaming, with metadata headers)
+// Turn a failed response into an Error. Proxy errors carry JSON
+// ({error, message, status, type}); a target's own 4xx/5xx does not, and is
+// recognisable by its X-Upstream-Protocol header.
+async function proxyError(response) {
+  const err = new Error(`Proxy error: ${response.status} ${response.statusText}`);
+  err.status = response.status;
+  if (!response.headers.get("X-Upstream-Protocol")) {
+    try {
+      const data = await response.json();
+      err.message = `Proxy error: ${data.message}` + (data.type ? ` (${data.type})` : "");
+      err.code = data.error;  // "dns_error", "tls_error", "timeout", ...
+      err.type = data.type;   // "Certificate expired", ...
+    } catch { /* not JSON */ }
+  }
+  return err;
+}
+
+// Fetch content via /proxy, following redirects on the proxy side
 async function fetchViaProxy(targetUrl) {
   const response = await fetch(
-    `${PROXY_BASE}/proxy?url=${encodeURIComponent(targetUrl)}`,
-    { headers: { "X-Proxy-Token": PROXY_TOKEN } }
+    `${PROXY_BASE}/proxy?url=${encodeURIComponent(targetUrl)}&follow=1`,
+    { headers: HEADERS }
   );
 
   if (!response.ok) {
-    throw new Error(`Proxy error: ${response.status} ${response.statusText}`);
+    // A 3xx arrives here only if it was not followed (limit, loop, no usable
+    // Location); X-Upstream-Location says where it pointed.
+    throw await proxyError(response);
   }
 
   // Read upstream metadata from custom headers
-  const protocol = response.headers.get("X-Upstream-Protocol"); // "HTTP/2.0"
-  const ip       = response.headers.get("X-Upstream-IP");       // "93.184.216.34"
-  const timing   = response.headers.get("X-Upstream-Timing");   // "dns=12;tcp=45;..."
+  const finalUrl  = response.headers.get("X-Upstream-Final-URL"); // where the content came from
+  const redirects = response.headers.get("X-Upstream-Redirects"); // "0", "1", ...
+  const protocol  = response.headers.get("X-Upstream-Protocol");  // "HTTP/2.0"
+  const ip        = response.headers.get("X-Upstream-IP");        // "93.184.216.34"
+  const timing    = response.headers.get("X-Upstream-Timing");    // "dns=12;tcp=45;..."
+  const truncated = response.headers.get("X-Upstream-Truncated") === "1";
 
   return response; // .text(), .json(), .arrayBuffer(), etc.
 }
 
-// Inspect a URL (SSL cert, timing, headers, IP — no body download)
+// Inspect a URL (SSL cert, timing, headers, IP — no body download).
+// With diag=1, failures arrive as data.error and a broken certificate is
+// still described in data.ssl.
 async function inspectUrl(targetUrl) {
   const response = await fetch(
-    `${PROXY_BASE}/inspect?url=${encodeURIComponent(targetUrl)}`,
-    { headers: { "X-Proxy-Token": PROXY_TOKEN } }
+    `${PROXY_BASE}/inspect?url=${encodeURIComponent(new URL(targetUrl).href)}&diag=1`,
+    { headers: HEADERS }
   );
-  return response.json();
-  // { status, headers, ssl, timing, ip, protocol }
+  if (!response.ok) throw await proxyError(response); // 4xx: token, URL, blocked
+  const data = await response.json();
+  // { status, headers, ssl, timing, ip, protocol, http3, method, location, error, ... }
+  if (data.error) {
+    console.warn(data.error.message, data.error.type, data.ssl?.issues);
+  }
+  return data; // data.location: next hop of a 3xx, already resolved
 }
 
 // Full page analysis via /page (redirect chain + body + SSL + timing)
 async function analyzePage(targetUrl) {
   const response = await fetch(
-    `${PROXY_BASE}/page?url=${encodeURIComponent(targetUrl)}`,
-    { headers: { "X-Proxy-Token": PROXY_TOKEN } }
+    `${PROXY_BASE}/page?url=${encodeURIComponent(new URL(targetUrl).href)}&diag=1`,
+    { headers: HEADERS }
   );
+  if (!response.ok) throw await proxyError(response);
   return response.json();
-  // { url, finalUrl, status, httpVersion, headers, html, redirectChain, ssl, timing, ... }
+  // { url, finalUrl, status, httpVersion, headers, html, redirectChain, ssl,
+  //   timing, truncated, maxBodySize, error, ... }
 }
 
 // Test connection
@@ -410,6 +763,9 @@ async function testProxy(base) {
   return r.ok && (await r.text()).includes("ok");
 }
 ```
+
+`new URL(u).href` converts an internationalised host name to punycode, which
+`/inspect` and `/page` need for the host-name check (see [Request](#request)).
 
 ### Recommended setup flow
 
@@ -430,8 +786,8 @@ async function testProxy(base) {
 | **SSRF protection** | Enforced in the dialer, after DNS resolution and before connect — see below |
 | **Credential isolation** | `Cookie`, `Authorization`, `Origin`, `Referer` and `Sec-Fetch-*` are never forwarded to the target |
 | **Configurable DNS** | Uses Cloudflare + Google DNS by default; custom servers or system DNS via `--dns` |
-| **TLS verification** | Upstream certificates are always verified |
-| **Redirect control** | Redirects are not followed automatically — the client decides |
+| **TLS verification** | Every connection that carries HTTP data is verified. The only exception is the handshake-only [diagnostic probe](#tls-diagnostic-probe) (`diag=1` after a `tls_error`), which reads certificates and nothing else |
+| **Redirect control** | The HTTP client never follows a redirect by itself, and `Location` is never forwarded to the browser (it would carry the token to the target) — `/proxy` reports `X-Upstream-Location` instead. Redirects are followed only by the proxy's own code: `/proxy?follow=1` (max. 5, GET/HEAD) and `/page` (max. 20). Every hop must be http/https and passes the SSRF pre-check; the dialer enforces the rule again |
 | **Response cap** | Maximum response size is configurable (default: 50 MB), enforced on the decompressed stream too |
 | **Bounded work** | Every upstream request hangs off the client's request context; `/page` has an overall time budget |
 | **Hop-by-hop filter** | Proxy-internal, hop-by-hop and `Connection`-listed headers are stripped |
@@ -460,6 +816,43 @@ cloud metadata at `169.254.169.254`), multicast and reserved space, plus the
 IPv6 forms that embed an IPv4 address — IPv4-mapped (`::ffff:127.0.0.1`), NAT64
 (`64:ff9b::/96`) and 6to4 (`2002::/16`).
 
+### TLS diagnostic probe
+
+Content connections — every request that carries HTTP data on `/proxy`,
+`/inspect` and `/page` — are always verified against the system trust store; the
+upstream transport never sets `InsecureSkipVerify` (a test enforces this). A
+failed verification therefore yields only an error, not the details a
+certificate checker needs: protocol, cipher, and the chain of a server that is
+expired, self-signed or stuck on TLS 1.0.
+
+With `diag=1`, a `tls_error` triggers one separate, **handshake-only** TLS
+connection to read them:
+
+- **Opt-in and narrow:** only with `diag=1`, and only after the verified request
+  failed with `tls_error`.
+- **Same address, same guard:** it connects to the IP the failed request had
+  already connected to — no second DNS lookup, so no rebinding window — and dials
+  through the same `safeDialControl` hook, which re-checks that IP.
+- **No application data:** verification is skipped (`InsecureSkipVerify`) so the
+  failing chain can be seen, but nothing is written or read after the handshake,
+  and the connection is never handed to the HTTP transport. It accepts TLS 1.0
+  and every cipher suite Go still implements (incl. RSA key exchange, 3DES, RC4)
+  so legacy servers can be described.
+- **Not a verdict:** `verified`, `error` and `errorType` come from the real,
+  verified connection. The probe only supplies chain, protocol and cipher
+  (`certSource: "probe"`).
+- **Bounded:** 10 seconds, derived from the client's request rather than from
+  the upstream timeout the failed request may have used up. Worst case:
+  `--timeout` + 10 s on `/inspect`, the `/page` budget + 10 s on `/page`.
+- **SNI:** the host name, none for an IP address or a non-ASCII host.
+
+If the probe fails, the chain crypto/tls attached to the verification error is
+used (`certSource: "verify-error"`, no protocol or cipher, `probeError` set); if
+there is none, `ssl` is `null`. Servers Go cannot handshake with even when
+skipping verification are described that way or not at all: certificates with a
+negative serial number, RSA keys below 1024 bit, SHA-1 handshake signatures in
+TLS 1.2, and SSLv3.
+
 ### HTTPS pages calling HTTP localhost
 
 Browsers treat `http://127.0.0.1` as a **"potentially trustworthy origin"** (W3C Secure Contexts spec). Requests from an HTTPS page to the local proxy are **not blocked** as mixed content. Chrome's Private Network Access preflight is handled automatically.
@@ -476,7 +869,17 @@ The proxy handles **multiple requests concurrently**. Go's `net/http` server spa
 
 **`/proxy`:** Brotli, gzip, and deflate are supported **transparently**. The proxy forwards the browser's `Accept-Encoding` header to the upstream server and streams the compressed response bytes back. The browser handles decompression.
 
-**`/inspect?body=1`:** The proxy first sends a HEAD request with the browser's full `Accept-Encoding` to detect the server's preferred compression (e.g. `zstd`, `br`), then a GET with `Accept-Encoding: gzip, deflate` to obtain a body that can be decompressed with Go's stdlib. The body is decompressed before embedding it in the JSON response. The `Content-Encoding` header in the `headers` map reflects the server's true preferred encoding from the HEAD probe, so consumers accurately detect compression support.
+**`/inspect?body=1` and `/page`:** The proxy first sends a HEAD request with the browser's full `Accept-Encoding` to detect the server's preferred compression (e.g. `zstd`, `br`), then a GET with `Accept-Encoding: gzip, deflate` to obtain a body that can be decompressed with Go's stdlib. The body is decompressed before embedding it in the JSON response. The `Content-Encoding` header in the `headers` map reflects the server's true preferred encoding from the HEAD probe, so consumers accurately detect compression support. The HEAD is untraced: reported timing and IP belong to the GET.
+
+**Undecodable bodies:** the `Content-Encoding` value falls into one of three classes (tokens are case-insensitive, `identity` is ignored):
+
+| `Content-Encoding` | Result |
+|---|---|
+| `gzip`, `x-gzip`, `deflate` (a single token) | Decoded |
+| A registered coding Go's stdlib cannot decode — `br`, `zstd`, `compress`, `x-compress`, `dcb`, `dcz`, `aes128gcm`, `exi`, `pack200-gzip` ([IANA registry](https://www.iana.org/assignments/http-parameters/http-parameters.xhtml#content-coding)) — or a stack of several tokens (`gzip, br`) | `decodeError: true`, empty `html` / `body` |
+| Any other token (`none`, `UTF-8`, `text/html`, `binary`, …) — a server misconfiguration seen on real sites | Treated as a mislabelled plain body: passed through unchanged when it is valid UTF-8 (as in v1.2.4); otherwise `decodeError: true` and an empty `html` / `body` |
+
+A corrupt gzip/deflate stream yields `decodeError: true` and only what could be decoded. Raw compressed or binary bytes are never handed on as text (before v1.3.0 a `br` or `zstd` body ended up in `html` / `body` as binary garbage). Because a valid-UTF-8 check decides the third class, a mislabelled page in a legacy charset (e.g. ISO-8859-1 with umlauts) also gets `decodeError: true`.
 
 **`deflate` handling:** RFC 7230 defines the `deflate` token as zlib
 (RFC 1950), but a large share of servers actually send raw DEFLATE (RFC 1951).
@@ -577,8 +980,8 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.2.4
-git push origin v1.2.4
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
@@ -600,6 +1003,33 @@ filtering, CORS preflight and CORS on error responses, deflate/zlib
 decompression, response truncation, all endpoints (`/proxy`, `/inspect`,
 `/page`, `/ping`, `/version`), upstream metadata headers, SSL extraction, and
 connection tracing.
+
+Since v1.3.0 the suite also builds its own test PKI (root, intermediate, leaf
+certificates with RSA, ECDSA and Ed25519 keys, plus an MD5-signed fixture) and
+runs **real TLS servers** via `httptest` against it:
+
+- **Certificate report:** OpenSSL names for protocols, cipher suites (the table
+  is checked against every suite Go implements) and signature algorithms; DN
+  formatting; chain labels and signature checks (incl. SHA-1 and MD5);
+  RFC 6125 host matching; every `issues` rule and message.
+- **TLS verdicts:** expired, not yet valid, wrong host, self-signed, untrusted
+  root, incomplete chain, TLS 1.0-only server and plain HTTP behind `https://`,
+  each classified from a real failing handshake.
+- **Diagnostic probe:** sends no application data, sets SNI correctly, is
+  blocked by the default dialer guard, reaches legacy servers (TLS 1.0 with RSA
+  key exchange, 3DES, RC4); the upstream client never skips verification.
+- **Endpoints:** `/inspect` with and without `diag=1`, HEAD→GET fallback,
+  headers-only GET (`get=1`), `location`, body truncation and undecodable encodings; `/page` hop fallback,
+  TLS failures, the hop limit, every chain-stop category, final-GET timeout,
+  truncation, corrupt gzip, mislabelled plain bodies (`Content-Encoding: none`,
+  `UTF-8`), hop certificate summary and the status line in `rawHeaders`;
+  `/proxy` never forwarding `Location`, truncation of compressed chunked
+  bodies, and `follow=1` (relative targets, HEAD, blocked hop, loop, hop limit,
+  `javascript:` targets, POST).
+- **Errors and helpers:** timeout detection, RFC 3986 redirect resolution (all
+  §5.4 examples), capped reads and UTF-8-safe truncation.
+
+None of the tests needs network access.
 
 CI runs `gofmt`, `go vet`, `staticcheck`, `govulncheck` and `go test -race` on
 every push and pull request — not only before a release build (see
@@ -647,6 +1077,176 @@ x/tools v0.51.0 or newer, a plain `go install` works again.
 
 ## Changelog
 
+### v1.3.0
+
+Feature release: **parity with the PHP proxy of the JPKCom Tools** (`proxy.php`
+2.8.0) for SSL-certificate and redirect information, so the tools' Expert Mode
+shows the same details as their server-side mode. Same toolchain as v1.2.4
+(Go 1.27.3); no new dependencies.
+
+**Release order — deploy the tools first.** `/proxy` no longer forwards
+`Location` (see below). The updated JPKCom Tools frontend works with older
+proxies as before (unknown query parameters such as `follow=1`, `diag=1` and
+`get=1` are ignored, every new field is feature-detected), but following
+redirects needs v1.3.0: with an older proxy the browser still follows a 3xx
+from `/proxy` to the target itself, and a redirect to another site fails at the
+CORS preflight ("Failed to fetch"), exactly as with the previous frontend.
+Publish the frontend first, then this release; the frontend's `MIN_VERSION`
+moves to `v1.3.0`.
+
+**New**
+
+- **Full certificate report** on `/inspect` and `/page` (`ssl`): every chain
+  entry gets position, label (`Server certificate`, `Intermediate CA`,
+  `Root CA (self-signed)`, `Cross-signed root (acts as intermediate)`), whether
+  the next certificate signed it, subject/issuer DN and organisation, validity
+  as text and Unix time, serial, OpenSSL signature-algorithm name, key
+  description, SANs, SHA-256/SHA-1 fingerprints and PEM. The report adds
+  `protocol` and `cipher` in OpenSSL notation (`TLSv1.3`,
+  `ECDHE-RSA-AES128-GCM-SHA256`), `cipherSuite` (IANA), `bits`, `verified` /
+  `valid`, `error` / `errorType`, `hostMatch` (RFC 6125), `selfSigned`,
+  `issues` (the PHP rule set and messages) and `certSource`. See
+  [`ssl` object](#ssl-object).
+- **`diag=1`** on `/inspect` and `/page`: a certificate checker needs details
+  exactly when verification fails. With `diag=1`, `/inspect` reports an upstream
+  failure inline (HTTP 200, `error` object), and a `tls_error` on either
+  endpoint runs a handshake-only [TLS diagnostic probe](#tls-diagnostic-probe)
+  that fills `ssl` with what the failing server presented — also for servers
+  stuck on TLS 1.0/1.1, 3DES or RC4. Without `diag`, the 502/504 contract is
+  unchanged.
+- **`type` on error responses**: a human-readable class with the PHP proxy's
+  texts (`Certificate expired`, `Could not resolve host`, …), set on every
+  upstream failure. See [Error responses](#error-responses).
+- **`follow=1` on `/proxy`** (GET and HEAD): the proxy follows up to 5
+  redirects itself, each target SSRF-checked, and reports
+  `X-Upstream-Final-URL` and `X-Upstream-Redirects`. See
+  [Redirects on `/proxy`](#redirects-on-proxy).
+- **`X-Upstream-Location`** on every 3xx from `/proxy`: the resolved, absolute
+  redirect target.
+- **`/inspect`**: `method`, `location` (resolved 3xx target), and with
+  `body=1` `truncated`, `maxBodySize` and `decodeError`. **`get=1`** takes
+  the headers from a GET (body closed unread) instead of a HEAD, as the PHP
+  proxy's headers-only fetch does — some servers, e.g. `www.google.com`, send
+  `Strict-Transport-Security` only on GET.
+- **`/page`**: hops gain `method`, `location`, `errorCategory`, `errorType` and a
+  certificate summary (`certCN`, `certExpiry`, `certDaysLeft`); the response
+  gains `truncated`, `maxBodySize` and `decodeError`.
+
+**Behaviour changes**
+
+All JSON changes are additive — no key was renamed, removed or retyped — but
+some values and statuses change:
+
+- **`/proxy` never forwards `Location`.** The browser's `fetch()` followed it
+  straight to the target, carrying `X-Proxy-Token` in a preflighted CORS request
+  — leaking the token wherever the target's CORS policy let it through, and
+  failing with "Failed to fetch" or a proxy-local 404 everywhere else. A 3xx now
+  reaches the caller as such, with `X-Upstream-Location`; pass `follow=1` to have
+  the proxy follow it.
+- **Timeouts are reported as `timeout` (504) on every endpoint**, including dial,
+  TLS-handshake and response-header timeouts, which used to be
+  `connection_error` or `upstream_error` (502); a DNS lookup that times out
+  (e.g. an unreachable `--dns` server) used to be `dns_error` (502). On `/page`
+  this also applies to hop errors and the final GET, whose `error.status` was
+  always 502.
+- **`/page` reports the real error code.** A chain failure used to arrive as
+  `upstream_error` whatever happened; now `error.error` is the failed hop's
+  `errorCategory` (`tls_error`, `dns_error`, `timeout`, `redirect_loop`,
+  `too_many_redirects`, `blocked_target`, …), with `status` 504 for a timeout.
+  On a failure `ip` names the server that failed.
+- **`/page` stops when a 21st redirect follows** with a `too_many_redirects`
+  hop; exactly 20 redirects still reach the final page. Before, the request
+  after the 20th redirect was fetched as the final page even if it redirected
+  again.
+- **`/page` treats an unusable `Location` as an error.** An unparseable value
+  (`bad_request`) or a non-http(s) scheme (`blocked_target`) ends the chain;
+  before, the tracer stopped silently and fetched the redirecting URL again as
+  the final page.
+- **HEAD→GET fallback:** `/inspect` and every `/page` hop repeat a request that
+  the server refused with 405 or 501 as GET (headers only, body closed unread),
+  as the PHP proxy does.
+- **`rawHeaders`** (top level and per hop) starts with the status line
+  (`HTTP/1.1 301 Moved Permanently`, `HTTP/2 200`) and lists headers sorted by
+  name; Go's map order made it differ from call to call.
+- **No more binary `html` / `body`:** a response in a registered coding Go
+  cannot decode (`br`, `zstd`, `compress`, `dcb`, `dcz`, …), in stacked codings
+  (`gzip, br`), or a corrupt gzip/deflate stream now gives `decodeError: true`
+  and only the decoded text. Before, the raw compressed bytes were returned as
+  the page. An unregistered token (`Content-Encoding: none`, `UTF-8`, …) still
+  passes a plain body through as before, but only if it is valid UTF-8;
+  binary bytes behind such a token now give `decodeError: true` and an empty
+  body. See [Compression](#compression).
+- **Truncated bodies** (`/page` `html`, `/inspect` `body`) are cut on a UTF-8
+  character boundary and flagged with `truncated: true`.
+- **`daysLeft` is floored**, matching the PHP proxy (differs only for expired
+  certificates, which earlier versions never reported). It is computed on whole
+  Unix seconds, so a `NotAfter` of 9999-12-31 (RFC 5280's "no expiration") is
+  no longer capped at 106751 days.
+- **`ssl.chain` lists at most 10 certificates** (earlier versions listed every
+  certificate the server sent).
+- **`chain[].subject` / `issuer`** fall back to the organisation, then
+  `"Unknown"`, when a certificate has no CN (was `""`).
+
+**Security**
+
+- **Token leak via `Location` closed** (see above).
+- **Handshake-only TLS probe.** This is the one place the proxy skips
+  certificate verification, and it is deliberately narrow: only with `diag=1`
+  after a `tls_error`, only to the IP the failed request had already connected
+  to, through the same `safeDialControl` SSRF guard, bounded to 10 s, and the
+  connection never carries application data. Every connection that carries HTTP
+  data stays verified; tests enforce both rules. See
+  [TLS diagnostic probe](#tls-diagnostic-probe).
+- **Redirect targets** followed by `/proxy?follow=1` and `/page` must be
+  http/https; userinfo is dropped, and each target passes the SSRF pre-check
+  before it is requested.
+
+**Fixes**
+
+- `X-Upstream-IP` and `ip` could name the wrong server: with Happy Eyeballs, a
+  losing dial's late `ConnectDone` overwrote the winner's address. Only a
+  successful connect is recorded now.
+- `/inspect?body=1` timing included the HEAD encoding probe; it now describes
+  the GET alone.
+- The specific certificate messages ("TLS certificate signed by unknown
+  authority", "TLS certificate invalid", "TLS certificate hostname mismatch")
+  were unreachable, because the wrapping `*tls.CertificateVerificationError` was
+  tested first; every certificate failure read "TLS certificate verification
+  failed".
+- An `https://` URL pointing at a plain-HTTP server was still reported as
+  `upstream_error`: `http.Client` reports that case as `http.ErrSchemeMismatch`
+  rather than the `tls.RecordHeaderError` that v1.2.1 handled. It is a
+  `tls_error` ("TLS protocol not supported") now.
+- `/proxy` cut a compressed chunked body (`Content-Encoding` set, no
+  `Content-Length`) at `--max-mb` without saying so. It now sets
+  `X-Upstream-Truncated: 1`, and `X-Upstream-Content-Length` is the capped
+  size.
+
+**Known limitations**
+
+- `X-Upstream-Truncated` is not set for a chunked `/proxy` body **without**
+  `Content-Encoding`: that body is streamed, so the headers are already sent
+  when the cap cuts it. A body with `Content-Length`, and a compressed chunked
+  body (buffered before the headers go out), are flagged.
+- The diagnostic probe cannot describe servers Go refuses to handshake with even
+  without verification (negative serial numbers, RSA keys below 1024 bit, SHA-1
+  handshake signatures in TLS 1.2, SSLv3); `ssl` then comes from the
+  verification error or stays `null`.
+- Internationalised host names must arrive in punycode for `hostMatch` and the
+  probe's SNI; the standard library has no IDNA.
+
+**Tests**
+
+- New test PKI with real `httptest` TLS servers, covering the certificate
+  report, every TLS verdict, the probe's guarantees, and the new `/inspect`,
+  `/page` and `/proxy` behaviour — see [Testing](#testing). All earlier tests
+  pass unchanged apart from `extractSSLInfo` gaining its host argument.
+
+**Build & CI**
+
+- No toolchain change: Go 1.27.3, CI pin `go-version: "1.27"`
+- `gofmt`, `go vet`, `staticcheck`, `govulncheck` and `go test -race` pass
+
 ### v1.2.4
 
 **Security release.** Toolchain-only: no changes to `main.go` or `main_test.go`,
@@ -667,9 +1267,15 @@ verification is always on, so all three endpoints (`/proxy`, `/inspect`,
 `/page`) rely on `crypto/x509` to decide whether a target is trustworthy. Before
 this release, a certificate issued through one of these intermediates was
 accepted as valid. `/inspect` and `/page` also reported it as valid in their SSL
-details. Now the handshake fails and the client gets a `tls_error`
-(`x509.CertificateInvalidError` → "TLS certificate invalid"). The error format
-is unchanged.
+details. Now the handshake fails and the client gets a `tls_error` with the
+message "TLS certificate verification failed". The error format is unchanged.
+
+*Corrected in v1.3.0:* this note originally named the message "TLS certificate
+invalid". The underlying error is an `x509.CertificateInvalidError`, but the
+v1.2.4 classifier tested the wrapping `*tls.CertificateVerificationError` first,
+so only the generic message was reachable. From v1.3.0 on, the specific x509
+checks run first: the message is "TLS certificate invalid" and `type` is
+"TLS/SSL error".
 
 `govulncheck` does not flag this yet: at release time the Go vulnerability
 database had no entry for CVE-2026-111943, so the scan is clean on 1.27.2 and
@@ -819,6 +1425,10 @@ errors keep their existing codes.
 
 Note this only affects the `error` **code**. HTTP status stays 502 and the
 `message` field remains display-safe, so no frontend change is required.
+
+*Corrected in v1.3.0:* the "Plain HTTP server behind an `https://` URL" row only
+held for a bare TLS handshake. Through `http.Client` that case surfaces as
+`http.ErrSchemeMismatch` and stayed `upstream_error` until v1.3.0.
 
 ### v1.2.0
 

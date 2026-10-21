@@ -16,17 +16,29 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
+	"crypto"
+	"crypto/dsa" //lint:ignore SA1019 only to describe legacy DSA certificate keys
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/md5"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -34,6 +46,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -97,6 +110,27 @@ type config struct {
 	// allowAnyHost disables the Host-header check that normally restricts the
 	// proxy to being addressed as localhost. Escape hatch for exotic setups.
 	allowAnyHost bool
+
+	// dialControl replaces safeDialControl as the dialer's Control hook, for
+	// the upstream client and the TLS diagnostic probe alike. Test-only: main
+	// never sets it, and nil means safeDialControl — the SSRF boundary.
+	dialControl func(network, address string, c syscall.RawConn) error
+
+	// rootCAs replaces the system trust store for upstream TLS verification.
+	// Test-only: main never sets it, and nil means the system roots.
+	// Verification itself is never switched off for a connection that carries
+	// application data; the only unverified handshake is the diagnostic probe
+	// (probeTLS), which reads certificates and nothing else.
+	rootCAs *x509.CertPool
+}
+
+// dialControlOrDefault returns the configured dial Control hook, falling back
+// to safeDialControl, so production code can never end up dialling without it.
+func (c *config) dialControlOrDefault() func(network, address string, c syscall.RawConn) error {
+	if c.dialControl != nil {
+		return c.dialControl
+	}
+	return safeDialControl
 }
 
 // blocksHost reports whether the target hostname should be rejected before any
@@ -150,6 +184,11 @@ type proxyError struct {
 	Error   string `json:"error"`
 	Message string `json:"message"`
 	Status  int    `json:"status"`
+	// Type is a human-readable class with the semantics of the PHP proxy's
+	// error.type ("Certificate expired", "Could not resolve host", …). Set on
+	// every upstream failure and on a /proxy redirect hop refused by the SSRF
+	// pre-check; absent on the request-validation 4xx from authorizeRequest.
+	Type string `json:"type,omitempty"`
 }
 
 // writeJSONError writes a categorized JSON error response with CORS headers.
@@ -160,6 +199,13 @@ type proxyError struct {
 func writeJSONError(w http.ResponseWriter, r *http.Request, cfg *config, code string, message string, status int) {
 	writeCORSHeaders(w, r, cfg)
 	writeJSON(w, status, proxyError{Error: code, Message: message, Status: status})
+}
+
+// writeUpstreamError writes the JSON error for a failed upstream request. The
+// status inside the body always matches the HTTP status of the response.
+func writeUpstreamError(w http.ResponseWriter, r *http.Request, cfg *config, pe *proxyError) {
+	writeCORSHeaders(w, r, cfg)
+	writeJSON(w, pe.Status, pe)
 }
 
 // writeJSON serialises v as the response body. Encoding errors can only surface
@@ -240,17 +286,24 @@ func classifyUpstreamError(err error) (code string, message string) {
 		return "blocked_target", "target resolves to a private or reserved address"
 	}
 
+	// Timeouts arrive in many shapes — a dial timeout as *net.OpError, an
+	// expired request context, the transport's TLS-handshake or header-wait
+	// deadline — and each would otherwise be filed under connection_error or
+	// upstream_error. Checked before DNS so a timed-out lookup counts as a
+	// timeout, as cURL's errno 28 does on the PHP side.
+	if isTimeout(err) {
+		return "timeout", "upstream request timed out"
+	}
+
 	// DNS resolution failure.
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
 		return "dns_error", "could not resolve hostname"
 	}
 
-	// TLS certificate verification errors.
-	var certErr *tls.CertificateVerificationError
-	if errors.As(err, &certErr) {
-		return "tls_error", "TLS certificate verification failed"
-	}
+	// TLS certificate verification errors. The specific x509 errors come
+	// first: crypto/tls wraps them in a *tls.CertificateVerificationError, and
+	// checking that wrapper first would make them unreachable.
 	var unknownAuthErr x509.UnknownAuthorityError
 	if errors.As(err, &unknownAuthErr) {
 		return "tls_error", "TLS certificate signed by unknown authority"
@@ -263,11 +316,17 @@ func classifyUpstreamError(err error) (code string, message string) {
 	if errors.As(err, &hostnameErr) {
 		return "tls_error", "TLS certificate hostname mismatch"
 	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return "tls_error", "TLS certificate verification failed"
+	}
 
 	// The target answered, but not with TLS — typically a plain HTTP server
-	// behind an https:// URL.
+	// behind an https:// URL. http.Client replaces the RecordHeaderError with
+	// ErrSchemeMismatch when the answer looks like HTTP, which is the usual
+	// case (https:// on port 80); a bare handshake still sees the former.
 	var recordErr tls.RecordHeaderError
-	if errors.As(err, &recordErr) {
+	if errors.As(err, &recordErr) || errors.Is(err, http.ErrSchemeMismatch) {
 		return "tls_error", "upstream did not respond with TLS"
 	}
 
@@ -297,6 +356,67 @@ func classifyUpstreamError(err error) (code string, message string) {
 	}
 
 	return "upstream_error", "upstream request failed"
+}
+
+// isTimeout reports whether err stems from a deadline: an expired context or a
+// net.Error that says so itself.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// upstreamFailure turns a failed upstream request into the complete JSON error
+// object: code, display-safe message, HTTP status (504 for a timeout, 502
+// otherwise) and the PHP-style type text. ctx is the request's own context; its
+// expired deadline is authoritative even when the transport reports the
+// cancellation in some other shape.
+func upstreamFailure(ctx context.Context, err error) *proxyError {
+	code, message := classifyUpstreamError(err)
+	if ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		code, message = "timeout", "upstream request timed out"
+	}
+	status := http.StatusBadGateway
+	if code == "timeout" {
+		status = http.StatusGatewayTimeout
+	}
+	return &proxyError{Error: code, Message: message, Status: status, Type: proxyErrorType(code, err)}
+}
+
+// proxyErrorType returns the human-readable class for an error code, matching
+// the texts the PHP proxy reports in error.type. For tls_error it is the
+// classified TLS failure, using the server's unverified chain when crypto/tls
+// handed one over.
+func proxyErrorType(code string, err error) string {
+	switch code {
+	case "tls_error":
+		var certs []*x509.Certificate
+		var cve *tls.CertificateVerificationError
+		if errors.As(err, &cve) {
+			certs = cve.UnverifiedCertificates
+		}
+		errorType, _ := classifyTLSFailure(err, certs, time.Now())
+		return errorType
+	case "dns_error":
+		return "Could not resolve host"
+	case "connection_error":
+		return "Could not connect to host"
+	case "timeout":
+		return "Connection timeout"
+	case "blocked_target":
+		return "Blocked target"
+	// The /page redirect tracer stops a chain for reasons of its own.
+	case "redirect_loop":
+		return "Redirect loop detected"
+	case "too_many_redirects":
+		return "Too many redirects"
+	case "bad_request":
+		return "Invalid URL"
+	default:
+		return "Upstream error"
+	}
 }
 
 // leafError unwraps err down to the innermost error in the chain. Returns nil
@@ -347,7 +467,14 @@ func (ct *connTrace) attach(ctx context.Context) context.Context {
 			ct.connectStart = time.Now()
 			ct.mu.Unlock()
 		},
-		ConnectDone: func(_, addr string, _ error) {
+		// Only a successful connect counts. With Happy Eyeballs several dials
+		// race, and a losing racer's late, failed ConnectDone would otherwise
+		// overwrite the winner — reporting an IP (and a probe target) that
+		// never served the response.
+		ConnectDone: func(_, addr string, err error) {
+			if err != nil {
+				return
+			}
 			ct.mu.Lock()
 			ct.connectDone = time.Now()
 			ct.remoteAddr = addr
@@ -451,8 +578,34 @@ func (ct *connTrace) remoteIP() string {
 // HTTP handler
 // -----------------------------------------------------------------------
 
+// maxProxyRedirects is how many redirects /proxy follows with follow=1 — the
+// limit the PHP proxy's fetchUrl uses.
+const maxProxyRedirects = 5
+
+// isFollowableRedirect reports a status whose Location /proxy follows. 300 and
+// 304 carry no single target to go to; they are returned as they are.
+func isFollowableRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
+}
+
 // proxyHandler returns an http.Handler that validates requests and forwards
 // them to the upstream URL supplied in the "url" query parameter.
+//
+// A redirect is never handed to the browser as such: Location is dropped and
+// the resolved target travels as X-Upstream-Location instead. With Location
+// present, fetch() would follow it straight to the target — carrying the
+// X-Proxy-Token header to a third party whenever that target's CORS policy
+// let the preflight through.
+//
+// With "follow=1" (GET and HEAD only; ignored for POST, which must not be
+// replayed) the proxy follows up to maxProxyRedirects redirects itself, each
+// target passing the SSRF pre-check first, and reports where it ended up in
+// X-Upstream-Final-URL and X-Upstream-Redirects.
 func proxyHandler(cfg *config, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -464,49 +617,69 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 		if !ok {
 			return
 		}
+		follow := r.URL.Query().Get("follow") == "1" && r.Method != http.MethodPost
 
 		// ------------------------------------------------------------------
-		// 5. Build the upstream request with connection tracing.
+		// 5. Execute the upstream request — and, with follow=1, each redirect
+		//    hop. Every hop gets a connTrace of its own, so the metadata
+		//    headers below describe the response actually returned. All hops
+		//    share one timeout.
 		// ------------------------------------------------------------------
 		ctx, cancel := context.WithTimeout(r.Context(), cfg.requestTimeout)
 		defer cancel()
 
-		ct := &connTrace{}
-		requestStart := time.Now()
-		ctx = ct.attach(ctx)
-
-		var bodyReader io.Reader
+		// Only POST forwards the browser's body; GET and HEAD send none.
+		var attachBody func(*http.Request)
 		if r.Method == http.MethodPost {
-			bodyReader = r.Body
+			attachBody = func(req *http.Request) { req.Body = r.Body }
 		}
 
-		upstreamReq, err := http.NewRequestWithContext(ctx, r.Method, target.String(), bodyReader)
-		if err != nil {
-			writeJSONError(w, r, cfg, "upstream_error", "could not build upstream request", http.StatusInternalServerError)
-			return
-		}
-
-		// Forward safe request headers, strip hop-by-hop and proxy-specific ones.
-		copyRequestHeaders(r, upstreamReq)
-
-		// ------------------------------------------------------------------
-		// 6. Execute the upstream request.
-		// ------------------------------------------------------------------
-		resp, err := client.Do(upstreamReq)
-		if err != nil {
-			log.Printf("upstream error: %v", err)
-			if ctx.Err() == context.DeadlineExceeded {
-				writeJSONError(w, r, cfg, "timeout", "upstream request timed out", http.StatusGatewayTimeout)
+		current := target
+		visited := map[string]bool{current.String(): true}
+		redirects := 0
+		var (
+			resp         *http.Response
+			ct           *connTrace
+			requestStart time.Time
+		)
+		for {
+			var err error
+			resp, ct, requestStart, err = doTraced(ctx, client, r.Method, current.String(), r, attachBody)
+			if err != nil {
+				log.Printf("upstream error: %v", err)
+				writeUpstreamError(w, r, cfg, upstreamFailure(ctx, err))
 				return
 			}
-			code, message := classifyUpstreamError(err)
-			writeJSONError(w, r, cfg, code, message, http.StatusBadGateway)
-			return
+			if !follow || !isFollowableRedirect(resp.StatusCode) || redirects == maxProxyRedirects {
+				break
+			}
+			// A redirect without a usable target, or back to a URL already
+			// visited, is returned as it is — the caller sees the 3xx.
+			next, err := resolveRedirect(current, lastLocation(resp.Header))
+			if err != nil || visited[next.String()] {
+				break
+			}
+			// SSRF pre-check on each redirect target, as for the original URL.
+			// The dialer enforces this again for the actual connection.
+			if cfg.blocksHost(ctx, next.Hostname()) {
+				resp.Body.Close()
+				writeUpstreamError(w, r, cfg, &proxyError{
+					Error:   "blocked_target",
+					Message: "redirect target resolves to a private or reserved address",
+					Status:  http.StatusForbidden,
+					Type:    proxyErrorType("blocked_target", nil),
+				})
+				return
+			}
+			resp.Body.Close()
+			visited[next.String()] = true
+			current = next
+			redirects++
 		}
 		defer resp.Body.Close()
 
 		// ------------------------------------------------------------------
-		// 7. Write CORS headers + upstream response headers to the client.
+		// 6. Write CORS headers + upstream response headers to the client.
 		// ------------------------------------------------------------------
 		writeCORSHeaders(w, r, cfg)
 		copyResponseHeaders(resp, w)
@@ -520,11 +693,26 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 		if ce := resp.Header.Get("Content-Encoding"); ce != "" {
 			w.Header().Set("X-Upstream-Content-Encoding", ce)
 		}
-		// Build explicit Access-Control-Expose-Headers from all response
-		// headers (wildcard "*" doesn't work with specific origins per spec).
+		// Where a redirect points, resolved against the URL that returned it
+		// (RFC 3986), in place of the Location header that is never forwarded.
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			if loc := lastLocation(resp.Header); loc != "" {
+				if next, err := resolveRedirect(current, loc); err == nil {
+					w.Header().Set("X-Upstream-Location", next.String())
+				}
+			}
+		}
+		if follow {
+			w.Header().Set("X-Upstream-Final-URL", current.String())
+			w.Header().Set("X-Upstream-Redirects", strconv.Itoa(redirects))
+		}
+		// Build explicit Access-Control-Expose-Headers from the forwarded
+		// response headers (wildcard "*" doesn't work with specific origins
+		// per spec).
 		exposeSet := make(map[string]struct{})
+		dynamic := connectionTokens(resp.Header)
 		for key := range resp.Header {
-			if _, skip := hopByHopHeaders[strings.ToLower(key)]; !skip {
+			if forwardsResponseHeader(strings.ToLower(key), dynamic) {
 				exposeSet[key] = struct{}{}
 			}
 		}
@@ -532,22 +720,19 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 		for _, h := range []string{
 			"X-Upstream-Protocol", "X-Upstream-IP", "X-Upstream-Timing",
 			"X-Upstream-Content-Encoding", "X-Upstream-Content-Length",
-			"X-Upstream-Truncated",
+			"X-Upstream-Truncated", "X-Upstream-Location",
+			"X-Upstream-Final-URL", "X-Upstream-Redirects",
 		} {
 			exposeSet[h] = struct{}{}
 		}
-		exposeKeys := make([]string, 0, len(exposeSet))
-		for k := range exposeSet {
-			exposeKeys = append(exposeKeys, k)
-		}
-		w.Header().Set("Access-Control-Expose-Headers", strings.Join(exposeKeys, ", "))
+		w.Header().Set("Access-Control-Expose-Headers", strings.Join(slices.Sorted(maps.Keys(exposeSet)), ", "))
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
 		cl := resp.Header.Get("Content-Length")
 		ce := resp.Header.Get("Content-Encoding")
 
 		// ------------------------------------------------------------------
-		// 8. Stream the response body (capped at maxResponseBytes if set).
+		// 7. Stream the response body (capped at maxResponseBytes if set).
 		//    When Content-Length is missing but the response is compressed
 		//    (chunked + Content-Encoding), buffer to count the transfer size.
 		//    This is safe because the body is already capped at maxResponseBytes.
@@ -579,12 +764,24 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 				log.Printf("warn: error streaming response body: %v", err)
 			}
 		} else if ce != "" {
-			// Compressed but chunked — buffer to count transfer size.
-			bodyBytes, err := io.ReadAll(bodySource)
+			// Compressed but chunked — buffer to count transfer size. Because
+			// the whole (capped) body is read before WriteHeader, a cut can
+			// still be announced here, unlike in the plain streaming branch
+			// below. readCapped reads one byte past the cap to know.
+			bodyBytes, truncated, err := readCapped(resp.Body, cfg.maxResponseBytes)
 			if err != nil {
 				log.Printf("warn: error buffering response body: %v", err)
 			}
+			// No upstream Content-Length reaches the client in this branch
+			// (cl == ""); make sure none is sent, so net/http frames the
+			// buffered bytes itself and never promises more than delivered.
+			w.Header().Del("Content-Length")
+			// On truncation this is the cap, i.e. a lower bound of the size.
 			w.Header().Set("X-Upstream-Content-Length", strconv.Itoa(len(bodyBytes)))
+			if truncated {
+				w.Header().Set("X-Upstream-Truncated", "1")
+				log.Printf("warn: chunked %s body truncated to %d bytes", ce, cfg.maxResponseBytes)
+			}
 			w.WriteHeader(resp.StatusCode)
 			if _, err := w.Write(bodyBytes); err != nil {
 				log.Printf("warn: error writing response body: %v", err)
@@ -620,9 +817,34 @@ type inspectResponse struct {
 	// nothing about the protocol this request used — that is Protocol.
 	HTTP3 bool   `json:"http3"`
 	Body  string `json:"body,omitempty"`
+	// Method is the method of the request this result describes: "HEAD", or
+	// "GET" with body=1, with get=1, or after the target answered a HEAD with
+	// 405/501.
+	Method string `json:"method"`
+	// Location is the response's last Location value, resolved against the
+	// target URL (RFC 3986) to an absolute URL without userinfo. Empty unless
+	// the response is a 3xx with a usable Location.
+	Location string `json:"location,omitempty"`
+	// Truncated reports that the body (body=1) hit MaxBodySize, either on the
+	// wire or after decoding.
+	Truncated bool `json:"truncated"`
+	// MaxBodySize is the configured body cap in bytes; 0 means unlimited.
+	MaxBodySize int64 `json:"maxBodySize"`
+	// DecodeError reports that the body (body=1) carries a Content-Encoding
+	// that could not be decoded. Body then holds only what was decoded — never
+	// the raw compressed bytes.
+	DecodeError bool `json:"decodeError,omitempty"`
+	// Error is only set with diag=1, when the upstream request failed. The
+	// response is then HTTP 200 with Status 0, so the caller gets the error
+	// class and — for tls_error — the certificate details in one object.
+	Error *proxyError `json:"error,omitempty"`
 }
 
 // sslInfo holds TLS certificate details extracted from the connection.
+//
+// The first twelve fields are the original v1.0 shape and keep Go's naming.
+// The rest mirrors what the PHP proxy reports (OpenSSL naming), so the tools
+// can render both modes with the same code.
 type sslInfo struct {
 	Version            string      `json:"version"`
 	Subject            string      `json:"subject"`
@@ -636,12 +858,78 @@ type sslInfo struct {
 	Chain              []chainLink `json:"chain"`
 	SignatureAlgorithm string      `json:"signatureAlgorithm"`
 	PublicKeyAlgorithm string      `json:"publicKeyAlgorithm"`
+
+	// Protocol is the TLS version in OpenSSL notation ("TLSv1.3", "TLSv1"),
+	// which the tools match against; Version keeps the Go-style name.
+	Protocol string `json:"protocol"`
+	// Cipher is the OpenSSL name of the negotiated suite, CipherSuite its IANA
+	// name and Bits its symmetric strength. Empty/0 when no handshake state is
+	// available (certSource "verify-error").
+	Cipher      string `json:"cipher"`
+	CipherSuite string `json:"cipherSuite"`
+	Bits        int    `json:"bits"`
+	// Verified reports whether the content connection passed verification
+	// against the trust store; Valid is the same value under the name the seo
+	// tool reads.
+	Verified bool `json:"verified"`
+	Valid    bool `json:"valid"`
+	// Error is the failure in OpenSSL verify-result wording (seo ssl.error),
+	// ErrorType the classified failure (dns-ssl error.type). Null if verified.
+	Error     *string `json:"error"`
+	ErrorType *string `json:"errorType"`
+	// HostMatch reports whether the leaf covers the requested host (RFC 6125).
+	// Null when the host is unknown or not ASCII (Go has no IDNA in the stdlib,
+	// so a U-label cannot be compared with the A-labels in the certificate).
+	HostMatch  *bool       `json:"hostMatch"`
+	SelfSigned bool        `json:"selfSigned"`
+	Issues     []certIssue `json:"issues"`
+	// CertSource says where the chain came from: "connection" (the verified
+	// content connection), "probe" (the handshake-only diagnostic probe) or
+	// "verify-error" (the chain crypto/tls attached to its verification error).
+	CertSource string `json:"certSource"`
+	// ProbeError is a generic note that the diagnostic probe failed; the
+	// details only go to the log.
+	ProbeError string `json:"probeError,omitempty"`
+}
+
+// certIssue is one finding about a certificate chain, as the PHP proxy's
+// certificateIssues() reports it.
+type certIssue struct {
+	Type string `json:"type"` // "error" | "warning"
+	Msg  string `json:"msg"`
 }
 
 // chainLink represents one certificate in the chain.
+//
+// Subject and Issuer are the original v1.0 fields. Everything else mirrors the
+// PHP proxy's describeProxyCertificate() and buildProxyCertificateChain() in
+// names, formats and semantics.
 type chainLink struct {
-	Subject string `json:"subject"`
+	Subject string `json:"subject"` // first CN, else first O, else "Unknown"
 	Issuer  string `json:"issuer"`
+
+	Position           int      `json:"position"`       // 1-based, server order
+	Label              string   `json:"label"`          // "Server certificate", "Intermediate CA", …
+	SignatureValid     *bool    `json:"signatureValid"` // signed by the next cert (or itself); null if the issuer was not sent
+	SubjectOrg         *string  `json:"subjectOrg"`
+	SubjectDN          string   `json:"subjectDN"` // "C=US, O=Example, CN=example.com" (DER order)
+	IssuerOrg          *string  `json:"issuerOrg"`
+	IssuerDN           string   `json:"issuerDN"`
+	SelfIssued         bool     `json:"selfIssued"`
+	IsCA               bool     `json:"isCA"`
+	ValidFrom          string   `json:"validFrom"` // "2006-01-02 15:04:05 UTC"
+	ValidUntil         string   `json:"validUntil"`
+	ValidFromTs        int64    `json:"validFromTs"` // Unix seconds
+	ValidUntilTs       int64    `json:"validUntilTs"`
+	DaysLeft           int      `json:"daysLeft"`           // floored, negative once expired
+	Serial             string   `json:"serial"`             // "01:EE:…"
+	SignatureAlgorithm string   `json:"signatureAlgorithm"` // OpenSSL long name
+	Key                string   `json:"key"`                // "RSA 2048 bit", "EC P-256 (256 bit)", …
+	KeyBits            *int     `json:"keyBits"`            // RSA only
+	SANs               []string `json:"sans"`               // DNS names, then IP addresses
+	SHA256             string   `json:"sha256"`
+	SHA1               string   `json:"sha1"`
+	PEM                string   `json:"pem"`
 }
 
 // tlsVersionName maps tls.Version* constants to human-readable names.
@@ -660,61 +948,860 @@ func tlsVersionName(v uint16) string {
 	}
 }
 
-// extractSSLInfo builds an sslInfo struct from the TLS connection state.
-func extractSSLInfo(state *tls.ConnectionState) *sslInfo {
-	if state == nil || len(state.PeerCertificates) == 0 {
+// tlsProtocolName maps a TLS version to OpenSSL's notation, which is what the
+// PHP proxy reports and what the tools test for outdated protocols.
+func tlsProtocolName(v uint16) string {
+	switch v {
+	case 0x0300: // SSL 3.0 — the tls constant is deprecated; Go never negotiates it
+		return "SSLv3"
+	case tls.VersionTLS10:
+		return "TLSv1"
+	case tls.VersionTLS11:
+		return "TLSv1.1"
+	case tls.VersionTLS12:
+		return "TLSv1.2"
+	case tls.VersionTLS13:
+		return "TLSv1.3"
+	default:
+		return ""
+	}
+}
+
+// openSSLCipher is the OpenSSL name and symmetric strength of a cipher suite.
+type openSSLCipher struct {
+	name string
+	bits int
+}
+
+// openSSLCiphers covers every suite in tls.CipherSuites() and
+// tls.InsecureCipherSuites() (a test keeps it complete). TLS 1.3 suites carry
+// their IANA names in OpenSSL too.
+var openSSLCiphers = map[uint16]openSSLCipher{
+	tls.TLS_AES_128_GCM_SHA256:       {"TLS_AES_128_GCM_SHA256", 128},
+	tls.TLS_AES_256_GCM_SHA384:       {"TLS_AES_256_GCM_SHA384", 256},
+	tls.TLS_CHACHA20_POLY1305_SHA256: {"TLS_CHACHA20_POLY1305_SHA256", 256},
+
+	tls.TLS_RSA_WITH_RC4_128_SHA:        {"RC4-SHA", 128},
+	tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA:   {"DES-CBC3-SHA", 112},
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA:    {"AES128-SHA", 128},
+	tls.TLS_RSA_WITH_AES_256_CBC_SHA:    {"AES256-SHA", 256},
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA256: {"AES128-SHA256", 128},
+	tls.TLS_RSA_WITH_AES_128_GCM_SHA256: {"AES128-GCM-SHA256", 128},
+	tls.TLS_RSA_WITH_AES_256_GCM_SHA384: {"AES256-GCM-SHA384", 256},
+
+	tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA:              {"ECDHE-ECDSA-RC4-SHA", 128},
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:          {"ECDHE-ECDSA-AES128-SHA", 128},
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:          {"ECDHE-ECDSA-AES256-SHA", 256},
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:       {"ECDHE-ECDSA-AES128-SHA256", 128},
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:       {"ECDHE-ECDSA-AES128-GCM-SHA256", 128},
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:       {"ECDHE-ECDSA-AES256-GCM-SHA384", 256},
+	tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: {"ECDHE-ECDSA-CHACHA20-POLY1305", 256},
+
+	tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA:              {"ECDHE-RSA-RC4-SHA", 128},
+	tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA:         {"ECDHE-RSA-DES-CBC3-SHA", 112},
+	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:          {"ECDHE-RSA-AES128-SHA", 128},
+	tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:          {"ECDHE-RSA-AES256-SHA", 256},
+	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256:       {"ECDHE-RSA-AES128-SHA256", 128},
+	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:       {"ECDHE-RSA-AES128-GCM-SHA256", 128},
+	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:       {"ECDHE-RSA-AES256-GCM-SHA384", 256},
+	tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256: {"ECDHE-RSA-CHACHA20-POLY1305", 256},
+}
+
+// openSSLCipherName returns the OpenSSL name and strength of a suite, falling
+// back to the IANA name (and 0 bits) for anything the table does not know.
+func openSSLCipherName(id uint16) (name string, bits int) {
+	if c, ok := openSSLCiphers[id]; ok {
+		return c.name, c.bits
+	}
+	return tls.CipherSuiteName(id), 0
+}
+
+// openSSLSigAlgName maps a signature algorithm to OpenSSL's long name. The
+// weak-algorithm rule in certificateIssues matches on these names.
+func openSSLSigAlgName(a x509.SignatureAlgorithm) string {
+	switch a {
+	case x509.MD2WithRSA:
+		return "md2WithRSAEncryption"
+	case x509.MD5WithRSA:
+		return "md5WithRSAEncryption"
+	case x509.SHA1WithRSA:
+		return "sha1WithRSAEncryption"
+	case x509.SHA256WithRSA:
+		return "sha256WithRSAEncryption"
+	case x509.SHA384WithRSA:
+		return "sha384WithRSAEncryption"
+	case x509.SHA512WithRSA:
+		return "sha512WithRSAEncryption"
+	case x509.SHA256WithRSAPSS, x509.SHA384WithRSAPSS, x509.SHA512WithRSAPSS:
+		return "rsassaPss"
+	case x509.DSAWithSHA1:
+		return "dsaWithSHA1"
+	case x509.DSAWithSHA256:
+		return "dsa_with_SHA256"
+	case x509.ECDSAWithSHA1:
+		return "ecdsa-with-SHA1"
+	case x509.ECDSAWithSHA256:
+		return "ecdsa-with-SHA256"
+	case x509.ECDSAWithSHA384:
+		return "ecdsa-with-SHA384"
+	case x509.ECDSAWithSHA512:
+		return "ecdsa-with-SHA512"
+	case x509.PureEd25519:
+		return "ED25519"
+	default:
+		return a.String()
+	}
+}
+
+var (
+	oidCommonName   = asn1.ObjectIdentifier{2, 5, 4, 3}
+	oidOrganization = asn1.ObjectIdentifier{2, 5, 4, 10}
+)
+
+// dnShortNames maps attribute OIDs to OpenSSL's short names. Anything else is
+// printed as a dotted OID.
+var dnShortNames = map[string]string{
+	"2.5.4.6":                    "C",
+	"2.5.4.8":                    "ST",
+	"2.5.4.7":                    "L",
+	"2.5.4.10":                   "O",
+	"2.5.4.11":                   "OU",
+	"2.5.4.3":                    "CN",
+	"2.5.4.5":                    "serialNumber",
+	"2.5.4.9":                    "street",
+	"2.5.4.17":                   "postalCode",
+	"2.5.4.4":                    "SN",
+	"2.5.4.42":                   "GN",
+	"2.5.4.15":                   "businessCategory",
+	"2.5.4.97":                   "organizationIdentifier",
+	"1.2.840.113549.1.9.1":       "emailAddress",
+	"0.9.2342.19200300.100.1.25": "DC",
+	"1.3.6.1.4.1.311.60.2.1.1":   "jurisdictionL",
+	"1.3.6.1.4.1.311.60.2.1.2":   "jurisdictionST",
+	"1.3.6.1.4.1.311.60.2.1.3":   "jurisdictionC",
+}
+
+// nameAttributes returns the attributes of n in DER order. A parsed name has
+// them in Names; a name built in code only has the convenience fields, so the
+// sequence is rebuilt from those.
+func nameAttributes(n pkix.Name) []pkix.AttributeTypeAndValue {
+	if len(n.Names) > 0 {
+		return n.Names
+	}
+	var attrs []pkix.AttributeTypeAndValue
+	for _, rdn := range n.ToRDNSequence() {
+		attrs = append(attrs, rdn...)
+	}
+	return attrs
+}
+
+// formatDN renders a distinguished name the way the PHP proxy does: short
+// names in DER order, "key=value" joined by ", ". A repeated key emits all its
+// values at the position of its first occurrence ("OU=a, OU=b, CN=x") — a
+// quirk of PHP's parsed-array representation, kept for identical output.
+func formatDN(n pkix.Name) string {
+	var order []string
+	values := make(map[string][]string)
+	for _, atv := range nameAttributes(n) {
+		key, ok := dnShortNames[atv.Type.String()]
+		if !ok {
+			key = atv.Type.String()
+		}
+		if _, seen := values[key]; !seen {
+			order = append(order, key)
+		}
+		values[key] = append(values[key], fmt.Sprint(atv.Value))
+	}
+	parts := make([]string, 0, len(order))
+	for _, key := range order {
+		for _, v := range values[key] {
+			parts = append(parts, key+"="+v)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// firstAttr returns the first value of the given attribute, or "". The first
+// one, not the last: pkix.Name.CommonName keeps the last CN, PHP the first.
+func firstAttr(n pkix.Name, oid asn1.ObjectIdentifier) string {
+	for _, atv := range nameAttributes(n) {
+		if atv.Type.Equal(oid) {
+			return fmt.Sprint(atv.Value)
+		}
+	}
+	return ""
+}
+
+// nameLabel is the short display name of a certificate name: the first CN,
+// else the first O, else "Unknown".
+func nameLabel(n pkix.Name) string {
+	if cn := firstAttr(n, oidCommonName); cn != "" {
+		return cn
+	}
+	if o := firstAttr(n, oidOrganization); o != "" {
+		return o
+	}
+	return "Unknown"
+}
+
+// optionalString returns nil for "", so the JSON carries null like PHP does.
+func optionalString(s string) *string {
+	if s == "" {
 		return nil
 	}
+	return &s
+}
 
-	leaf := state.PeerCertificates[0]
-
-	org := ""
-	if len(leaf.Subject.Organization) > 0 {
-		org = leaf.Subject.Organization[0]
+// describePublicKey describes the certificate's public key like the PHP
+// proxy. rsaBits is set for RSA keys only — it feeds the weak-key rule.
+func describePublicKey(c *x509.Certificate) (desc string, rsaBits *int) {
+	switch pub := c.PublicKey.(type) {
+	case *rsa.PublicKey:
+		if pub == nil || pub.N == nil {
+			return "Unknown", nil
+		}
+		bits := pub.N.BitLen()
+		return fmt.Sprintf("RSA %d bit", bits), &bits
+	case *ecdsa.PublicKey:
+		if pub == nil || pub.Curve == nil {
+			return "Unknown", nil
+		}
+		params := pub.Curve.Params()
+		name := params.Name
+		if name == "P-224" {
+			// PHP only shortens the three common NIST curves; any other keeps
+			// its OpenSSL name.
+			name = "secp224r1"
+		}
+		return fmt.Sprintf("EC %s (%d bit)", name, params.BitSize), nil
+	case ed25519.PublicKey:
+		return "Ed25519", nil
+	case *dsa.PublicKey:
+		if pub == nil || pub.P == nil {
+			return "Unknown", nil
+		}
+		return fmt.Sprintf("DSA %d bit", pub.P.BitLen()), nil
+	default:
+		// Includes a nil key, and X25519 (*ecdh.PublicKey) — the only other key
+		// type crypto/x509 parses, which a TLS server certificate cannot use.
+		// PHP's "Other (N bit)" branch therefore has no Go equivalent.
+		return "Unknown", nil
 	}
-	issuerOrg := ""
-	if len(leaf.Issuer.Organization) > 0 {
-		issuerOrg = leaf.Issuer.Organization[0]
+}
+
+// colonHex renders bytes as upper-case hex pairs joined by ":".
+func colonHex(b []byte) string {
+	h := strings.ToUpper(hex.EncodeToString(b))
+	var sb strings.Builder
+	for i := 0; i < len(h); i += 2 {
+		if i > 0 {
+			sb.WriteByte(':')
+		}
+		sb.WriteString(h[i : i+2])
 	}
+	return sb.String()
+}
 
-	daysLeft := int(time.Until(leaf.NotAfter).Hours() / 24)
+// certTimeLayout is the PHP proxy's date format, gmdate('Y-m-d H:i:s \U\T\C').
+const certTimeLayout = "2006-01-02 15:04:05 UTC"
 
-	// SANs cover DNS names and IP addresses; a certificate issued only for an
-	// IP would otherwise report an empty SAN list.
-	sans := make([]string, 0, len(leaf.DNSNames)+len(leaf.IPAddresses))
-	sans = append(sans, leaf.DNSNames...)
-	for _, ip := range leaf.IPAddresses {
+// daysUntil returns the whole days from now until t, floored like the PHP
+// proxy's floor((validTo - time()) / 86400) — negative once t has passed.
+// Integer Unix seconds, never time.Duration: t.Sub saturates at ~292 years,
+// and a NotAfter of 9999-12-31 (RFC 5280's "no expiration") is far beyond.
+func daysUntil(t, now time.Time) int {
+	d := t.Unix() - now.Unix()
+	days := d / 86400
+	if d%86400 != 0 && d < 0 {
+		days-- // Go truncates toward zero; floor rounds down
+	}
+	return int(days)
+}
+
+// isSelfIssued reports whether subject and issuer are the same name. An empty
+// raw name (a certificate built in code rather than parsed) never counts.
+func isSelfIssued(c *x509.Certificate) bool {
+	return len(c.RawSubject) > 0 && bytes.Equal(c.RawSubject, c.RawIssuer)
+}
+
+// isSelfSigned reports whether the certificate is self-issued and carries a
+// valid signature made with its own key.
+func isSelfSigned(c *x509.Certificate) bool {
+	return isSelfIssued(c) && signatureValid(c, c)
+}
+
+// servedChainReachesRoot reports whether the leaf (certs[0]) links up to a
+// self-signed certificate through the certificates the server sent — each
+// step an issuer whose subject matches and whose key made the signature, in
+// any order. Like OpenSSL's verify error 19 versus 20: a self-signed root
+// the leaf cannot reach (intermediate missing or wrong) leaves the chain
+// incomplete rather than ending in an untrusted root. Each step moves to a
+// certificate not yet visited, so the walk ends after len(certs) steps.
+func servedChainReachesRoot(certs []*x509.Certificate) bool {
+	if len(certs) < 2 {
+		return false
+	}
+	visited := make([]bool, len(certs))
+	visited[0] = true
+	cur := certs[0]
+	for {
+		next := -1
+		for i, c := range certs {
+			if !visited[i] && bytes.Equal(c.RawSubject, cur.RawIssuer) && signatureValid(cur, c) {
+				next = i
+				break
+			}
+		}
+		if next < 0 {
+			return false
+		}
+		if isSelfSigned(certs[next]) {
+			return true
+		}
+		visited[next] = true
+		cur = certs[next]
+	}
+}
+
+// describeCertificate builds the per-certificate report, everything except
+// the chain-dependent Position, Label and SignatureValid.
+func describeCertificate(c *x509.Certificate, now time.Time) chainLink {
+	key, keyBits := describePublicKey(c)
+
+	sans := make([]string, 0, len(c.DNSNames)+len(c.IPAddresses))
+	sans = append(sans, c.DNSNames...)
+	for _, ip := range c.IPAddresses {
 		sans = append(sans, ip.String())
 	}
 
-	chain := make([]chainLink, 0, len(state.PeerCertificates))
-	for _, cert := range state.PeerCertificates {
-		chain = append(chain, chainLink{
-			Subject: cert.Subject.CommonName,
-			Issuer:  cert.Issuer.CommonName,
-		})
+	// SerialNumber is nil only for a certificate built in code; a parsed one
+	// always has it. Bytes() is the magnitude — negative serials never get
+	// here, crypto/x509 refuses to parse them.
+	serial := ""
+	if c.SerialNumber != nil {
+		if serial = colonHex(c.SerialNumber.Bytes()); serial == "" {
+			serial = "00"
+		}
 	}
 
-	return &sslInfo{
-		Version:            tlsVersionName(state.Version),
+	sum256 := sha256.Sum256(c.Raw)
+	sum1 := sha1.Sum(c.Raw)
+	pemText := ""
+	if len(c.Raw) > 0 {
+		pemText = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw}))
+	}
+
+	return chainLink{
+		Subject:            nameLabel(c.Subject),
+		Issuer:             nameLabel(c.Issuer),
+		SubjectOrg:         optionalString(firstAttr(c.Subject, oidOrganization)),
+		SubjectDN:          formatDN(c.Subject),
+		IssuerOrg:          optionalString(firstAttr(c.Issuer, oidOrganization)),
+		IssuerDN:           formatDN(c.Issuer),
+		SelfIssued:         isSelfIssued(c),
+		IsCA:               c.BasicConstraintsValid && c.IsCA,
+		ValidFrom:          c.NotBefore.UTC().Format(certTimeLayout),
+		ValidUntil:         c.NotAfter.UTC().Format(certTimeLayout),
+		ValidFromTs:        c.NotBefore.Unix(),
+		ValidUntilTs:       c.NotAfter.Unix(),
+		DaysLeft:           daysUntil(c.NotAfter, now),
+		Serial:             serial,
+		SignatureAlgorithm: openSSLSigAlgName(c.SignatureAlgorithm),
+		Key:                key,
+		KeyBits:            keyBits,
+		SANs:               sans,
+		SHA256:             colonHex(sum256[:]),
+		SHA1:               colonHex(sum1[:]),
+		PEM:                pemText,
+	}
+}
+
+// signatureValid reports whether parent's key made child's signature — a pure
+// signature check like openssl_x509_verify, nothing else. Not
+// CheckSignatureFrom: that also demands that parent is a CA, which would
+// report a self-signed leaf as broken.
+func signatureValid(child, parent *x509.Certificate) bool {
+	if child == nil || parent == nil || parent.PublicKey == nil {
+		return false
+	}
+	err := parent.CheckSignature(child.SignatureAlgorithm, child.RawTBSCertificate, child.Signature)
+	if err == nil {
+		return true
+	}
+	// crypto/x509 refuses MD5 outright, OpenSSL still checks it. Only the
+	// display depends on this; nothing is ever trusted because of it.
+	var insecure x509.InsecureAlgorithmError
+	if errors.As(err, &insecure) && child.SignatureAlgorithm == x509.MD5WithRSA {
+		if pub, ok := parent.PublicKey.(*rsa.PublicKey); ok {
+			sum := md5.Sum(child.RawTBSCertificate)
+			return rsa.VerifyPKCS1v15(pub, crypto.MD5, sum[:], child.Signature) == nil
+		}
+	}
+	return false
+}
+
+// maxChainCerts caps how many certificates of a served chain are described.
+const maxChainCerts = 10
+
+// rootWord matches a CA named "… Root …"; such a CA with an issuer other than
+// itself is a cross-signed root acting as an intermediate.
+var rootWord = regexp.MustCompile(`(?i)\broot\b`)
+
+// buildCertificateChain describes the chain in server order (leaf first), with
+// each certificate's position, label and whether the next one signed it.
+func buildCertificateChain(certs []*x509.Certificate, now time.Time) []chainLink {
+	if len(certs) > maxChainCerts {
+		certs = certs[:maxChainCerts]
+	}
+	chain := make([]chainLink, 0, len(certs))
+	for i, c := range certs {
+		link := describeCertificate(c, now)
+		link.Position = i + 1
+
+		switch {
+		case link.SelfIssued:
+			v := signatureValid(c, c)
+			link.SignatureValid = &v
+		case i+1 < len(certs):
+			v := signatureValid(c, certs[i+1])
+			link.SignatureValid = &v
+		}
+
+		switch {
+		case i == 0:
+			link.Label = "Server certificate"
+		case link.SelfIssued && link.SignatureValid != nil && *link.SignatureValid:
+			link.Label = "Root CA (self-signed)"
+		case link.IsCA && rootWord.MatchString(link.Subject):
+			link.Label = "Cross-signed root (acts as intermediate)"
+		case link.IsCA:
+			link.Label = "Intermediate CA"
+		default:
+			link.Label = "Certificate"
+		}
+		chain = append(chain, link)
+	}
+	return chain
+}
+
+// isASCII reports whether s contains only ASCII bytes.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// certMatchesHost reports whether the certificate names cover host, with the
+// rules of the PHP proxy (RFC 6125): the SANs, or the subject if there are
+// none; exact match after lower-casing and dropping trailing dots; a "*."
+// wildcard covers exactly one non-empty label. IP hosts are compared as IPs,
+// which also matches an IPv6 SAN written differently.
+//
+// Returns nil when there is no host to check, or when it is not ASCII: Go has
+// no IDNA in the stdlib, and a U-label never equals the A-labels a certificate
+// carries, so any answer would be a false "not covered".
+func certMatchesHost(host string, sans []string, cn string) *bool {
+	h := strings.TrimRight(strings.ToLower(strings.Trim(host, "[]")), ".")
+	if h == "" || !isASCII(h) {
+		return nil
+	}
+	names := sans
+	if len(names) == 0 {
+		names = []string{cn}
+	}
+	hostIP := net.ParseIP(h)
+
+	match := false
+	for _, name := range names {
+		n := strings.TrimRight(strings.ToLower(name), ".")
+		if hostIP != nil {
+			if ip := net.ParseIP(n); ip != nil && ip.Equal(hostIP) {
+				match = true
+				break
+			}
+			continue
+		}
+		if n == h {
+			match = true
+			break
+		}
+		if strings.HasPrefix(n, "*.") {
+			suffix := n[1:]
+			if strings.HasSuffix(h, suffix) {
+				if label := h[:len(h)-len(suffix)]; label != "" && !strings.Contains(label, ".") {
+					match = true
+					break
+				}
+			}
+		}
+	}
+	return &match
+}
+
+// weakSigAlg is the PHP rule for weak signature algorithms. PHP's pattern
+// misses "ecdsa-with-SHA1"; certificateIssues adds that case explicitly.
+var weakSigAlg = regexp.MustCompile(`(?i)md5|sha1With|sha1-`)
+
+// certificateIssues is a port of the dns-ssl tool's certificateIssues(): the
+// same rules, order and English messages.
+func certificateIssues(chain []chainLink, hostMatch *bool, selfSigned bool, now time.Time) []certIssue {
+	issues := []certIssue{}
+	if len(chain) == 0 {
+		return issues
+	}
+	add := func(typ, format string, args ...any) {
+		issues = append(issues, certIssue{Type: typ, Msg: fmt.Sprintf(format, args...)})
+	}
+
+	leaf := chain[0]
+	switch ts := now.Unix(); {
+	case leaf.ValidUntilTs < ts:
+		days := leaf.DaysLeft
+		if days < 0 {
+			days = -days
+		}
+		add("error", "The certificate expired %d days ago.", days)
+	case leaf.ValidFromTs > ts:
+		add("error", "The certificate is not valid yet.")
+	case leaf.DaysLeft <= 14:
+		add("warning", "The certificate expires in %d days.", leaf.DaysLeft)
+	}
+
+	if hostMatch != nil && !*hostMatch {
+		add("error", "The host name is not covered by the certificate (CN/SAN).")
+	}
+	if selfSigned {
+		add("error", "The certificate is self-signed — browsers will not trust it.")
+	}
+
+	for _, c := range chain {
+		weak := weakSigAlg.MatchString(c.SignatureAlgorithm) ||
+			strings.HasSuffix(strings.ToUpper(c.SignatureAlgorithm), "-SHA1")
+		if weak && !(c.SelfIssued && c.Position > 1) {
+			add("warning", "%s: weak signature algorithm (%s).", c.Subject, c.SignatureAlgorithm)
+		}
+		if c.KeyBits != nil && *c.KeyBits < 2048 {
+			add("warning", "%s: RSA key with only %d bit.", c.Subject, *c.KeyBits)
+		}
+	}
+
+	last := chain[len(chain)-1]
+	if len(chain) == 1 && !selfSigned {
+		add("warning", "The server sends no intermediate certificate — some clients cannot build the chain.")
+	} else if last.SignatureValid != nil && !*last.SignatureValid {
+		add("error", "The chain is broken: %s is not signed by the next certificate.", last.Subject)
+	}
+
+	for _, c := range chain {
+		if c.Position < len(chain) && c.SignatureValid != nil && !*c.SignatureValid {
+			add("error", "Chain order or content is wrong: %s is not signed by the following certificate.", c.Subject)
+			break
+		}
+	}
+	return issues
+}
+
+// -----------------------------------------------------------------------
+// TLS verdict and the handshake-only diagnostic probe
+// -----------------------------------------------------------------------
+
+// classifyTLSFailure explains a failed TLS connection in the PHP proxy's two
+// vocabularies: errorType as the dns-ssl tool shows it (classifyProxySslError)
+// and verifyText as OpenSSL's verify result (seo ssl.error).
+//
+// err — the content connection's real error — is authoritative: it carries
+// the platform's actual trust decision. certs (from the probe, or the chain
+// crypto/tls attached to the error) only sub-classify an unknown authority.
+func classifyTLSFailure(err error, certs []*x509.Certificate, now time.Time) (errorType, verifyText string) {
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &invalid) && invalid.Reason == x509.Expired {
+		// crypto/x509 uses Expired for both ends of the validity window.
+		notYet := strings.Contains(invalid.Detail, "is before")
+		if invalid.Cert != nil {
+			notYet = now.Before(invalid.Cert.NotBefore)
+		}
+		if notYet {
+			return "Certificate not yet valid", "Certificate is not yet valid"
+		}
+		return "Certificate expired", "Certificate has expired"
+	}
+
+	var hostErr x509.HostnameError
+	if errors.As(err, &hostErr) {
+		return "Host name does not match the certificate", "Hostname mismatch"
+	}
+
+	var unknown x509.UnknownAuthorityError
+	var noRoots x509.SystemRootsError
+	if errors.As(err, &unknown) || errors.As(err, &noRoots) {
+		if len(certs) > 0 && isSelfSigned(certs[0]) {
+			return "Self-signed certificate", "Self-signed certificate"
+		}
+		if servedChainReachesRoot(certs) {
+			return "Untrusted root certificate in the chain", "Self-signed certificate in chain"
+		}
+		return "Incomplete chain or unknown issuer", "Unable to get local issuer certificate"
+	}
+
+	// Any other verification failure: a CA not allowed to sign, no valid chain
+	// (e.g. a distrusted root), a wrong key usage, or an untyped error from a
+	// platform verifier (macOS, Windows).
+	var cve *tls.CertificateVerificationError
+	if errors.As(err, &invalid) || errors.As(err, &cve) {
+		return "TLS/SSL error", "Certificate not trusted"
+	}
+
+	// Handshake failures. A plain-HTTP answer surfaces as RecordHeaderError
+	// (or http.ErrSchemeMismatch, see classifyUpstreamError);
+	// a protocol-version mismatch either as the peer's alert or as crypto/tls'
+	// own untyped error. Both carry "protocol version" in the innermost error
+	// — read there, never off the chain, which includes the caller's URL.
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) || errors.Is(err, http.ErrSchemeMismatch) {
+		return "TLS protocol not supported", "TLS protocol not supported"
+	}
+	if leaf := leafError(err); leaf != nil && strings.Contains(leaf.Error(), "protocol version") {
+		return "TLS protocol not supported", "TLS protocol not supported"
+	}
+	return "TLS/SSL error", "TLS handshake failed"
+}
+
+// tlsProbeTimeout bounds the diagnostic handshake (dial included).
+const tlsProbeTimeout = 10 * time.Second
+
+// probeFailedMessage is all the client learns about a failed probe.
+const probeFailedMessage = "TLS handshake for certificate details failed"
+
+// errNoProbeAddress is logged when there is no connected address to probe.
+var errNoProbeAddress = errors.New("no connected address to probe")
+
+// probeTLS performs a handshake-only TLS connection to ip:port to read what a
+// failing server presents: protocol, cipher and its certificate chain.
+//
+// It runs only on request (diag=1) after a tls_error, against the IP the failed
+// request had already connected to — so there is no second DNS lookup and no
+// rebinding window — and it dials through the configured Control hook, i.e.
+// safeDialControl in production, which re-checks that literal IP.
+func probeTLS(ctx context.Context, cfg *config, host, port, ip string) (*tls.ConnectionState, error) {
+	ctx, cancel := context.WithTimeout(ctx, tlsProbeTimeout) // never exceeds the parent's deadline
+	defer cancel()
+
+	dialer := &net.Dialer{Timeout: tlsProbeTimeout, Control: cfg.dialControlOrDefault()}
+	raw, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+	if err != nil {
+		return nil, err
+	}
+	defer raw.Close()
+
+	// No SNI for a literal IP (as PHP does), nor for a non-ASCII host, which
+	// is not a valid server_name and would need IDNA to become one.
+	sni := host
+	if net.ParseIP(host) != nil || !isASCII(host) {
+		sni = ""
+	}
+
+	// Every suite Go still implements, so servers stuck on RSA key exchange,
+	// 3DES or RC4 still show their certificate.
+	suites := make([]uint16, 0, len(openSSLCiphers))
+	for _, s := range tls.CipherSuites() {
+		suites = append(suites, s.ID)
+	}
+	for _, s := range tls.InsecureCipherSuites() {
+		suites = append(suites, s.ID)
+	}
+
+	// SECURITY: handshake-only diagnostic. InsecureSkipVerify is required to
+	// *see* a chain that fails verification. This connection never carries
+	// application data: nothing is written or read after the handshake, and it
+	// is never handed to an http.Transport. The trust verdict reported to the
+	// client comes from the verified content connection (classifyTLSFailure),
+	// not from this probe.
+	tc := tls.Client(raw, &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS10,
+		CipherSuites:       suites,
+	})
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = tc.SetDeadline(deadline)
+	}
+	if err := tc.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	state := tc.ConnectionState()
+	_ = tc.Close()
+	return &state, nil
+}
+
+// diagnoseTLSFailure builds the certificate report for a request that failed
+// with a tls_error: the chain and handshake details from the probe, or — when
+// the probe fails — the unverified chain crypto/tls attached to the error.
+// Returns nil when neither is available.
+func diagnoseTLSFailure(ctx context.Context, cfg *config, target *url.URL, ip string, reqErr error, now time.Time) *sslInfo {
+	host := target.Hostname()
+	port := target.Port()
+	if port == "" {
+		port = "443"
+	}
+
+	var state *tls.ConnectionState
+	probeErr := errNoProbeAddress
+	if ip != "" {
+		state, probeErr = probeTLS(ctx, cfg, host, port, ip)
+	}
+
+	var (
+		certs  []*x509.Certificate
+		source string
+		note   string
+	)
+	var cve *tls.CertificateVerificationError
+	switch {
+	case probeErr == nil && len(state.PeerCertificates) > 0:
+		certs, source = state.PeerCertificates, "probe"
+	case errors.As(reqErr, &cve) && len(cve.UnverifiedCertificates) > 0:
+		log.Printf("tls probe for %s failed: %v", host, probeErr)
+		certs, source, note = cve.UnverifiedCertificates, "verify-error", probeFailedMessage
+		state = nil
+	default:
+		log.Printf("tls probe for %s failed: %v", host, probeErr)
+		return nil
+	}
+
+	errorType, verifyText := classifyTLSFailure(reqErr, certs, now)
+	info := buildSSLInfo(certs, state, host, false, &verifyText, &errorType, source, now)
+	if info != nil {
+		info.ProbeError = note
+	}
+	return info
+}
+
+// diagnoseRequestTLS runs diagnoseTLSFailure for a diag=1 request with a budget
+// of its own, derived from the client's request: the upstream timeout may
+// already be used up by the request that failed.
+func diagnoseRequestTLS(r *http.Request, cfg *config, target *url.URL, ip string, reqErr error) *sslInfo {
+	ctx, cancel := context.WithTimeout(r.Context(), tlsProbeTimeout)
+	defer cancel()
+	return diagnoseTLSFailure(ctx, cfg, target, ip, reqErr, time.Now())
+}
+
+// buildSSLInfo assembles the certificate report. certs is the chain in server
+// order; state, when known, supplies the negotiated protocol and cipher.
+// verified is the content connection's verdict, with verifyText and errorType
+// explaining a failure (nil when verified).
+func buildSSLInfo(certs []*x509.Certificate, state *tls.ConnectionState, host string, verified bool,
+	verifyText, errorType *string, source string, now time.Time) *sslInfo {
+	if len(certs) == 0 {
+		return nil
+	}
+	leaf := certs[0]
+	chain := buildCertificateChain(certs, now)
+
+	info := &sslInfo{
 		Subject:            leaf.Subject.CommonName,
 		Issuer:             leaf.Issuer.CommonName,
-		IssuerOrg:          issuerOrg,
-		Organization:       org,
 		ValidFrom:          leaf.NotBefore.UTC().Format(time.RFC3339),
 		ValidTo:            leaf.NotAfter.UTC().Format(time.RFC3339),
-		DaysLeft:           daysLeft,
-		SANs:               sans,
+		DaysLeft:           daysUntil(leaf.NotAfter, now),
+		SANs:               chain[0].SANs, // DNS names and IPs: an IP-only cert would otherwise report none
 		Chain:              chain,
 		SignatureAlgorithm: leaf.SignatureAlgorithm.String(),
 		PublicKeyAlgorithm: leaf.PublicKeyAlgorithm.String(),
+		Verified:           verified,
+		Valid:              verified,
+		Error:              verifyText,
+		ErrorType:          errorType,
+		CertSource:         source,
 	}
+	if len(leaf.Subject.Organization) > 0 {
+		info.Organization = leaf.Subject.Organization[0]
+	}
+	if len(leaf.Issuer.Organization) > 0 {
+		info.IssuerOrg = leaf.Issuer.Organization[0]
+	}
+	if state != nil {
+		info.Version = tlsVersionName(state.Version)
+		info.Protocol = tlsProtocolName(state.Version)
+		info.Cipher, info.Bits = openSSLCipherName(state.CipherSuite)
+		info.CipherSuite = tls.CipherSuiteName(state.CipherSuite)
+	}
+
+	info.HostMatch = certMatchesHost(host, chain[0].SANs, chain[0].Subject)
+	info.SelfSigned = chain[0].SelfIssued && chain[0].SignatureValid != nil && *chain[0].SignatureValid
+	info.Issues = certificateIssues(chain, info.HostMatch, info.SelfSigned, now)
+	return info
+}
+
+// extractSSLInfo builds an sslInfo struct from a verified TLS connection to
+// host. An empty host leaves hostMatch null.
+func extractSSLInfo(state *tls.ConnectionState, host string) *sslInfo {
+	if state == nil || len(state.PeerCertificates) == 0 {
+		return nil
+	}
+	return buildSSLInfo(state.PeerCertificates, state, host, true, nil, nil, "connection", time.Now())
+}
+
+// doTraced performs one upstream request with a connTrace of its own, attached
+// to that request only — so timing and IP describe exactly this request, not a
+// probe that ran before it. The caller closes resp.Body.
+func doTraced(ctx context.Context, client *http.Client, method, target string, browserReq *http.Request,
+	tweak func(*http.Request)) (resp *http.Response, ct *connTrace, start time.Time, err error) {
+	ct = &connTrace{}
+	start = time.Now()
+	req, err := http.NewRequestWithContext(ct.attach(ctx), method, target, nil)
+	if err != nil {
+		return nil, ct, start, err
+	}
+	copyRequestHeaders(browserReq, req)
+	if tweak != nil {
+		tweak(req)
+	}
+	resp, err = client.Do(req)
+	return resp, ct, start, err
+}
+
+// isHeadRefused reports a status that means "this server does not do HEAD".
+// /inspect and the /page redirect tracer then repeat the request with GET.
+func isHeadRefused(status int) bool {
+	return status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented
+}
+
+// probeContentEncoding asks the target with a HEAD — carrying the browser's
+// full Accept-Encoding — which Content-Encoding it really prefers (br, zstd,
+// …). The body GET that follows only accepts what the stdlib can decode, so
+// its own header would hide that. The HEAD is untraced: reported timing and
+// IP belong to the GET. Returns "" on failure; the GET reports the error.
+func probeContentEncoding(ctx context.Context, client *http.Client, target string, browserReq *http.Request) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, target, nil)
+	if err != nil {
+		return ""
+	}
+	copyRequestHeaders(browserReq, req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	resp.Body.Close()
+	return resp.Header.Get("Content-Encoding")
 }
 
 // inspectHandler returns an http.Handler that performs a request to the
 // target URL and returns connection metadata (SSL, timing, headers, IP,
 // protocol) as a JSON response. The response body is included when the
 // "body" query parameter is set to "1".
+//
+// With "get=1" (and no body=1), the headers come from a GET whose body is
+// closed unread instead of a HEAD — what the PHP proxy's headers-only fetch
+// (cURL CUSTOMREQUEST GET + NOBODY) puts on the wire. Some servers send
+// different headers to HEAD; www.google.com, for instance, only sends
+// Strict-Transport-Security on GET.
+//
+// With "diag=1", an upstream failure is reported inline (HTTP 200 with an
+// error object) and a tls_error additionally carries the certificate details
+// the failing server presented.
 func inspectHandler(cfg *config, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -723,20 +1810,13 @@ func inspectHandler(cfg *config, client *http.Client) http.Handler {
 			return
 		}
 
-		// Build traced request.
+		query := r.URL.Query()
+		includeBody := query.Get("body") == "1"
+		headersViaGET := query.Get("get") == "1" && !includeBody
+		diag := query.Get("diag") == "1"
+
 		ctx, cancel := context.WithTimeout(r.Context(), cfg.requestTimeout)
 		defer cancel()
-
-		ct := &connTrace{}
-		requestStart := time.Now()
-		ctx = ct.attach(ctx)
-
-		// Use GET if body requested, HEAD otherwise — to get full connection info.
-		method := http.MethodHead
-		includeBody := r.URL.Query().Get("body") == "1"
-		if includeBody {
-			method = http.MethodGet
-		}
 
 		// When body=1, we need two pieces of information:
 		// 1. The server's true preferred Content-Encoding (may be zstd, br, etc.)
@@ -747,45 +1827,66 @@ func inspectHandler(cfg *config, client *http.Client) http.Handler {
 		// then send the GET with Accept-Encoding limited to gzip/deflate
 		// so we can decompress the body. The HEAD-detected encoding is
 		// restored in the final header map.
+		//
+		// The HEAD runs untraced: the reported timing and IP belong to the GET.
 		var serverContentEncoding string
 		if includeBody {
-			headReq, err := http.NewRequestWithContext(ctx, http.MethodHead, target.String(), nil)
-			if err != nil {
-				writeJSONError(w, r, cfg, "upstream_error", "could not build upstream request", http.StatusInternalServerError)
-				return
-			}
-			copyRequestHeaders(r, headReq)
-			headResp, err := client.Do(headReq)
-			if err == nil {
-				serverContentEncoding = headResp.Header.Get("Content-Encoding")
-				headResp.Body.Close()
-			}
-			// On HEAD failure, we continue — the GET below will report the error.
+			serverContentEncoding = probeContentEncoding(ctx, client, target.String(), r)
 		}
 
-		upstreamReq, err := http.NewRequestWithContext(ctx, method, target.String(), nil)
-		if err != nil {
-			writeJSONError(w, r, cfg, "upstream_error", "could not build upstream request", http.StatusInternalServerError)
-			return
-		}
-		copyRequestHeaders(r, upstreamReq)
-
-		// For body requests, limit Accept-Encoding to what stdlib can
-		// decompress (gzip, deflate). This prevents garbled bytes in the
-		// JSON response while still allowing the body to be read as text.
+		// HEAD unless the body (or a headers-only GET) is wanted. For body
+		// requests, limit Accept-Encoding to what stdlib can decompress
+		// (gzip, deflate).
+		method := http.MethodHead
+		var limitEncoding func(*http.Request)
 		if includeBody {
-			upstreamReq.Header.Set("Accept-Encoding", "gzip, deflate")
+			method = http.MethodGet
+			limitEncoding = func(req *http.Request) { req.Header.Set("Accept-Encoding", "gzip, deflate") }
+		} else if headersViaGET {
+			method = http.MethodGet
+		}
+		resp, ct, requestStart, err := doTraced(ctx, client, method, target.String(), r, limitEncoding)
+
+		// get=1: headers only. Close the body unread — with keep-alives
+		// disabled the connection goes with it, so the page is never
+		// downloaded (same as the 405/501 fallback below).
+		if err == nil && headersViaGET {
+			resp.Body.Close()
 		}
 
-		resp, err := client.Do(upstreamReq)
+		// Some servers refuse HEAD (405) or never implemented it (501). Repeat
+		// with GET, as the PHP proxy does, but only for the headers: the body
+		// is closed unread, and with keep-alives disabled the connection goes
+		// with it — a large page is never downloaded.
+		if err == nil && method == http.MethodHead && isHeadRefused(resp.StatusCode) {
+			resp.Body.Close()
+			method = http.MethodGet
+			resp, ct, requestStart, err = doTraced(ctx, client, method, target.String(), r, nil)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}
+
 		if err != nil {
 			log.Printf("inspect upstream error: %v", err)
-			if ctx.Err() == context.DeadlineExceeded {
-				writeJSONError(w, r, cfg, "timeout", "upstream request timed out", http.StatusGatewayTimeout)
+			failure := upstreamFailure(ctx, err)
+			if !diag {
+				writeUpstreamError(w, r, cfg, failure)
 				return
 			}
-			code, message := classifyUpstreamError(err)
-			writeJSONError(w, r, cfg, code, message, http.StatusBadGateway)
+			result := inspectResponse{
+				Headers:     map[string][]string{},
+				Timing:      ct.timingMap(requestStart),
+				IP:          ct.remoteIP(),
+				Method:      method,
+				MaxBodySize: cfg.maxResponseBytes,
+				Error:       failure,
+			}
+			if failure.Error == "tls_error" {
+				result.SSL = diagnoseRequestTLS(r, cfg, target, result.IP, err)
+			}
+			writeCORSHeaders(w, r, cfg)
+			writeJSON(w, http.StatusOK, result)
 			return
 		}
 		defer resp.Body.Close()
@@ -808,44 +1909,38 @@ func inspectHandler(cfg *config, client *http.Client) http.Handler {
 			hdrs["Content-Encoding"] = []string{serverContentEncoding}
 		}
 
-		// Read body if requested, decompressing based on Content-Encoding.
-		var body string
+		// Read body if requested, decompressing based on the GET's actual
+		// Content-Encoding. Both the wire bytes and the decoded text are capped.
+		var body cappedBody
 		if includeBody {
-			var bodySource io.Reader = resp.Body
-			if cfg.maxResponseBytes > 0 {
-				bodySource = io.LimitReader(resp.Body, cfg.maxResponseBytes)
-			}
+			body = readDecodedBody(resp.Body, resp.Header.Get("Content-Encoding"), cfg.maxResponseBytes)
+		}
 
-			// Decompress based on actual GET response encoding (gzip/deflate via stdlib).
-			if dec, err := newDecompressor(bodySource, resp.Header.Get("Content-Encoding")); err != nil {
-				log.Printf("warn: could not decompress inspect body: %v", err)
-			} else if dec != nil {
-				defer dec.Close()
-				bodySource = dec
+		// Where a redirect points, already resolved — the caller follows it
+		// with another /inspect without re-implementing RFC 3986.
+		var location string
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			if loc := lastLocation(resp.Header); loc != "" {
+				if next, err := resolveRedirect(target, loc); err == nil {
+					location = next.String()
+				}
 			}
-
-			// Cap the decompressed stream too — guards against zip-bomb-style
-			// payloads where a small compressed body expands to gigabytes.
-			if cfg.maxResponseBytes > 0 {
-				bodySource = io.LimitReader(bodySource, cfg.maxResponseBytes)
-			}
-
-			bodyBytes, err := io.ReadAll(bodySource)
-			if err != nil {
-				log.Printf("warn: error reading inspect body: %v", err)
-			}
-			body = string(bodyBytes)
 		}
 
 		result := inspectResponse{
-			Status:   resp.StatusCode,
-			Headers:  hdrs,
-			SSL:      extractSSLInfo(resp.TLS),
-			Timing:   timingMap,
-			IP:       ct.remoteIP(),
-			Protocol: resp.Proto,
-			HTTP3:    altSvcAdvertisesHTTP3(resp.Header),
-			Body:     body,
+			Status:      resp.StatusCode,
+			Headers:     hdrs,
+			SSL:         extractSSLInfo(resp.TLS, target.Hostname()),
+			Timing:      timingMap,
+			IP:          ct.remoteIP(),
+			Protocol:    resp.Proto,
+			HTTP3:       altSvcAdvertisesHTTP3(resp.Header),
+			Body:        string(body.data),
+			Method:      method,
+			Location:    location,
+			Truncated:   body.truncated,
+			MaxBodySize: cfg.maxResponseBytes,
+			DecodeError: body.decodeError,
 		}
 
 		writeCORSHeaders(w, r, cfg)
@@ -913,8 +2008,9 @@ func splitAltSvcValues(field string) []string {
 // -----------------------------------------------------------------------
 
 // newDecompressor returns a reader that decodes the given Content-Encoding, or
-// (nil, nil) when the encoding needs no handling (identity, empty, or one the
-// stdlib cannot decode such as br/zstd — those are passed through verbatim).
+// (nil, nil) for any other value (identity, empty, one the stdlib cannot decode
+// such as br/zstd, or an unknown token). readDecodedBody decides what to do
+// with those bytes.
 //
 // "deflate" is deliberately not just flate.NewReader: RFC 7230 defines the
 // token as zlib (RFC 1950), yet a large share of servers emit raw DEFLATE
@@ -958,6 +2054,175 @@ func isZlibHeader(br *bufio.Reader) bool {
 	return cmf&0x0f == 8 && (uint16(cmf)<<8|uint16(flg))%31 == 0
 }
 
+// readCapped reads at most limit bytes (limit <= 0: unlimited) and reports
+// whether the stream held more. It reads one byte past the cap to know.
+func readCapped(r io.Reader, limit int64) (data []byte, truncated bool, err error) {
+	if limit <= 0 {
+		data, err = io.ReadAll(r)
+		return data, false, err
+	}
+	data, err = io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(data)) > limit {
+		return data[:limit], true, err
+	}
+	return data, false, err
+}
+
+// trimPartialUTF8 drops an incomplete UTF-8 sequence at the end of b — what a
+// byte cap leaves behind when it cuts through a multi-byte character (the
+// equivalent of PHP's mb_strcut). Invalid bytes are left alone.
+func trimPartialUTF8(b []byte) []byte {
+	for i := len(b) - 1; i >= 0 && i >= len(b)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(b[i]) {
+			if !utf8.FullRune(b[i:]) {
+				return b[:i]
+			}
+			return b
+		}
+	}
+	return b
+}
+
+// cappedBody is an upstream body read under the size cap and decoded.
+type cappedBody struct {
+	data        []byte // decoded text — never raw compressed bytes
+	rawSize     int    // bytes read off the wire, before decoding
+	truncated   bool   // the wire bytes or the decoded text hit the cap
+	decodeError bool   // the Content-Encoding could not be decoded; data is what was
+}
+
+// knownContentCodings holds the registered compressing or encrypting content
+// codings (IANA "HTTP Content Coding Registry", RFC 9110 §8.4.1) other than
+// identity. A body in one of them is never text as it stands. gzip, x-gzip and
+// deflate are decoded; the rest the stdlib cannot decode.
+var knownContentCodings = map[string]struct{}{
+	"gzip": {}, "x-gzip": {}, "deflate": {},
+	"br": {}, "zstd": {}, "compress": {}, "x-compress": {},
+	"dcb": {}, "dcz": {}, "aes128gcm": {}, "exi": {}, "pack200-gzip": {},
+}
+
+// contentCodings splits a Content-Encoding field into its lower-case tokens,
+// dropping empty ones and identity.
+func contentCodings(field string) []string {
+	var out []string
+	for _, tok := range strings.Split(field, ",") {
+		tok = strings.ToLower(strings.TrimSpace(tok))
+		if tok != "" && tok != "identity" {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// readDecodedBody reads r under limit (applied to the wire bytes and again to
+// the decoded text, against zip-bomb-style payloads) and decodes it according
+// to encoding.
+//
+// Encodings are handled in three classes:
+//
+//   - a single gzip, x-gzip or deflate is decoded;
+//   - a registered coding the stdlib cannot decode (br, zstd, compress, dcb,
+//     dcz, …; see knownContentCodings), or a stack of codings ("gzip, br"),
+//     yields no data and decodeError: handing the compressed bytes on as if
+//     they were text would put binary garbage into a JSON string;
+//   - any other token is a server misconfiguration ("none", "UTF-8",
+//     "text/html", "binary", …) that real sites send with a plain body. The
+//     bytes are passed through when they are valid UTF-8 (as v1.2.4 did);
+//     otherwise they get the same treatment as an undecodable coding.
+//
+// A stream that breaks off midway keeps what was decoded, also with
+// decodeError — unless the cap cut the wire bytes, which ends every decoder
+// early and is truncation, not corruption.
+func readDecodedBody(r io.Reader, encoding string, limit int64) cappedBody {
+	raw, rawTruncated, err := readCapped(r, limit)
+	if err != nil {
+		log.Printf("warn: error reading upstream body: %v", err)
+	}
+	body := cappedBody{data: raw, rawSize: len(raw), truncated: rawTruncated}
+
+	codings := contentCodings(encoding)
+	if len(codings) > 0 && len(raw) > 0 {
+		enc := strings.Join(codings, ", ")
+		known := false
+		for _, c := range codings {
+			if _, ok := knownContentCodings[c]; ok {
+				known = true
+			}
+		}
+		var dec io.ReadCloser
+		var err error
+		if len(codings) == 1 {
+			dec, err = newDecompressor(bytes.NewReader(raw), enc)
+		}
+		switch {
+		case err != nil:
+			log.Printf("warn: could not decompress body (%s): %v", enc, err)
+			body.data, body.decodeError = nil, true
+		case dec == nil && !known:
+			// Unregistered token: plain text mislabelled, or binary. A cut
+			// through a multi-byte character at the cap is not binary.
+			check := raw
+			if rawTruncated {
+				check = trimPartialUTF8(raw)
+			}
+			if !utf8.Valid(check) {
+				log.Printf("warn: unknown Content-Encoding %q with a non-UTF-8 body", enc)
+				body.data, body.decodeError = nil, true
+			}
+		case dec == nil:
+			body.data, body.decodeError = nil, true
+		default:
+			decoded, decodedTruncated, readErr := readCapped(dec, limit)
+			dec.Close()
+			body.data = decoded
+			body.truncated = body.truncated || decodedTruncated
+			if readErr != nil && !rawTruncated {
+				log.Printf("warn: error decompressing body (%s): %v", enc, readErr)
+				body.decodeError = true
+			}
+		}
+	}
+
+	if body.truncated {
+		body.data = trimPartialUTF8(body.data)
+	}
+	return body
+}
+
+// -----------------------------------------------------------------------
+// Redirect targets
+// -----------------------------------------------------------------------
+
+// errUnsupportedRedirectScheme is returned for a redirect that leaves
+// http/https (javascript:, data:, ftp:, …).
+var errUnsupportedRedirectScheme = errors.New("redirect target uses an unsupported scheme")
+
+// lastLocation returns the last Location value, or "". With several values the
+// last one wins, as in the PHP proxy.
+func lastLocation(h http.Header) string {
+	vals := h.Values("Location")
+	if len(vals) == 0 {
+		return ""
+	}
+	return vals[len(vals)-1]
+}
+
+// resolveRedirect resolves a Location value against the URL that returned it
+// (RFC 3986 §5.2, which url.ResolveReference implements). Userinfo is dropped,
+// like the PHP proxy does, and only http/https targets are accepted.
+func resolveRedirect(base *url.URL, loc string) (*url.URL, error) {
+	ref, err := url.Parse(strings.TrimSpace(loc))
+	if err != nil {
+		return nil, err
+	}
+	next := base.ResolveReference(ref)
+	next.User = nil
+	if next.Scheme != "http" && next.Scheme != "https" {
+		return nil, errUnsupportedRedirectScheme
+	}
+	return next, nil
+}
+
 // -----------------------------------------------------------------------
 // /page endpoint — full page analysis (redirect chain + body + SSL + timing)
 // -----------------------------------------------------------------------
@@ -973,6 +2238,22 @@ type pageHop struct {
 	Server     string  `json:"server,omitempty"`
 	RawHeaders string  `json:"rawHeaders,omitempty"`
 	Error      string  `json:"error,omitempty"`
+	// Method is "HEAD", or "GET" when the target refused HEAD with 405/501 or
+	// for the final hop. Absent on hops the tracer stopped without a request
+	// (loop, hop limit, blocked target), like the PHP proxy's {hop, url, error}.
+	Method string `json:"method,omitempty"`
+	// Location is the resolved, absolute target of a 3xx hop.
+	Location string `json:"location,omitempty"`
+	// ErrorCategory is the proxy error code of a failed hop (tls_error,
+	// dns_error, timeout, redirect_loop, too_many_redirects, blocked_target, …).
+	ErrorCategory string `json:"errorCategory,omitempty"`
+	// ErrorType is the classified failure text, only for a tls_error hop.
+	ErrorType string `json:"errorType,omitempty"`
+	// Certificate summary of the hop's verified connection (https only).
+	// CertCN is the leaf's common name alone — no O fallback, as in PHP.
+	CertCN       string `json:"certCN,omitempty"`
+	CertExpiry   string `json:"certExpiry,omitempty"` // "2006-01-02"
+	CertDaysLeft *int   `json:"certDaysLeft,omitempty"`
 }
 
 // pageResponse is the JSON envelope returned by the /page endpoint.
@@ -1000,13 +2281,23 @@ type pageResponse struct {
 	TransferSize    int                 `json:"transferSize"`
 	ContentEncoding string              `json:"contentEncoding"`
 	Error           *proxyError         `json:"error"`
+	// Truncated reports that the body hit MaxBodySize, on the wire or after
+	// decoding; HTML then ends at the cap (on a UTF-8 boundary).
+	Truncated bool `json:"truncated"`
+	// MaxBodySize is the configured body cap in bytes; 0 means unlimited.
+	MaxBodySize int64 `json:"maxBodySize"`
+	// DecodeError reports a Content-Encoding that could not be decoded. HTML
+	// then holds only what was decoded — never the raw compressed bytes.
+	DecodeError bool `json:"decodeError,omitempty"`
 }
 
-// formatRawHeaders renders response headers as a raw string (one per line).
+// formatRawHeaders renders response headers as a raw string (one per line),
+// keys sorted: Go cannot recover the server's order, so at least make it
+// deterministic.
 func formatRawHeaders(h http.Header) string {
 	var sb strings.Builder
-	for key, vals := range h {
-		for _, v := range vals {
+	for _, key := range slices.Sorted(maps.Keys(h)) {
+		for _, v := range h[key] {
 			sb.WriteString(key)
 			sb.WriteString(": ")
 			sb.WriteString(v)
@@ -1016,126 +2307,212 @@ func formatRawHeaders(h http.Header) string {
 	return sb.String()
 }
 
+// statusLine renders the response's status line the way it appears in a raw
+// header block: "HTTP/1.1 301 Moved Permanently". HTTP/2 and later have no
+// reason phrase on the wire (Go synthesises one), so they read "HTTP/2 200" —
+// what cURL shows on the PHP side.
+func statusLine(resp *http.Response) string {
+	if resp.ProtoMajor >= 2 {
+		return fmt.Sprintf("HTTP/%d %d", resp.ProtoMajor, resp.StatusCode)
+	}
+	proto := resp.Proto
+	if proto == "" {
+		proto = "HTTP/1.1"
+	}
+	status := resp.Status
+	if status == "" {
+		status = strings.TrimSpace(strconv.Itoa(resp.StatusCode) + " " + http.StatusText(resp.StatusCode))
+	}
+	return proto + " " + status
+}
+
+// rawHeaderBlock is the status line followed by the sorted header lines.
+func rawHeaderBlock(resp *http.Response) string {
+	return statusLine(resp) + "\n" + formatRawHeaders(resp.Header)
+}
+
+// setHopCert adds the certificate summary of a hop's verified connection.
+func setHopCert(hop *pageHop, state *tls.ConnectionState, now time.Time) {
+	if state == nil || len(state.PeerCertificates) == 0 {
+		return
+	}
+	leaf := state.PeerCertificates[0]
+	days := daysUntil(leaf.NotAfter, now)
+	hop.CertCN = firstAttr(leaf.Subject, oidCommonName) // the first CN, like PHP
+	hop.CertExpiry = leaf.NotAfter.UTC().Format("2006-01-02")
+	hop.CertDaysLeft = &days
+}
+
+// hopFailure describes where and why traceRedirectChain stopped early.
+type hopFailure struct {
+	// pe is the error /page reports at the top level. Its code is the failed
+	// hop's errorCategory — never empty — and its message the hop's error.
+	pe *proxyError
+	// err is the transport error; nil when one of the tracer's own rules
+	// stopped the chain (loop, hop limit, blocked target, time budget).
+	err error
+	// url is the URL that failed; nil when it could not be parsed.
+	url *url.URL
+	// ip is the address the failed request had connected to, if any — the
+	// one the TLS diagnostic probe may contact.
+	ip string
+}
+
+// chainStop builds the top-level error for a chain stopped by one of the
+// tracer's own rules. message is the hop's error text.
+func chainStop(code, message string) *proxyError {
+	status := http.StatusBadGateway
+	if code == "timeout" {
+		status = http.StatusGatewayTimeout
+	}
+	return &proxyError{Error: code, Message: message, Status: status, Type: proxyErrorType(code, nil)}
+}
+
 // traceRedirectChain follows redirect hops via HEAD requests, recording
-// timing, IP, headers, and status for each hop. Returns the chain and the
-// final URL (which may be the original URL if no redirects occurred).
+// timing, IP, headers, status and the certificate summary for each 3xx hop.
+// A server that refuses HEAD (405/501) is asked again with GET, whose body is
+// closed unread. Returns the chain, the final URL (which may be the original
+// URL if no redirects occurred) and — when the chain stopped early — why. The
+// last hop then carries the error.
 //
 // The parent context carries the overall budget for the /page request. Each hop
 // additionally gets its own per-request timeout, but the parent deadline always
 // wins — otherwise maxHops slow redirects could keep the handler alive for
 // maxHops × requestTimeout, and a client disconnect would not stop any of it.
-func traceRedirectChain(parent context.Context, client *http.Client, startURL string, browserReq *http.Request, maxHops int, cfg *config) ([]pageHop, string) {
-	var hops []pageHop
-	currentURL := startURL
+func traceRedirectChain(parent context.Context, client *http.Client, startURL string, browserReq *http.Request,
+	maxHops int, cfg *config) (hops []pageHop, finalURL string, fail *hopFailure) {
 	visited := make(map[string]bool)
 
-	for i := 0; i < maxHops; i++ {
+	// stop appends an error-only hop for a rule that ended the chain.
+	stop := func(hop int, rawURL string, u *url.URL, code, message string) {
+		hops = append(hops, pageHop{Hop: hop, URL: rawURL, Error: message, ErrorCategory: code})
+		fail = &hopFailure{pe: chainStop(code, message), url: u}
+	}
+
+	current, err := url.Parse(startURL)
+	if err != nil {
+		stop(1, startURL, nil, "bad_request", "invalid URL")
+		return hops, startURL, fail
+	}
+
+	for i := 0; ; i++ {
+		currentURL := current.String()
 		if parent.Err() != nil {
-			hops = append(hops, pageHop{Hop: i + 1, URL: currentURL, Error: "timeout: redirect chain exceeded the time budget"})
+			stop(i+1, currentURL, current, "timeout", "timeout: redirect chain exceeded the time budget")
 			break
 		}
 		if visited[currentURL] {
-			hops = append(hops, pageHop{Hop: i + 1, URL: currentURL, Error: "redirect loop detected"})
+			stop(i+1, currentURL, current, "redirect_loop", "redirect loop detected")
+			break
+		}
+		// maxHops redirects followed, and the last request still redirected
+		// here — a 21st redirect. Like the Fetch standard, exactly maxHops
+		// redirects are fine.
+		if i > maxHops {
+			stop(i+1, currentURL, current, "too_many_redirects", fmt.Sprintf("too_many_redirects: more than %d redirects", maxHops))
 			break
 		}
 		visited[currentURL] = true
 
+		method := http.MethodHead
 		ctx, cancel := context.WithTimeout(parent, cfg.requestTimeout)
-		ct := &connTrace{}
-		requestStart := time.Now()
-		ctx = ct.attach(ctx)
+		resp, ct, start, err := doTraced(ctx, client, method, currentURL, browserReq, nil)
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodHead, currentURL, nil)
-		if err != nil {
+		// Some servers refuse HEAD (405) or never implemented it (501), and
+		// may well redirect a GET. Ask again with GET under a fresh per-hop
+		// timeout, for the headers only: the body is closed unread, and with
+		// keep-alives disabled the connection goes with it.
+		if err == nil && isHeadRefused(resp.StatusCode) {
+			resp.Body.Close()
 			cancel()
-			hops = append(hops, pageHop{Hop: i + 1, URL: currentURL, Error: "invalid URL"})
-			break
+			method = http.MethodGet
+			ctx, cancel = context.WithTimeout(parent, cfg.requestTimeout)
+			resp, ct, start, err = doTraced(ctx, client, method, currentURL, browserReq, nil)
 		}
-		copyRequestHeaders(browserReq, req)
-
-		resp, err := client.Do(req)
-		cancel()
 
 		hop := pageHop{
 			Hop:    i + 1,
 			URL:    currentURL,
-			SSL:    strings.HasPrefix(currentURL, "https://"),
+			Method: method,
+			SSL:    current.Scheme == "https",
 			IP:     ct.remoteIP(),
-			Timing: math.Round(ct.timingMap(requestStart)["total"]*10) / 10,
+			Timing: math.Round(ct.timingMap(start)["total"]*10) / 10,
 		}
 
 		if err != nil {
-			hop.Error = classifyUpstreamErrorMessage(err)
+			// Classified before cancel(): the per-hop context's own deadline
+			// tells a timeout apart from any other failure.
+			pe := upstreamFailure(ctx, err)
+			cancel()
+			log.Printf("page redirect trace error: %v", err)
+			hop.Error = pe.Error + ": " + pe.Message
+			hop.ErrorCategory = pe.Error
+			if pe.Error == "tls_error" {
+				hop.ErrorType = pe.Type
+			}
+			pe.Message = hop.Error
 			hops = append(hops, hop)
+			fail = &hopFailure{pe: pe, err: err, url: current, ip: hop.IP}
 			break
 		}
-
 		resp.Body.Close()
+		cancel()
+
 		hop.Status = resp.StatusCode
 		hop.Server = resp.Header.Get("Server")
-		hop.RawHeaders = formatRawHeaders(resp.Header)
+		hop.RawHeaders = rawHeaderBlock(resp)
+		setHopCert(&hop, resp.TLS, time.Now())
 
 		// Only record redirect hops (3xx). The final non-redirect hop is
 		// handled by the caller (pageHandler) which does a GET with body.
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			hops = append(hops, hop)
-			loc := resp.Header.Get("Location")
-			if loc == "" {
-				break
-			}
-			resolved, err := url.Parse(loc)
-			if err != nil {
-				break
-			}
-			base, _ := url.Parse(currentURL)
-			nextURL := base.ResolveReference(resolved).String()
-
-			// SSRF pre-check on each redirect target. The dialer enforces this
-			// again for the actual connection; this only fails faster and
-			// records a clearer reason in the chain.
-			parsedNext, err := url.Parse(nextURL)
-			if err != nil {
-				break
-			}
-			if cfg.blocksHost(parent, parsedNext.Hostname()) {
-				hops = append(hops, pageHop{
-					Hop:   i + 2,
-					URL:   nextURL,
-					Error: "blocked_target: redirect target resolves to a private or reserved address",
-				})
-				break
-			}
-
-			currentURL = nextURL
-			continue
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			break
 		}
-		break // not a redirect
+		loc := lastLocation(resp.Header)
+		if loc == "" {
+			hops = append(hops, hop)
+			break
+		}
+		next, err := resolveRedirect(current, loc)
+		if err != nil {
+			hops = append(hops, hop)
+			if errors.Is(err, errUnsupportedRedirectScheme) {
+				stop(i+2, strings.TrimSpace(loc), nil, "blocked_target", "blocked_target: redirect target uses an unsupported scheme")
+			} else {
+				stop(i+2, strings.TrimSpace(loc), nil, "bad_request", "bad_request: invalid redirect target")
+			}
+			break
+		}
+		hop.Location = next.String()
+		hops = append(hops, hop)
+
+		// SSRF pre-check on each redirect target. The dialer enforces this
+		// again for the actual connection; this only fails faster and
+		// records a clearer reason in the chain.
+		if cfg.blocksHost(parent, next.Hostname()) {
+			stop(i+2, next.String(), next, "blocked_target", "blocked_target: redirect target resolves to a private or reserved address")
+			break
+		}
+		current = next
 	}
 
-	return hops, currentURL
-}
-
-// classifyUpstreamErrorMessage returns a safe message for an upstream error.
-func classifyUpstreamErrorMessage(err error) string {
-	code, msg := classifyUpstreamError(err)
-	return code + ": " + msg
+	return hops, current.String(), fail
 }
 
 // pageHandler returns an http.Handler for the /page endpoint.
+//
+// With "diag=1", a tls_error — in the redirect chain or on the final GET —
+// additionally carries the certificate details the failing server presented,
+// and finalUrl names that server's URL.
 func pageHandler(cfg *config, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		// CORS preflight.
-		if r.Method == http.MethodOptions {
-			writeCORSHeaders(w, r, cfg)
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
 		target, ok := authorizeRequest(w, r, cfg, http.MethodGet)
 		if !ok {
 			return
 		}
 		rawTarget := target.String()
+		diag := r.URL.Query().Get("diag") == "1"
 
 		// One budget for the whole endpoint. Derived from r.Context() so that a
 		// client disconnect aborts every upstream request still in flight, and
@@ -1146,34 +2523,41 @@ func pageHandler(cfg *config, client *http.Client) http.Handler {
 
 		// ---- Phase 1: Trace redirect chain --------------------------------
 		const maxRedirects = 20
-		hops, finalURL := traceRedirectChain(reqCtx, client, rawTarget, r, maxRedirects, cfg)
+		hops, finalURL, fail := traceRedirectChain(reqCtx, client, rawTarget, r, maxRedirects, cfg)
 
-		// Check if the chain ended with an error.
-		if len(hops) > 0 && hops[len(hops)-1].Error != "" {
+		// The chain ended with an error: report it with its real code. The
+		// final GET is skipped — there is no trustworthy URL to fetch.
+		if fail != nil {
 			result := pageResponse{
 				URL:           rawTarget,
 				FinalURL:      finalURL,
 				RedirectChain: hops,
-				Error:         &proxyError{Error: "upstream_error", Message: hops[len(hops)-1].Error, Status: 502},
+				IP:            fail.ip,
+				MaxBodySize:   cfg.maxResponseBytes,
+				Error:         fail.pe,
+			}
+			if diag && fail.pe.Error == "tls_error" && fail.url != nil {
+				// As the PHP proxy does: the certificate report describes
+				// the URL where the chain stopped.
+				result.FinalURL = fail.url.String()
+				result.SSL = diagnoseRequestTLS(r, cfg, fail.url, fail.ip, fail.err)
 			}
 			writeCORSHeaders(w, r, cfg)
 			writeJSON(w, http.StatusOK, result)
 			return
 		}
 
+		final, err := url.Parse(finalURL)
+		if err != nil {
+			// Unreachable: finalURL was produced by url.URL.String().
+			final = target
+		}
+
 		// ---- Phase 2: HEAD probe for true Content-Encoding ----------------
 		var serverContentEncoding string
 		{
 			ctx, cancel := context.WithTimeout(reqCtx, cfg.requestTimeout)
-			headReq, err := http.NewRequestWithContext(ctx, http.MethodHead, finalURL, nil)
-			if err == nil {
-				copyRequestHeaders(r, headReq)
-				headResp, err := client.Do(headReq)
-				if err == nil {
-					serverContentEncoding = headResp.Header.Get("Content-Encoding")
-					headResp.Body.Close()
-				}
-			}
+			serverContentEncoding = probeContentEncoding(ctx, client, finalURL, r)
 			cancel()
 		}
 
@@ -1181,27 +2565,23 @@ func pageHandler(cfg *config, client *http.Client) http.Handler {
 		ctx, cancel := context.WithTimeout(reqCtx, cfg.requestTimeout)
 		defer cancel()
 
-		ct := &connTrace{}
-		requestStart := time.Now()
-		ctx = ct.attach(ctx)
-
-		getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
-		if err != nil {
-			writeJSONError(w, r, cfg, "upstream_error", "could not build request", http.StatusBadGateway)
-			return
-		}
-		copyRequestHeaders(r, getReq)
-		getReq.Header.Set("Accept-Encoding", "gzip, deflate")
-
-		resp, err := client.Do(getReq)
+		limitEncoding := func(req *http.Request) { req.Header.Set("Accept-Encoding", "gzip, deflate") }
+		resp, ct, requestStart, err := doTraced(ctx, client, http.MethodGet, finalURL, r, limitEncoding)
 		if err != nil {
 			log.Printf("page upstream error: %v", err)
-			code, message := classifyUpstreamError(err)
+			// upstreamFailure checks ctx — the final GET's own timeout, which
+			// also expires with the overall budget — so a deadline is
+			// reported as timeout (504) whatever shape the transport gave it.
 			result := pageResponse{
 				URL:           rawTarget,
 				FinalURL:      finalURL,
 				RedirectChain: hops,
-				Error:         &proxyError{Error: code, Message: message, Status: 502},
+				IP:            ct.remoteIP(),
+				MaxBodySize:   cfg.maxResponseBytes,
+				Error:         upstreamFailure(ctx, err),
+			}
+			if diag && result.Error.Error == "tls_error" {
+				result.SSL = diagnoseRequestTLS(r, cfg, final, result.IP, err)
 			}
 			writeCORSHeaders(w, r, cfg)
 			writeJSON(w, http.StatusOK, result)
@@ -1209,45 +2589,18 @@ func pageHandler(cfg *config, client *http.Client) http.Handler {
 		}
 		defer resp.Body.Close()
 
-		// Read body — first buffer raw bytes (for transfer size), then decompress.
-		var rawSource io.Reader = resp.Body
-		if cfg.maxResponseBytes > 0 {
-			rawSource = io.LimitReader(resp.Body, cfg.maxResponseBytes)
-		}
-
-		rawBytes, err := io.ReadAll(rawSource)
-		if err != nil {
-			log.Printf("warn: error reading page body: %v", err)
-		}
+		// Read the body under the cap and decode it. Undecodable or corrupt
+		// encodings never hand compressed bytes on as HTML (see readDecodedBody).
+		actualEncoding := resp.Header.Get("Content-Encoding")
+		body := readDecodedBody(resp.Body, actualEncoding, cfg.maxResponseBytes)
 
 		// Transfer size = raw compressed bytes received from upstream. Prefer
 		// the upstream Content-Length, but only when it is a sane value — it is
 		// attacker-controlled and would otherwise land in the JSON verbatim.
-		transferSize := len(rawBytes)
+		transferSize := body.rawSize
 		if cl := resp.Header.Get("Content-Length"); cl != "" {
 			if n, convErr := strconv.Atoi(cl); convErr == nil && n >= 0 {
 				transferSize = n
-			}
-		}
-
-		// Decompress the raw bytes based on Content-Encoding.
-		// Cap the decompressed stream to guard against zip-bomb-style payloads
-		// where a small compressed body expands to gigabytes.
-		actualEncoding := resp.Header.Get("Content-Encoding")
-		bodyBytes := rawBytes
-		if dec, decErr := newDecompressor(bytes.NewReader(rawBytes), actualEncoding); decErr != nil {
-			log.Printf("warn: could not decompress page body (%s): %v", actualEncoding, decErr)
-		} else if dec != nil {
-			var limited io.Reader = dec
-			if cfg.maxResponseBytes > 0 {
-				limited = io.LimitReader(dec, cfg.maxResponseBytes)
-			}
-			decoded, readErr := io.ReadAll(limited)
-			dec.Close()
-			if readErr != nil {
-				log.Printf("warn: error decompressing page body (%s): %v", actualEncoding, readErr)
-			} else {
-				bodyBytes = decoded
 			}
 		}
 
@@ -1271,20 +2624,24 @@ func pageHandler(cfg *config, client *http.Client) http.Handler {
 
 		// Build timing map.
 		timingMap := ct.timingMap(requestStart)
-		timingMap["downloadSize"] = float64(len(bodyBytes))
+		timingMap["downloadSize"] = float64(len(body.data))
 		timingMap["speed"] = 0
+
+		rawHeaders := rawHeaderBlock(resp)
 
 		// Append final hop to redirect chain.
 		finalHop := pageHop{
 			Hop:        len(hops) + 1,
 			URL:        finalURL,
+			Method:     http.MethodGet,
 			Status:     resp.StatusCode,
-			SSL:        strings.HasPrefix(finalURL, "https://"),
+			SSL:        final.Scheme == "https",
 			IP:         ct.remoteIP(),
 			Timing:     timingMap["total"],
 			Server:     resp.Header.Get("Server"),
-			RawHeaders: formatRawHeaders(resp.Header),
+			RawHeaders: rawHeaders,
 		}
+		setHopCert(&finalHop, resp.TLS, time.Now())
 		hops = append(hops, finalHop)
 
 		result := pageResponse{
@@ -1294,16 +2651,19 @@ func pageHandler(cfg *config, client *http.Client) http.Handler {
 			HTTPVersion:     resp.Proto,
 			HTTP3:           altSvcAdvertisesHTTP3(resp.Header),
 			Headers:         hdrs,
-			RawHeaders:      formatRawHeaders(resp.Header),
-			HTML:            string(bodyBytes),
+			RawHeaders:      rawHeaders,
+			HTML:            string(body.data),
 			RedirectChain:   hops,
-			SSL:             extractSSLInfo(resp.TLS),
+			SSL:             extractSSLInfo(resp.TLS, final.Hostname()),
 			Timing:          timingMap,
 			IP:              ct.remoteIP(),
-			Size:            len(bodyBytes),
+			Size:            len(body.data),
 			TransferSize:    transferSize,
 			ContentEncoding: contentEncoding,
 			Error:           nil,
+			Truncated:       body.truncated,
+			MaxBodySize:     cfg.maxResponseBytes,
+			DecodeError:     body.decodeError,
 		}
 
 		writeCORSHeaders(w, r, cfg)
@@ -1448,7 +2808,8 @@ func isBlockedIP(ip net.IP) bool {
 // one resolution and we see its result.
 //
 // It also covers every code path for free — redirect hops, HEAD probes and the
-// final GET all dial through the same transport.
+// final GET all dial through the same transport, and the TLS diagnostic probe
+// (probeTLS) dials with the same hook.
 func safeDialControl(_, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -1630,20 +2991,32 @@ func copyRequestHeaders(src *http.Request, dst *http.Request) {
 	}
 }
 
+// forwardsResponseHeader reports whether an upstream response header (lower
+// case) reaches the client. dynamic holds the response's Connection-listed
+// names (connectionTokens).
+func forwardsResponseHeader(lower string, dynamic map[string]struct{}) bool {
+	if _, skip := hopByHopHeaders[lower]; skip {
+		return false
+	}
+	if _, skip := dynamic[lower]; skip {
+		return false
+	}
+	// Strip upstream CORS headers — we set our own.
+	if strings.HasPrefix(lower, "access-control-") {
+		return false
+	}
+	// Never hand the browser a redirect to follow: fetch() would go straight
+	// to the target with the proxy token attached. proxyHandler reports the
+	// resolved target as X-Upstream-Location instead.
+	return lower != "location"
+}
+
 // copyResponseHeaders copies safe upstream response headers to the client
-// response, skipping hop-by-hop headers.
+// response, skipping hop-by-hop headers, upstream CORS headers and Location.
 func copyResponseHeaders(src *http.Response, dst http.ResponseWriter) {
 	dynamic := connectionTokens(src.Header)
 	for key, values := range src.Header {
-		lower := strings.ToLower(key)
-		if _, skip := hopByHopHeaders[lower]; skip {
-			continue
-		}
-		if _, skip := dynamic[lower]; skip {
-			continue
-		}
-		// Strip upstream CORS headers — we set our own.
-		if strings.HasPrefix(lower, "access-control-") {
+		if !forwardsResponseHeader(strings.ToLower(key), dynamic) {
 			continue
 		}
 		for _, v := range values {
@@ -1658,8 +3031,8 @@ func copyResponseHeaders(src *http.Response, dst http.ResponseWriter) {
 
 // newUpstreamClient builds the http.Client used for every outbound request.
 //
-// The dialer carries safeDialControl, which is where SSRF is actually enforced
-// (see its documentation). Note that the DNS resolver deliberately uses its own
+// The dialer carries safeDialControl (cfg.dialControl only in tests), which is
+// where SSRF is actually enforced (see its documentation). Note that the DNS resolver deliberately uses its own
 // plain dialer: with --dns system the configured nameserver may itself be a
 // loopback address such as systemd-resolved on 127.0.0.53, and applying the
 // guard there would break name resolution entirely.
@@ -1668,7 +3041,7 @@ func newUpstreamClient(cfg *config) *http.Client {
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 		Resolver:  cfg.resolver,
-		Control:   safeDialControl,
+		Control:   cfg.dialControlOrDefault(),
 	}
 	transport := &http.Transport{
 		DialContext:           dialer.DialContext,
@@ -1678,11 +3051,25 @@ func newUpstreamClient(cfg *config) *http.Client {
 		IdleConnTimeout:       60 * time.Second,
 		ForceAttemptHTTP2:     true,
 		DisableKeepAlives:     true, // Fresh connection per request — accurate httptrace timing and IP.
-		// TLS verification is intentionally left enabled (InsecureSkipVerify: false).
+		// TLS verification stays enabled for every connection that carries
+		// application data: this transport never sets InsecureSkipVerify
+		// (test-enforced). The only unverified handshake in the program is
+		// probeTLS — diag=1 after a tls_error, handshake only, never handed
+		// to this transport.
+	}
+	if cfg.rootCAs != nil {
+		// Tests only: trust a test CA instead of the system store. Still a
+		// fully verified connection.
+		transport.TLSClientConfig = &tls.Config{RootCAs: cfg.rootCAs}
 	}
 	return &http.Client{
 		Transport: transport,
-		// Do not follow redirects automatically; let the browser handle them.
+		// Never follow redirects inside the transport. Each hop must stay
+		// visible to the handler — /page records it, /inspect reports its
+		// Location, /proxy reports it as X-Upstream-Location or follows it
+		// itself with follow=1 — and must pass the SSRF pre-check before it
+		// is requested. The browser is never left to follow one (see
+		// forwardsResponseHeader).
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
