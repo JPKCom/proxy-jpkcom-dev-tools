@@ -3252,18 +3252,39 @@ func TestProbeTLS_LegacyCiphers(t *testing.T) {
 // The content client must never skip verification — with the test-only trust
 // store override or without it.
 func TestUpstreamClient_NeverSkipsVerification(t *testing.T) {
+	entries, err := parseAllowLocal([]string{"wp.test"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, cfg := range map[string]*config{
-		"production": {},
-		"test roots": {rootCAs: x509.NewCertPool()},
+		"production":              {},
+		"test roots":              {rootCAs: x509.NewCertPool()},
+		"allow-local":             {allowLocal: entries},
+		"allow-local, test roots": {allowLocal: entries, rootCAs: x509.NewCertPool()},
 	} {
-		tr, ok := newUpstreamClient(cfg).Transport.(*http.Transport)
-		if !ok {
-			t.Fatalf("%s: unexpected transport type", name)
-		}
-		if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
-			t.Errorf("%s: the upstream client skips TLS verification", name)
+		for _, tr := range upstreamTransports(t, newUpstreamClient(cfg)) {
+			if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+				t.Errorf("%s: the upstream client skips TLS verification", name)
+			}
 		}
 	}
+}
+
+// upstreamTransports returns the *http.Transport values behind an upstream
+// client: one without --allow-local, the local and the public one with it.
+func upstreamTransports(t *testing.T, c *http.Client) []*http.Transport {
+	t.Helper()
+	switch tr := c.Transport.(type) {
+	case *http.Transport:
+		return []*http.Transport{tr}
+	case *localSplitTransport:
+		if tr.local == nil || tr.public == nil || tr.local == tr.public {
+			t.Fatal("localSplitTransport needs two distinct transports")
+		}
+		return []*http.Transport{tr.local, tr.public}
+	}
+	t.Fatalf("unexpected transport type %T", c.Transport)
+	return nil
 }
 
 func TestConnTrace_IgnoresFailedConnect(t *testing.T) {
@@ -4623,4 +4644,1185 @@ func TestProxy_Follow(t *testing.T) {
 			t.Errorf("upstream hits = %d, want 1", n)
 		}
 	})
+}
+
+// -----------------------------------------------------------------------
+// --allow-local (LOCAL-1 to LOCAL-9)
+// -----------------------------------------------------------------------
+
+// localCfg is newTestConfig with the real SSRF guard (no ssrfCheck, no
+// dialControl), the --allow-local entries (empty = flag off), every origin
+// allowed and roots as trust store. hosts answers the lookup hook: name →
+// comma-separated IPs; any other name is NXDOMAIN. The counter counts lookups.
+func localCfg(t *testing.T, entries string, hosts map[string]string, roots *x509.CertPool) (*config, *atomic.Int32) {
+	t.Helper()
+	cfg := newTestConfig()
+	cfg.allowedOrigins = nil
+	cfg.rootCAs = roots
+	if entries != "" {
+		list, err := parseAllowLocal([]string{entries}, 0)
+		if err != nil {
+			t.Fatalf("parseAllowLocal(%q): %v", entries, err)
+		}
+		cfg.allowLocal = list
+	}
+	lookups := &atomic.Int32{}
+	cfg.lookupIP = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		lookups.Add(1)
+		v, ok := hosts[strings.ToLower(host)]
+		if !ok {
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		}
+		var addrs []net.IPAddr
+		for _, s := range strings.Split(v, ",") {
+			addrs = append(addrs, net.IPAddr{IP: net.ParseIP(s)})
+		}
+		return addrs, nil
+	}
+	return cfg, lookups
+}
+
+// countingServer is a plain HTTP test server that counts its requests.
+func countingServer(t *testing.T, h http.HandlerFunc) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	hits := &atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if h != nil {
+			h(w, r)
+			return
+		}
+		w.Write([]byte("local ok"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, hits
+}
+
+// decodeProxyError decodes a top-level JSON error body.
+func decodeProxyError(t *testing.T, rr *httptest.ResponseRecorder) proxyError {
+	t.Helper()
+	var pe proxyError
+	if err := json.Unmarshal(rr.Body.Bytes(), &pe); err != nil {
+		t.Fatalf("decode error body: %v — %s", err, rr.Body.String())
+	}
+	return pe
+}
+
+// wantBlocked asserts a top-level blocked_target error with status and reason.
+func wantBlocked(t *testing.T, rr *httptest.ResponseRecorder, status int, reason string) {
+	t.Helper()
+	if rr.Code != status {
+		t.Fatalf("status %d, want %d — %s", rr.Code, status, rr.Body.String())
+	}
+	pe := decodeProxyError(t, rr)
+	if pe.Error != "blocked_target" || pe.Status != status || pe.Reason != reason {
+		t.Errorf("error body = %+v, want blocked_target/%d/%s", pe, status, reason)
+	}
+	if rr.Header().Get("Access-Control-Allow-Origin") == "" {
+		t.Error("blocked_target error carries no CORS headers")
+	}
+}
+
+func TestParseAllowLocal(t *testing.T) {
+	valid := []struct {
+		in   string
+		want string // canonical String() of all entries, comma-joined
+	}{
+		{"wp.test", "wp.test"},
+		{"WP.Test.", "wp.test"},
+		{"nas.lan", "nas.lan"},
+		{"wp.home.arpa", "wp.home.arpa"},
+		{"*.test", "*.test"},
+		{"*.localhost", "*.localhost"},
+		{"localhost", "localhost"},
+		{"*.ddev.site,localhost:8888", "*.ddev.site,localhost:8888"},
+		{" *.ddev.site , , localhost:8888 ", "*.ddev.site,localhost:8888"},
+		{"*.intranet.example", "*.intranet.example"},
+		{"10.0.5.20", "10.0.5.20"},
+		{"10.0.5.0/24", "10.0.5.0/24"},
+		{"10.0.5.0/24:8080", "10.0.5.0/24:8080"},
+		{"127.0.0.1:8888", "127.0.0.1:8888"},
+		{"192.168.0.0/16", "192.168.0.0/16"},
+		{"100.64.0.0/16", "100.64.0.0/16"},
+		{"100.100.0.0/16", "100.100.0.0/16"}, // contains a metadata address, which stays blocked
+		{"[fd00::5]", "[fd00::5]"},
+		{"[fd00::5]:8443", "[fd00::5]:8443"},
+		{"[fd00::/64]", "[fd00::/64]"},
+		{"[fd00::/64]:8443", "[fd00::/64]:8443"},
+		{"[fd00:ec2::/48]", "[fd00:ec2::/48]"},
+		{"[::1]", "[::1]"},
+		{"wp.test:65535", "wp.test:65535"},
+	}
+	for _, tc := range valid {
+		t.Run("ok/"+tc.in, func(t *testing.T) {
+			entries, err := parseAllowLocal([]string{tc.in}, 8765)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var got []string
+			for _, e := range entries {
+				got = append(got, e.String())
+			}
+			if strings.Join(got, ",") != tc.want {
+				t.Errorf("got %q, want %q", strings.Join(got, ","), tc.want)
+			}
+		})
+	}
+
+	invalid := []struct {
+		in       string
+		mentions string // the error must contain this
+	}{
+		{"", "empty"},
+		{" , ,", "empty"},
+		{"*", "every name"},
+		{"a.*.example", "wildcard"},
+		{"*.*.example", "wildcard"},
+		{"*example.com", "wildcard"},
+		{"*.lan", "every device"},
+		{"*.local", "every device"},
+		{"*.internal", "every device"},
+		{"*.home.arpa", "home network"},
+		{"*.fritz.box", "home network"},
+		{"*.nas.home.arpa", "only exact names"},
+		{"*.x.fritz.box", "only exact names"},
+		{`"*.ddev.site`, "quotation marks"},
+		{`localhost:8888"`, "quotation marks"},
+		{"'wp.test'", "quotation marks"},
+		{"\u201c*.ddev.site\u201d", "quotation marks"},
+		{"\u2018wp.test\u2019", "quotation marks"},
+		{"*.nip.io", "nip.io"},
+		{"*.sslip.io", "sslip.io"},
+		{"*.xip.io", "xip.io"},
+		{"*.localtest.me", "localtest.me"},
+		{"*.lvh.me", "lvh.me"},
+		{"*.traefik.me", "traefik.me"},
+		{"*.10.0.0.1.nip.io", "nip.io"},
+		{"fd00::5", "brackets"},
+		{"fd00::/64", "brackets"},
+		{"[10.0.5.20]", "without brackets"},
+		{"[wp.test]", "IPv6"},
+		{"[fd00::5", `"]"`},
+		{"[fd00::5]x", "after"},
+		{"localhost:*", "single number"},
+		{"localhost:8000-8100", "single number"},
+		{"localhost:", "empty port"},
+		{"localhost:0", "between 1 and 65535"},
+		{"localhost:65536", "between 1 and 65535"},
+		{"localhost:8765", "own --port"},
+		{"10.0.5.20:6379", "Redis"},
+		{"localhost:2375", "Docker"},
+		{"localhost:2376", "Docker"},
+		{"localhost:2379", "etcd"},
+		{"localhost:3306", "MySQL"},
+		{"localhost:5432", "PostgreSQL"},
+		{"localhost:9200", "Elasticsearch"},
+		{"localhost:10250", "kubelet"},
+		{"localhost:11211", "memcached"},
+		{"localhost:27017", "MongoDB"},
+		{"0.0.0.0/0", "every address"},
+		{"[::/0]", "every address"},
+		{"10.0.0.0/8", "/16 or narrower"},
+		{"[fd00::/32]", "/48 or narrower"},
+		{"10.0.5.1/24", "host bits"},
+		{"192.0.0.0/16", "mixes"},
+		{"172.32.0.0/16", "public"},
+		{"8.8.8.8", "public"},
+		{"169.254.0.0/16", "always blocked"},
+		{"169.254.169.254", "always blocked"},
+		{"100.100.100.200", "metadata"},
+		{"[fd00:ec2::254]", "metadata"},
+		{"224.0.0.1", "always blocked"},
+		{"[fe80::1]", "always blocked"},
+		{"[2002::/48]", "always blocked"},
+		{"-bad-.test", "not a valid host name"},
+		{"under_score.test", "not a valid host name"},
+		{"1.2.3", "not a valid host name"},
+		{"wp.tëst", "Punycode"},
+		{"https://wp.test", "scheme"},
+		{"wp.test/path", "CIDR"},
+	}
+	for _, tc := range invalid {
+		t.Run("bad/"+tc.in, func(t *testing.T) {
+			_, err := parseAllowLocal([]string{tc.in}, 8765)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tc.mentions) {
+				t.Errorf("error %q does not mention %q", err, tc.mentions)
+			}
+			if strings.TrimSpace(strings.Trim(tc.in, ", ")) != "" && !strings.Contains(err.Error(), fmt.Sprintf("%q", strings.TrimSpace(strings.Split(tc.in, ",")[0]))) {
+				t.Errorf("error %q does not name the entry", err)
+			}
+		})
+	}
+
+	// The flag may be repeated; the values are merged.
+	entries, err := parseAllowLocal([]string{"wp.test", "localhost:8888,10.0.5.0/24"}, 0)
+	if err != nil || len(entries) != 3 {
+		t.Fatalf("repeated flag: %v, %d entries", err, len(entries))
+	}
+	// --port 0 (random port) cannot be named in advance.
+	if _, err := parseAllowLocal([]string{"localhost:8765"}, 0); err != nil {
+		t.Errorf("with --port 0 any port is fine: %v", err)
+	}
+}
+
+func TestValidateFlags_PositionalArgs(t *testing.T) {
+	base := startFlags{timeoutSec: 30, maxMB: 50}
+
+	// PowerShell splits an unquoted list into separate arguments.
+	f := base
+	f.rawOrigins = "https://www.jpkc.com"
+	f.allowLocal, f.allowLocalSet = []string{"*.ddev.site"}, true
+	f.args = []string{"localhost:8888", "--origin", "https://www.jpkc.com"}
+	_, err := validateFlags(f)
+	if err == nil {
+		t.Fatal("expected leftover arguments with --allow-local to be fatal")
+	}
+	for _, want := range []string{"localhost:8888", `quote the list: --allow-local "a,b"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+	// The argument check comes before "requires --origin", whose message
+	// would be misleading here.
+	f.rawOrigins = ""
+	if _, err := validateFlags(f); err == nil || strings.Contains(err.Error(), "requires --origin") {
+		t.Errorf("got %v, want the positional-argument error", err)
+	}
+
+	// --allow-local itself among the leftovers: an unquoted --origin list
+	// stopped the flag parser before it. The user meant to set the flag, so
+	// this is fatal as well, with the same hint.
+	for _, args := range [][]string{
+		{"https://b.example", "--allow-local", "*.ddev.site"},
+		{"https://b.example", "-allow-local", "*.ddev.site"},
+		{"https://b.example", "--allow-local=*.ddev.site"},
+		{"https://b.example", "-allow-local=*.ddev.site"},
+	} {
+		f = base
+		f.rawOrigins = "https://a.example"
+		f.args = args
+		if _, err := validateFlags(f); err == nil || !strings.Contains(err.Error(), `quote the list: --allow-local "a,b"`) {
+			t.Errorf("args %q: %v, want the positional-argument error", args, err)
+		}
+	}
+	// Only the flag name counts, not a value that merely mentions it.
+	f = base
+	f.args = []string{"allow-local", "x--allow-local", "---allow-local"}
+	if _, err := validateFlags(f); err != nil {
+		t.Errorf("args %q: %v, want only a warning", f.args, err)
+	}
+
+	// Without the new flags: start as in v1.3.0, plus a warning.
+	f = base
+	f.args = []string{"stray"}
+	start, err := validateFlags(f)
+	if err != nil {
+		t.Fatalf("v1.3.0 command line must still start: %v", err)
+	}
+	if len(start.warnings) != 1 || !strings.Contains(start.warnings[0], "stray") {
+		t.Errorf("warnings = %q", start.warnings)
+	}
+	// No arguments, no warning.
+	if start, err := validateFlags(base); err != nil || len(start.warnings) != 0 || start.allowLocal != nil {
+		t.Errorf("plain start: %+v, %v", start, err)
+	}
+}
+
+func TestValidateFlags_AllowLocal(t *testing.T) {
+	ok := startFlags{timeoutSec: 30, maxMB: 50, rawOrigins: "https://www.jpkc.com",
+		allowLocal: []string{"*.ddev.site"}, allowLocalSet: true}
+
+	start, err := validateFlags(ok)
+	if err != nil {
+		t.Fatalf("valid flags: %v", err)
+	}
+	if len(start.allowLocal) != 1 || start.allowLocal[0].String() != "*.ddev.site" {
+		t.Errorf("allowLocal = %v", start.allowLocal)
+	}
+
+	f := ok
+	f.rawOrigins = ""
+	if _, err := validateFlags(f); err == nil || err.Error() != "--allow-local requires --origin (otherwise any website could use the proxy to reach your local network)" {
+		t.Errorf("without --origin: %v", err)
+	}
+	f = ok
+	f.allowAnyHost = true
+	if _, err := validateFlags(f); err == nil || err.Error() != "--allow-local cannot be combined with --allow-any-host" {
+		t.Errorf("with --allow-any-host: %v", err)
+	}
+	f = ok
+	f.allowLocal = []string{""}
+	if _, err := validateFlags(f); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Errorf(`--allow-local "": %v`, err)
+	}
+	f = ok
+	f.allowLocal = []string{"*.lan"}
+	if _, err := validateFlags(f); err == nil {
+		t.Error("an invalid entry must be fatal")
+	}
+
+	for _, origin := range []string{
+		"null", "*", "http://www.example.com", "https://www.example.com/tools/", "https://www.example.com/",
+		"https://www.example.com?x", "https://www.example.com#x", "https://user@www.example.com", "https://",
+		"https://www.example.com:", "https://www.example.com:99999", "ftp://www.example.com", "www.example.com",
+		"http://localhost.example.com", "http://10.0.0.1",
+		"https://www.jpkc.com,null", // every entry counts
+	} {
+		f = ok
+		f.rawOrigins = origin
+		_, err := validateFlags(f)
+		if err == nil {
+			t.Errorf("--origin %q must be fatal with --allow-local", origin)
+			continue
+		}
+		if !strings.Contains(err.Error(), "must be an https origin without a path") {
+			t.Errorf("--origin %q: %v", origin, err)
+		}
+	}
+	for _, origin := range []string{
+		"https://www.jpkc.com", "https://jpkcom-tools.ddev.site:8443", "http://localhost:8080", "http://localhost",
+		"http://127.0.0.1:3000", "HTTPS://WWW.JPKC.COM", "https://www.jpkc.com, https://jpkcom-tools.ddev.site",
+	} {
+		f = ok
+		f.rawOrigins = origin
+		if _, err := validateFlags(f); err != nil {
+			t.Errorf("--origin %q: %v", origin, err)
+		}
+	}
+
+	// Without --allow-local, --origin stays unchecked (COMPAT-2).
+	f = startFlags{timeoutSec: 30, maxMB: 50, rawOrigins: "null,https://x.example/path"}
+	if start, err := validateFlags(f); err != nil || len(start.origins) != 2 {
+		t.Errorf("v1.3.0 origins: %+v, %v", start, err)
+	}
+	// The v1.3.0 checks are unchanged.
+	for _, bad := range []startFlags{
+		{port: -1, timeoutSec: 30}, {port: 65536, timeoutSec: 30}, {timeoutSec: 0}, {timeoutSec: 30, maxMB: -1},
+		{timeoutSec: 30, maxMB: 1024*1024 + 1},
+	} {
+		if _, err := validateFlags(bad); err == nil {
+			t.Errorf("%+v must be fatal", bad)
+		}
+	}
+}
+
+func TestAllowLocal_Match(t *testing.T) {
+	cases := []struct {
+		entries    string
+		host, port string
+		want       bool
+	}{
+		{"*.ddev.site", "x.ddev.site", "443", true},
+		{"*.ddev.site", "a.b.ddev.site", "80", true},
+		{"*.ddev.site", "X.DDEV.SITE.", "443", true},
+		{"*.ddev.site", "ddev.site", "443", false},
+		{"*.ddev.site", "xddev.site", "443", false},
+		{"*.ddev.site", "x.ddev.site.evil.example", "443", false},
+		{"*.ddev.site", "x.ddev.site", "8443", false},
+		{"10.0.5.0/24:8080", "10.0.5.7", "8080", true},
+		{"10.0.5.0/24:8080", "10.0.5.7", "80", false},
+		{"10.0.5.0/24:8080", "nas.example", "8080", false},
+		{"10.0.5.20", "10.0.5.20", "443", true},
+		{"10.0.5.20", "10.0.5.21", "443", false},
+		{"localhost:8888", "localhost", "8888", true},
+		{"localhost:8888", "127.0.0.1", "8888", false}, // a literal is not the name
+		{"localhost", "localhost", "443", true},
+		{"localhost", "a.localhost", "443", false},
+		{"*.localhost", "a.localhost", "80", true},
+		{"[fd00::/64]:8443", "fd00::5", "8443", true},
+		{"[fd00::/64]:8443", "fd00:0:0:1::5", "8443", false},
+		{"wp.test", "wp.test", "8080", false}, // no port: 80 and 443 only
+		// Request names must pass the same syntax check as entries.
+		{"*.ddev.site", "a..ddev.site", "443", false},
+		{"*.ddev.site", "-a.ddev.site", "443", false},
+		{"*.ddev.site", "a_b.ddev.site", "443", false},
+		{"wp.test", "wp..test", "443", false},
+	}
+	for _, tc := range cases {
+		cfg, _ := localCfg(t, tc.entries, nil, nil)
+		if got := cfg.allowLocalMatch(tc.host, tc.port); got != tc.want {
+			t.Errorf("%s: allowLocalMatch(%s, %s) = %v, want %v", tc.entries, tc.host, tc.port, got, tc.want)
+		}
+	}
+
+	// localVerdict: the address decides together with the name.
+	verdicts := []struct {
+		entries    string
+		host, port string
+		ip         string
+		want       verdict
+	}{
+		{"*.ddev.site", "x.ddev.site", "443", "127.0.0.1", verdictAllowed},
+		{"*.ddev.site", "x.ddev.site", "443", "::1", verdictAllowed},
+		{"*.ddev.site", "x.ddev.site", "443", "192.168.1.66", verdictNotAllowlisted},
+		{"*.ddev.site", "x.ddev.site", "443", "93.184.215.14", verdictPublic},
+		{"*.ddev.site", "evil.test", "443", "127.0.0.1", verdictNotAllowlisted},
+		{"*.ddev.site", "a..ddev.site", "443", "127.0.0.1", verdictNotAllowlisted},
+		{"*.ddev.site", "x.ddev.site", "443", "169.254.169.254", verdictAlwaysBlocked},
+		{"10.0.5.0/24:8080", "10.0.5.7", "8080", "10.0.5.7", verdictAllowed},
+		{"10.0.5.0/24:8080", "10.0.5.7", "80", "10.0.5.7", verdictNotAllowlisted},
+		{"10.0.5.0/24:8080", "nas.example", "8080", "10.0.5.7", verdictNotAllowlisted},
+		{"localhost:8888", "127.0.0.1", "8888", "127.0.0.1", verdictNotAllowlisted},
+		{"localhost:8888", "localhost", "8888", "127.0.0.1", verdictAllowed},
+	}
+	for _, tc := range verdicts {
+		cfg, _ := localCfg(t, tc.entries, nil, nil)
+		if got := cfg.localVerdict(tc.host, tc.port, net.ParseIP(tc.ip)); got != tc.want {
+			t.Errorf("%s: localVerdict(%s, %s, %s) = %v, want %v", tc.entries, tc.host, tc.port, tc.ip, got, tc.want)
+		}
+	}
+
+	// Off: nothing matches.
+	cfg, _ := localCfg(t, "", nil, nil)
+	if cfg.allowLocalMatchURL(&url.URL{Scheme: "http", Host: "localhost"}) {
+		t.Error("without --allow-local nothing is a local target")
+	}
+}
+
+func TestAllowLocal_NameLoopbackOnly(t *testing.T) {
+	// A spoofed DNS answer for a listed name points into the LAN.
+	cfg, _ := localCfg(t, "*.ddev.site", map[string]string{"x.ddev.site": "192.168.1.66"}, nil)
+	rr := doProxy(t, cfg, http.MethodGet, "http://x.ddev.site/", "", nil)
+	// The pre-check leaves a listed name to the dialer, which refuses it.
+	wantBlocked(t, rr, http.StatusBadGateway, reasonNotAllowlisted)
+
+	// The same through a real server: the name resolves to loopback and a
+	// LAN address; only loopback is ever dialled.
+	srv, hits := countingServer(t, nil)
+	port := serverPort(t, srv)
+	cfg, _ = localCfg(t, "wp.test:"+port, map[string]string{"wp.test": "192.168.1.66,127.0.0.1"}, nil)
+	if rr := doProxy(t, cfg, http.MethodGet, "http://wp.test:"+port+"/", "", nil); rr.Code != http.StatusOK || hits.Load() != 1 {
+		t.Errorf("status %d, hits %d — %s", rr.Code, hits.Load(), rr.Body.String())
+	}
+
+	// An IP/CIDR entry opens its range to the name entries, and only that.
+	cfg, _ = localCfg(t, "wp.intranet.example,10.0.5.0/24", nil, nil)
+	if v := cfg.localVerdict("wp.intranet.example", "443", net.ParseIP("10.0.5.7")); v != verdictAllowed {
+		t.Errorf("name → 10.0.5.7: %v, want allowed", v)
+	}
+	if v := cfg.localVerdict("wp.intranet.example", "443", net.ParseIP("10.0.6.7")); v != verdictNotAllowlisted {
+		t.Errorf("name → 10.0.6.7: %v, want not allowlisted", v)
+	}
+	// The CIDR entry's port plays no role for the name; the name's does.
+	cfg, _ = localCfg(t, "wp.intranet.example,10.0.5.0/24:8080", nil, nil)
+	if v := cfg.localVerdict("wp.intranet.example", "443", net.ParseIP("10.0.5.7")); v != verdictAllowed {
+		t.Errorf("name:443 → 10.0.5.7 with a :8080 range: %v, want allowed", v)
+	}
+
+	// localhost maps to both loopback addresses without DNS.
+	cfg, lookups := localCfg(t, "localhost", nil, nil)
+	ips, err := cfg.resolveHost(context.Background(), "localhost")
+	if err != nil || len(ips) != 2 || lookups.Load() != 0 {
+		t.Fatalf("resolveHost(localhost) = %v, %v, %d lookups", ips, err, lookups.Load())
+	}
+	for _, ip := range ips {
+		if v := cfg.localVerdict("localhost", "443", ip); v != verdictAllowed {
+			t.Errorf("localhost → %s: %v, want allowed", ip, v)
+		}
+	}
+}
+
+func TestAllowLocal_NameReachesLoopback(t *testing.T) {
+	srv, hits := countingServer(t, nil)
+	port := serverPort(t, srv)
+	hosts := map[string]string{"wp.test": "127.0.0.1"}
+	target := "http://wp.test:" + port + "/"
+
+	cfg, _ := localCfg(t, "wp.test:"+port, hosts, nil)
+	rr := doProxy(t, cfg, http.MethodGet, target, "", nil)
+	if rr.Code != http.StatusOK || rr.Body.String() != "local ok" {
+		t.Fatalf("status %d — %s", rr.Code, rr.Body.String())
+	}
+	if ip := rr.Header().Get("X-Upstream-IP"); ip != "127.0.0.1" {
+		t.Errorf("X-Upstream-IP = %q", ip)
+	}
+
+	// Flag off: the v1.3.0 block, now with a reason.
+	cfg, _ = localCfg(t, "", hosts, nil)
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, target, "", nil), http.StatusForbidden, reasonPrivate)
+
+	// Flag on with another entry.
+	cfg, _ = localCfg(t, "other.test:"+port, hosts, nil)
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, target, "", nil), http.StatusForbidden, reasonNotAllowlisted)
+
+	// Right name, wrong port.
+	cfg, _ = localCfg(t, "wp.test", hosts, nil)
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, target, "", nil), http.StatusForbidden, reasonNotAllowlisted)
+
+	if hits.Load() != 1 {
+		t.Errorf("server saw %d requests, want 1", hits.Load())
+	}
+}
+
+func TestAllowLocal_ForeignNameToLoopbackBlocked(t *testing.T) {
+	srv, hits := countingServer(t, nil)
+	port := serverPort(t, srv)
+	cfg, _ := localCfg(t, "*.ddev.site", map[string]string{"evil.test": "127.0.0.1"}, nil)
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://evil.test:"+port+"/", "", nil),
+		http.StatusForbidden, reasonNotAllowlisted)
+
+	// Past a pre-check that waved it through, the dialer says the same.
+	cfg.ssrfCheck = func(string) bool { return false }
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://evil.test:"+port+"/", "", nil),
+		http.StatusBadGateway, reasonNotAllowlisted)
+	if hits.Load() != 0 {
+		t.Errorf("server saw %d requests, want 0", hits.Load())
+	}
+}
+
+func TestAllowLocal_RebindingBlocked(t *testing.T) {
+	srv, hits := countingServer(t, nil)
+	port := serverPort(t, srv)
+	cfg, _ := localCfg(t, "*.ddev.site", nil, nil)
+	var calls atomic.Int32
+	cfg.lookupIP = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		// First answer public (the pre-check), every later one loopback.
+		if calls.Add(1) == 1 {
+			return []net.IPAddr{{IP: net.ParseIP("100.63.255.1")}}, nil
+		}
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	rr := doProxy(t, cfg, http.MethodGet, "http://rebind.test:"+port+"/", "", nil)
+	wantBlocked(t, rr, http.StatusBadGateway, reasonNotAllowlisted)
+	if hits.Load() != 0 {
+		t.Errorf("server saw %d requests, want 0", hits.Load())
+	}
+	if calls.Load() != 2 {
+		t.Errorf("lookups = %d, want 2 (pre-check and dialer)", calls.Load())
+	}
+
+	// A listed name is never pre-resolved: the dialer's own answer is the
+	// only one that counts, and it may only be loopback.
+	calls.Store(0)
+	cfg.lookupIP = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if calls.Add(1) == 1 {
+			return []net.IPAddr{{IP: net.ParseIP("192.168.1.66")}}, nil
+		}
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://x.ddev.site/", "", nil), http.StatusBadGateway, reasonNotAllowlisted)
+	if calls.Load() != 1 {
+		t.Errorf("lookups = %d, want 1 (dialer only)", calls.Load())
+	}
+}
+
+func TestAllowLocal_TimingPreserved(t *testing.T) {
+	srv, _ := countingServer(t, nil)
+	port := serverPort(t, srv)
+	cfg, _ := localCfg(t, "wp.test:"+port, map[string]string{"wp.test": "127.0.0.1"}, nil)
+	slow := cfg.lookupIP
+	cfg.lookupIP = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		time.Sleep(5 * time.Millisecond) // a DNS phase the header can show
+		return slow(ctx, host)
+	}
+
+	rr := doProxy(t, cfg, http.MethodGet, "http://wp.test:"+port+"/", "", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d — %s", rr.Code, rr.Body.String())
+	}
+	if ip := rr.Header().Get("X-Upstream-IP"); ip != "127.0.0.1" {
+		t.Errorf("X-Upstream-IP = %q", ip)
+	}
+	timing := rr.Header().Get("X-Upstream-Timing")
+	m := regexp.MustCompile(`^dns=(\d+);tcp=(\d+);ssl=0;ttfb=\d+;total=\d+$`).FindStringSubmatch(timing)
+	if m == nil {
+		t.Fatalf("X-Upstream-Timing = %q", timing)
+	}
+	if dns, _ := strconv.Atoi(m[1]); dns < 4 {
+		t.Errorf("dns phase %dms, want the lookup's ≥ 5ms — %q", dns, timing)
+	}
+
+	// Both phases reach the trace through the guard.
+	var dnsStart, dnsDone, connectStart, connectDone atomic.Int32
+	trace := &httptrace.ClientTrace{
+		DNSStart:     func(httptrace.DNSStartInfo) { dnsStart.Add(1) },
+		DNSDone:      func(httptrace.DNSDoneInfo) { dnsDone.Add(1) },
+		ConnectStart: func(string, string) { connectStart.Add(1) },
+		ConnectDone:  func(string, string, error) { connectDone.Add(1) },
+	}
+	ctx := httptrace.WithClientTrace(withLocalStart(context.Background(), true), trace)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://wp.test:"+port+"/", nil)
+	resp, err := newUpstreamClient(cfg).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if dnsStart.Load() != 1 || dnsDone.Load() != 1 || connectStart.Load() != 1 || connectDone.Load() != 1 {
+		t.Errorf("trace: dns %d/%d, connect %d/%d", dnsStart.Load(), dnsDone.Load(), connectStart.Load(), connectDone.Load())
+	}
+}
+
+func TestAllowLocal_AlwaysBlocked(t *testing.T) {
+	cases := []struct {
+		name, entries, target string
+		ownPort               int
+		status                int
+	}{
+		{"metadata v4", "10.0.5.0/24", "http://169.254.169.254/", 0, http.StatusForbidden},
+		{"own port", "localhost", "http://localhost:%d/ping", 1, http.StatusForbidden},
+		{"alibaba metadata", "100.100.0.0/16", "http://100.100.100.200/", 0, http.StatusForbidden},
+		{"aws metadata v6", "[fd00:ec2::/48]", "http://[fd00:ec2::254]/", 0, http.StatusForbidden},
+		{"flag off, metadata", "", "http://169.254.169.254/latest/meta-data/", 0, http.StatusForbidden},
+		{"flag off, own port", "", "http://127.0.0.1:%d/ping", 1, http.StatusForbidden},
+		{"multicast", "10.0.5.0/24", "http://224.0.0.1/", 0, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, _ := localCfg(t, tc.entries, nil, nil)
+			target := tc.target
+			if tc.ownPort != 0 {
+				cfg.port = 18765
+				target = fmt.Sprintf(tc.target, cfg.port)
+			}
+			wantBlocked(t, doProxy(t, cfg, http.MethodGet, target, "", nil), tc.status, reasonAlwaysBlocked)
+		})
+	}
+
+	// An entry naming the own port: only possible with --port 0 at parse
+	// time. The listed name skips the pre-check; the dialer refuses.
+	cfg, _ := localCfg(t, "localhost:18765", nil, nil)
+	cfg.port = 18765
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://localhost:18765/ping", "", nil),
+		http.StatusBadGateway, reasonAlwaysBlocked)
+	// An address entry naming the own port: pre-check on the literal.
+	cfg, _ = localCfg(t, "127.0.0.1:18765", nil, nil)
+	cfg.port = 18765
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://127.0.0.1:18765/ping", "", nil),
+		http.StatusForbidden, reasonAlwaysBlocked)
+
+	// "Flag off, 10.0.0.1" stays the v1.3.0 case.
+	cfg, _ = localCfg(t, "", nil, nil)
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://10.0.0.1/", "", nil), http.StatusForbidden, reasonPrivate)
+}
+
+func TestAllowLocal_PrecheckSkipsDNSForListedName(t *testing.T) {
+	cfg, lookups := localCfg(t, "*.ddev.site", map[string]string{"x.ddev.site": "127.0.0.1", "pub.example": "93.184.215.14"}, nil)
+	u, _ := url.Parse("https://x.ddev.site/wp-json/")
+	if blocked, reason := cfg.precheck(context.Background(), u, true); blocked || lookups.Load() != 0 {
+		t.Errorf("listed name, local start: blocked=%v reason=%q lookups=%d", blocked, reason, lookups.Load())
+	}
+	// Not a local start (a hop of a public request): resolved and judged.
+	if blocked, reason := cfg.precheck(context.Background(), u, false); !blocked || reason != reasonNotAllowlisted || lookups.Load() != 1 {
+		t.Errorf("listed name, public start: blocked=%v reason=%q lookups=%d", blocked, reason, lookups.Load())
+	}
+	// A name off the list is resolved even on a local start.
+	p, _ := url.Parse("https://pub.example/")
+	if blocked, _ := cfg.precheck(context.Background(), p, true); blocked || lookups.Load() != 2 {
+		t.Errorf("public name: blocked=%v lookups=%d", blocked, lookups.Load())
+	}
+	// A lookup failure fails open, as in v1.3.0.
+	n, _ := url.Parse("https://nx.example/")
+	if blocked, _ := cfg.precheck(context.Background(), n, false); blocked {
+		t.Error("an unresolvable name must fail open in the pre-check")
+	}
+}
+
+func TestPrecheck_ReasonMatchesDialer(t *testing.T) {
+	cases := []struct {
+		name, entries string
+		hosts         map[string]string
+		target        string
+		ownPort       int
+		want          string
+	}{
+		{"private literal, flag off", "", nil, "http://10.0.0.1/", 0, reasonPrivate},
+		{"private name, flag off", "", map[string]string{"nas.example": "10.0.0.1"}, "http://nas.example/", 0, reasonPrivate},
+		{"loopback name, flag off", "", map[string]string{"wp.test": "127.0.0.1"}, "http://wp.test:8080/", 0, reasonPrivate},
+		{"metadata, flag off", "", nil, "http://169.254.169.254/", 0, reasonAlwaysBlocked},
+		{"own port, flag off", "", nil, "http://127.0.0.1:18765/", 18765, reasonAlwaysBlocked},
+		{"unlisted name", "*.ddev.site", map[string]string{"evil.test": "127.0.0.1"}, "http://evil.test/", 0, reasonNotAllowlisted},
+		{"unlisted literal", "10.0.5.0/24", nil, "http://10.0.6.1/", 0, reasonNotAllowlisted},
+		{"listed range, wrong port", "10.0.5.0/24", nil, "http://10.0.5.1:8080/", 0, reasonNotAllowlisted},
+		{"metadata in a listed range", "100.100.0.0/16", nil, "http://100.100.100.200/", 0, reasonAlwaysBlocked},
+		{"metadata, flag on", "10.0.5.0/24", nil, "http://169.254.169.254/", 0, reasonAlwaysBlocked},
+		{"own port, flag on", "*.ddev.site", nil, "http://localhost:18765/", 18765, reasonAlwaysBlocked},
+		{"mixed answers", "*.ddev.site", map[string]string{"mix.test": "127.0.0.1,169.254.169.254"}, "http://mix.test/", 0, reasonAlwaysBlocked},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, _ := localCfg(t, tc.entries, tc.hosts, nil)
+			if tc.ownPort != 0 {
+				cfg.port = tc.ownPort
+			}
+			u, _ := url.Parse(tc.target)
+			localStart := cfg.allowLocalMatchURL(u)
+			blocked, reason := cfg.precheck(context.Background(), u, localStart)
+			if !blocked || reason != tc.want {
+				t.Errorf("pre-check: blocked=%v reason=%q, want %q", blocked, reason, tc.want)
+			}
+
+			// The dialer, reached directly (as after a fail-open pre-check).
+			ctx, cancel := context.WithTimeout(withLocalStart(context.Background(), localStart), 5*time.Second)
+			defer cancel()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, tc.target, nil)
+			resp, err := newUpstreamClient(cfg).Do(req)
+			if err == nil {
+				resp.Body.Close()
+				t.Fatal("the dialer let the request through")
+			}
+			pe := upstreamFailure(ctx, err)
+			if pe.Error != "blocked_target" || pe.Reason != tc.want {
+				t.Errorf("dialer: %+v (err %v), want reason %q", pe, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestAllowLocal_TLSProbeUsesAllowance(t *testing.T) {
+	pki := newTestPKI(t)
+	der, key := pki.leaf(t, certOpts{cn: "wp.test", dns: []string{"wp.test"}})
+	srv := tlsServerWith(t, [][]byte{der, pki.interDER}, key, nil, nil)
+	port := serverPort(t, srv)
+	target := "https://wp.test:" + port + "/"
+
+	// The test CA is not trusted: tls_error. The probe must reach the
+	// local target through the same allowance as the request.
+	cfg, _ := localCfg(t, "wp.test:"+port, map[string]string{"wp.test": "127.0.0.1"}, x509.NewCertPool())
+	resp := decodeInspect(t, doInspect(t, cfg, target, "&diag=1"))
+	if resp.Error == nil || resp.Error.Error != "tls_error" {
+		t.Fatalf("error = %+v", resp.Error)
+	}
+	if resp.SSL == nil || resp.SSL.CertSource != "probe" || resp.SSL.ProbeError != "" {
+		t.Fatalf("ssl = %+v, want certSource probe", resp.SSL)
+	}
+	if len(resp.SSL.Chain) != 2 {
+		t.Errorf("chain has %d certificates, want 2 (as served)", len(resp.SSL.Chain))
+	}
+
+	page := decodePage(t, doPage(t, cfg, target, "&diag=1"))
+	if page.Error == nil || page.Error.Error != "tls_error" || page.SSL == nil || page.SSL.CertSource != "probe" {
+		t.Errorf("/page: error=%+v ssl=%+v", page.Error, page.SSL)
+	}
+
+	// Without the allowance on the request (missing context value), the
+	// probe is refused like the request and falls back to the chain from
+	// the verification error.
+	ip := "127.0.0.1"
+	state, err := probeTLS(context.Background(), cfg, "wp.test", port, ip)
+	if err == nil || !errors.Is(err, errBlockedTarget) || state != nil {
+		t.Errorf("probe without local start: state=%v err=%v", state, err)
+	}
+	state, err = probeTLS(withLocalStart(context.Background(), true), cfg, "wp.test", port, ip)
+	if err != nil || state == nil || len(state.PeerCertificates) != 2 {
+		t.Errorf("probe with local start: err=%v", err)
+	}
+	// A name off the list gets no allowance even on a local start.
+	if _, err := probeTLS(withLocalStart(context.Background(), true), cfg, "evil.test", port, ip); !errors.Is(err, errBlockedTarget) {
+		t.Errorf("probe for an unlisted name: %v", err)
+	}
+}
+
+// redirectTo answers every request with a 302 to loc.
+func redirectTo(loc string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", loc)
+		w.WriteHeader(http.StatusFound)
+	}
+}
+
+func TestAllowLocal_RedirectIntoLocal(t *testing.T) {
+	local, localHits := countingServer(t, nil)
+	lport := serverPort(t, local)
+	pub, _ := countingServer(t, redirectTo("http://wp.test:"+lport+"/wp-json/"))
+	pport := serverPort(t, pub)
+
+	cfg, _ := localCfg(t, "wp.test:"+lport, map[string]string{"pub.test": "127.0.0.1", "wp.test": "127.0.0.1"}, nil)
+	// pub.test plays a public site: the only test that opens the base
+	// dialer (and the pre-check) to loopback. The exact-address dialer for
+	// listed targets is unaffected.
+	cfg.ssrfCheck = func(string) bool { return false }
+	cfg.dialControl = allowAllDial
+	start := "http://pub.test:" + pport + "/"
+
+	rr := doProxy(t, cfg, http.MethodGet, start, "&follow=1", nil)
+	wantBlocked(t, rr, http.StatusForbidden, reasonRedirectIntoLocal)
+	if pe := decodeProxyError(t, rr); pe.Type != "Blocked target" {
+		t.Errorf("type = %q", pe.Type)
+	}
+
+	page := decodePage(t, doPage(t, cfg, start, ""))
+	if page.Error == nil || page.Error.Error != "blocked_target" || page.Error.Reason != reasonRedirectIntoLocal {
+		t.Fatalf("/page error = %+v", page.Error)
+	}
+	last := page.RedirectChain[len(page.RedirectChain)-1]
+	if last.ErrorCategory != "blocked_target" || last.ErrorReason != reasonRedirectIntoLocal {
+		t.Errorf("/page last hop = %+v", last)
+	}
+
+	// Also a listed IP literal.
+	cfg.allowLocal, _ = parseAllowLocal([]string{"127.0.0.1:" + lport}, 0)
+	pub2, _ := countingServer(t, redirectTo("http://127.0.0.1:"+lport+"/"))
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://pub.test:"+serverPort(t, pub2)+"/", "&follow=1", nil),
+		http.StatusForbidden, reasonRedirectIntoLocal)
+
+	if localHits.Load() != 0 {
+		t.Errorf("local target saw %d requests, want 0", localHits.Load())
+	}
+}
+
+func TestAllowLocal_LocalToPublicAllowed(t *testing.T) {
+	pub, pubHits := countingServer(t, nil)
+	pport := serverPort(t, pub)
+	local, _ := countingServer(t, redirectTo("http://pub.test:"+pport+"/final"))
+	lport := serverPort(t, local)
+
+	cfg, _ := localCfg(t, "wp.test:"+lport, map[string]string{"pub.test": "127.0.0.1", "wp.test": "127.0.0.1"}, nil)
+	// pub.test plays a public site (see TestAllowLocal_RedirectIntoLocal).
+	cfg.ssrfCheck = func(string) bool { return false }
+	cfg.dialControl = allowAllDial
+	start := "http://wp.test:" + lport + "/"
+
+	rr := doProxy(t, cfg, http.MethodGet, start, "&follow=1", nil)
+	if rr.Code != http.StatusOK || rr.Header().Get("X-Upstream-Final-URL") != "http://pub.test:"+pport+"/final" {
+		t.Fatalf("status %d final %q — %s", rr.Code, rr.Header().Get("X-Upstream-Final-URL"), rr.Body.String())
+	}
+	page := decodePage(t, doPage(t, cfg, start, ""))
+	if page.Error != nil || page.FinalURL != "http://pub.test:"+pport+"/final" {
+		t.Errorf("/page: error=%+v final=%q", page.Error, page.FinalURL)
+	}
+	if pubHits.Load() < 2 {
+		t.Errorf("public target saw %d requests", pubHits.Load())
+	}
+}
+
+func TestAllowLocal_LocalToLocalAllowed(t *testing.T) {
+	second, hits := countingServer(t, nil)
+	sport := serverPort(t, second)
+	first, _ := countingServer(t, redirectTo("http://api.wp.test:"+sport+"/wp-json/"))
+	fport := serverPort(t, first)
+
+	// The real guard: no ssrfCheck, no dialControl.
+	cfg, _ := localCfg(t, "wp.test:"+fport+",*.wp.test:"+sport,
+		map[string]string{"wp.test": "127.0.0.1", "api.wp.test": "127.0.0.1"}, nil)
+	start := "http://wp.test:" + fport + "/"
+
+	rr := doProxy(t, cfg, http.MethodGet, start, "&follow=1", nil)
+	if rr.Code != http.StatusOK || rr.Body.String() != "local ok" || rr.Header().Get("X-Upstream-Redirects") != "1" {
+		t.Fatalf("status %d — %s", rr.Code, rr.Body.String())
+	}
+	page := decodePage(t, doPage(t, cfg, start, ""))
+	if page.Error != nil || page.FinalURL != "http://api.wp.test:"+sport+"/wp-json/" || page.HTML != "local ok" {
+		t.Errorf("/page: error=%+v final=%q", page.Error, page.FinalURL)
+	}
+
+	// A local start redirecting to a local target that is not listed.
+	before := hits.Load()
+	first2, _ := countingServer(t, redirectTo("http://127.0.0.1:"+sport+"/"))
+	cfg.allowLocal, _ = parseAllowLocal([]string{"wp.test:" + serverPort(t, first2)}, 0)
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://wp.test:"+serverPort(t, first2)+"/", "&follow=1", nil),
+		http.StatusForbidden, reasonNotAllowlisted)
+	if before < 2 || hits.Load() != before {
+		t.Errorf("second target saw %d requests, then %d; the unlisted hop must add none", before, hits.Load())
+	}
+}
+
+func TestAllowLocal_AllEndpoints(t *testing.T) {
+	pki := newTestPKI(t)
+	der, key := pki.leaf(t, certOpts{cn: "wp.test", dns: []string{"wp.test"}})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html>local</html>"))
+	})
+	mux.HandleFunc("/old", redirectTo("/"))
+	srv := tlsServerWith(t, [][]byte{der, pki.interDER}, key, nil, mux)
+	port := serverPort(t, srv)
+	base := "https://wp.test:" + port
+
+	cfg, _ := localCfg(t, "wp.test:"+port, map[string]string{"wp.test": "127.0.0.1"}, pki.pool)
+
+	for _, extra := range []string{"", "&follow=1"} {
+		rr := doProxy(t, cfg, http.MethodGet, base+"/old", extra, nil)
+		want := http.StatusFound
+		if extra != "" {
+			want = http.StatusOK
+		}
+		if rr.Code != want {
+			t.Errorf("/proxy%s: status %d — %s", extra, rr.Code, rr.Body.String())
+		}
+	}
+	if rr := doProxy(t, cfg, http.MethodHead, base+"/", "", nil); rr.Code != http.StatusOK {
+		t.Errorf("/proxy HEAD: %d", rr.Code)
+	}
+	for _, extra := range []string{"", "&get=1", "&body=1", "&diag=1"} {
+		rr := doInspect(t, cfg, base+"/", extra)
+		if rr.Code != http.StatusOK {
+			t.Errorf("/inspect%s: %d — %s", extra, rr.Code, rr.Body.String())
+			continue
+		}
+		resp := decodeInspect(t, rr)
+		if resp.Status != http.StatusOK || resp.Error != nil || resp.SSL == nil || !resp.SSL.Verified || resp.IP != "127.0.0.1" {
+			t.Errorf("/inspect%s: status=%d error=%+v ip=%q", extra, resp.Status, resp.Error, resp.IP)
+		}
+		if extra == "&body=1" && resp.Body != "<html>local</html>" {
+			t.Errorf("/inspect body = %q", resp.Body)
+		}
+	}
+	for _, extra := range []string{"", "&diag=1"} {
+		page := decodePage(t, doPage(t, cfg, base+"/old", extra))
+		if page.Error != nil || page.HTML != "<html>local</html>" || len(page.RedirectChain) != 2 || page.SSL == nil {
+			t.Errorf("/page%s: error=%+v chain=%d body=%q", extra, page.Error, len(page.RedirectChain), page.HTML)
+		}
+	}
+}
+
+func TestAllowLocal_MissingContextValueFailsClosed(t *testing.T) {
+	srv, hits := countingServer(t, nil)
+	port := serverPort(t, srv)
+	cfg, _ := localCfg(t, "wp.test:"+port, map[string]string{"wp.test": "127.0.0.1"}, nil)
+	client := newUpstreamClient(cfg)
+	target := "http://wp.test:" + port + "/"
+
+	// A code path that forgot withLocalStart.
+	resp, err := client.Get(target)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("a request without the local-start value reached the local target")
+	}
+	if pe := upstreamFailure(context.Background(), err); pe.Error != "blocked_target" || pe.Reason != reasonNotAllowlisted {
+		t.Errorf("error = %+v", pe)
+	}
+	// An explicit false is the same.
+	req, _ := http.NewRequestWithContext(withLocalStart(context.Background(), false), http.MethodGet, target, nil)
+	if resp, err := client.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("localStart=false reached the local target")
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("server saw %d requests", hits.Load())
+	}
+	// With the value: through.
+	req, _ = http.NewRequestWithContext(withLocalStart(context.Background(), true), http.MethodGet, target, nil)
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if localStartFrom(context.Background()) {
+		t.Error("a missing value must read as false")
+	}
+}
+
+func TestAllowLocal_NoConnectionReuse(t *testing.T) {
+	cfg, _ := localCfg(t, "wp.test", nil, nil)
+	// With --allow-local the two request classes have separate transports
+	// (HTTP/2 shares connections between concurrent requests regardless of
+	// DisableKeepAlives; see TestAttack_H2ConnectionSharing), and each keeps
+	// HTTP/1.1 connections single-use.
+	if _, ok := newUpstreamClient(cfg).Transport.(*localSplitTransport); !ok {
+		t.Fatal("with --allow-local the upstream client must split its transport by localStart")
+	}
+	for _, transport := range upstreamTransports(t, newUpstreamClient(cfg)) {
+		if !transport.DisableKeepAlives {
+			t.Fatal("DisableKeepAlives must stay true")
+		}
+	}
+	// Without the list: the single v1.3.0 transport.
+	if _, ok := newUpstreamClient(&config{}).Transport.(*http.Transport); !ok {
+		t.Error("without --allow-local the upstream client must keep the single v1.3.0 transport")
+	}
+
+	var conns atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	port := serverPort(t, srv)
+	cfg, _ = localCfg(t, "wp.test:"+port, map[string]string{"wp.test": "127.0.0.1"}, nil)
+	client := newUpstreamClient(cfg)
+	target := "http://wp.test:" + port + "/"
+
+	req, _ := http.NewRequestWithContext(withLocalStart(context.Background(), true), http.MethodGet, target, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	req, _ = http.NewRequestWithContext(withLocalStart(context.Background(), false), http.MethodGet, target, nil)
+	if resp, err := client.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("the second request reused the first one's permission")
+	} else if !errors.Is(err, errBlockedTarget) {
+		t.Errorf("second request: %v", err)
+	}
+	if conns.Load() != 1 {
+		t.Errorf("server saw %d connections, want 1 (the second dial is refused)", conns.Load())
+	}
+}
+
+func TestBlockedTarget_Reason(t *testing.T) {
+	// /proxy, /inspect, /page: pre-check 403 with top-level reason.
+	cfg, _ := localCfg(t, "*.ddev.site", map[string]string{"evil.test": "127.0.0.1", "x.ddev.site": "192.168.1.66"}, nil)
+	for name, do := range map[string]func(string, string) *httptest.ResponseRecorder{
+		"proxy":   func(u, e string) *httptest.ResponseRecorder { return doProxy(t, cfg, http.MethodGet, u, e, nil) },
+		"inspect": func(u, e string) *httptest.ResponseRecorder { return doInspect(t, cfg, u, e) },
+		"page":    func(u, e string) *httptest.ResponseRecorder { return doPage(t, cfg, u, e) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			wantBlocked(t, do("http://evil.test/", ""), http.StatusForbidden, reasonNotAllowlisted)
+			wantBlocked(t, do("http://169.254.169.254/", ""), http.StatusForbidden, reasonAlwaysBlocked)
+		})
+	}
+
+	// Dialer: /proxy 502 top-level, /inspect?diag=1 and /page inline.
+	wantBlocked(t, doProxy(t, cfg, http.MethodGet, "http://x.ddev.site/", "", nil), http.StatusBadGateway, reasonNotAllowlisted)
+	wantBlocked(t, doInspect(t, cfg, "http://x.ddev.site/", ""), http.StatusBadGateway, reasonNotAllowlisted)
+	resp := decodeInspect(t, doInspect(t, cfg, "http://x.ddev.site/", "&diag=1"))
+	if resp.Error == nil || resp.Error.Error != "blocked_target" || resp.Error.Reason != reasonNotAllowlisted || resp.Error.Status != 502 {
+		t.Errorf("/inspect?diag=1 error = %+v", resp.Error)
+	}
+	page := decodePage(t, doPage(t, cfg, "http://x.ddev.site/", ""))
+	if page.Error == nil || page.Error.Reason != reasonNotAllowlisted || len(page.RedirectChain) != 1 ||
+		page.RedirectChain[0].ErrorReason != reasonNotAllowlisted || page.RedirectChain[0].ErrorCategory != "blocked_target" {
+		t.Errorf("/page error = %+v chain = %+v", page.Error, page.RedirectChain)
+	}
+
+	// /page: a redirect hop the pre-check refuses (reason in error and hop),
+	// and a non-http scheme.
+	hop, _ := countingServer(t, redirectTo("http://169.254.169.254/"))
+	js, _ := countingServer(t, redirectTo("javascript:alert(1)"))
+	hcfg, _ := localCfg(t, "", map[string]string{"hop.test": "127.0.0.1"}, nil)
+	hcfg.dialControl = allowAllDial
+	// hop.test plays a public start; every literal still goes through the
+	// real pre-check.
+	hcfg.ssrfCheck = nil
+	hcfg.lookupIP = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	hopStart := "http://hop.test:" + serverPort(t, hop) + "/"
+	// The start resolves to loopback and would be refused itself; skip the
+	// start's pre-check by asking the tracer directly.
+	ctx := withLocalStart(context.Background(), false)
+	req := httptest.NewRequest(http.MethodGet, "/page", nil)
+	hops, _, fail := traceRedirectChain(ctx, newUpstreamClient(hcfg), hopStart, req, 20, hcfg)
+	if fail == nil || fail.pe.Error != "blocked_target" || fail.pe.Reason != reasonAlwaysBlocked {
+		t.Fatalf("/page blocked hop: %+v", fail)
+	}
+	if last := hops[len(hops)-1]; last.ErrorReason != reasonAlwaysBlocked || last.ErrorCategory != "blocked_target" {
+		t.Errorf("/page blocked hop: %+v", last)
+	}
+
+	scfg := testCfg(t, nil)
+	page = decodePage(t, doPage(t, scfg, js.URL+"/", ""))
+	last := page.RedirectChain[len(page.RedirectChain)-1]
+	if page.Error == nil || page.Error.Reason != reasonUnsupportedScheme || last.ErrorReason != reasonUnsupportedScheme {
+		t.Errorf("/page javascript: error=%+v hop=%+v", page.Error, last)
+	}
+
+	// /proxy?follow=1 hop refused by the pre-check: 403 with type and reason.
+	fcfg, _ := localCfg(t, "", nil, nil)
+	fcfg.dialControl = allowAllDial
+	fcfg.lookupIP = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	fcfg.ssrfCheck = func(h string) bool { return h != "hop.test" }
+	rr := doProxy(t, fcfg, http.MethodGet, "http://hop.test:"+serverPort(t, hop)+"/", "&follow=1", nil)
+	wantBlocked(t, rr, http.StatusForbidden, reasonPrivate)
+
+	// Flag off: always_blocked and private, no not_allowlisted.
+	off, _ := localCfg(t, "", nil, nil)
+	wantBlocked(t, doProxy(t, off, http.MethodGet, "http://169.254.169.254/", "", nil), http.StatusForbidden, reasonAlwaysBlocked)
+	wantBlocked(t, doProxy(t, off, http.MethodGet, "http://10.0.0.1/", "", nil), http.StatusForbidden, reasonPrivate)
+}
+
+func TestSafeDialControl_ReasonAndText(t *testing.T) {
+	err := safeDialControl("tcp", "127.0.0.1:8080", nil)
+	var be *blockedError
+	if !errors.As(err, &be) || be.reason != reasonPrivate || err.Error() != "target address is blocked: 127.0.0.1" {
+		t.Errorf("loopback: %v (%+v)", err, be)
+	}
+	err = safeDialControl("tcp", "169.254.169.254:80", nil)
+	if !errors.As(err, &be) || be.reason != reasonAlwaysBlocked {
+		t.Errorf("metadata: %v", err)
+	}
+	err = safeDialControl("tcp", "[fd00:ec2::254]:80", nil)
+	if !errors.As(err, &be) || be.reason != reasonAlwaysBlocked {
+		t.Errorf("AWS IPv6 metadata: %v", err)
+	}
+	// IPv4-mapped forms are normalised.
+	err = safeDialControl("tcp", "[::ffff:169.254.169.254]:80", nil)
+	if !errors.As(err, &be) || be.reason != reasonAlwaysBlocked {
+		t.Errorf("mapped metadata: %v", err)
+	}
+	// The exact-address hook opens one ip:port and nothing else.
+	ctl := exactAddressControl(net.ParseIP("127.0.0.1"), "8080", safeDialControl)
+	if err := ctl("tcp", "127.0.0.1:8080", nil); err != nil {
+		t.Errorf("exact address refused: %v", err)
+	}
+	for _, addr := range []string{"127.0.0.1:8081", "127.0.0.2:8080", "[::1]:8080"} {
+		if err := ctl("tcp", addr, nil); !errors.Is(err, errBlockedTarget) {
+			t.Errorf("%s: %v", addr, err)
+		}
+	}
+}
+
+func TestBanner_LocalLines(t *testing.T) {
+	info := bannerInfo{version: "dev", port: 8765, token: strings.Repeat("a", 48), dnsLabel: "1.1.1.1:53",
+		origins: []string{"https://www.jpkc.com"}}
+
+	plain := bannerLines(info)
+	for _, l := range plain {
+		if strings.Contains(l, "Local") || strings.Contains(l, "WARNING") {
+			t.Errorf("banner without new flags has %q", l)
+		}
+	}
+	if len(plain) != 19 {
+		t.Errorf("v1.3.0 banner has 19 lines, got %d", len(plain))
+	}
+
+	entries, err := parseAllowLocal([]string{"*.ddev.site,localhost:8888,[fd00::/64]:8443"}, 8765)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.allowLocal = entries
+	lines := bannerLines(info)
+	if len(lines) != len(plain)+2 {
+		t.Fatalf("got %d lines, want %d", len(lines), len(plain)+2)
+	}
+	text := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"║    Local    :  *.ddev.site, localhost:8888, [fd00::/64]:8443",
+		"║    WARNING  :  local network access enabled for the allowed origins",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("banner lacks %q:\n%s", want, text)
+		}
+	}
+	// Right after the Host line.
+	for i, l := range lines {
+		if strings.Contains(l, "Host     :") && !strings.Contains(lines[i+1], "Local    :") {
+			t.Errorf("Local line not after Host: %q", lines[i+1])
+		}
+	}
+	// Every box line has the same width — the new lines are in the width list.
+	width := -1
+	for _, l := range lines {
+		if !strings.HasPrefix(l, "║") && !strings.HasPrefix(l, "╔") && !strings.HasPrefix(l, "╟") && !strings.HasPrefix(l, "╠") && !strings.HasPrefix(l, "╚") {
+			continue
+		}
+		w := utf8.RuneCountInString(l)
+		if width == -1 {
+			width = w
+		} else if w != width {
+			t.Errorf("line width %d ≠ %d: %q", w, width, l)
+		}
+	}
+
+	// A warning for leftover arguments.
+	info.allowLocal = nil
+	info.warnings = []string{`ignored arguments ["x"]`}
+	if text := strings.Join(bannerLines(info), "\n"); !strings.Contains(text, `WARNING  :  ignored arguments ["x"]`) {
+		t.Errorf("warning missing:\n%s", text)
+	}
 }

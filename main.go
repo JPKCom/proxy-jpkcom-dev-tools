@@ -92,9 +92,10 @@ type config struct {
 	// 0 means unlimited (not recommended for production).
 	maxResponseBytes int64
 
-	// ssrfCheck is the function used to determine whether a hostname resolves
-	// to a blocked address. Defaults to isPrivateHost in production; tests may
-	// override it with a no-op to allow localhost targets.
+	// ssrfCheck replaces the SSRF pre-check (precheck) with a plain "is this
+	// hostname blocked?" test. Test-only: main never sets it, and nil means
+	// the built-in pre-check with --allow-local and block reasons. A hook that
+	// blocks reports reason "private", the v1.3.0 case.
 	//
 	// This is only a fast pre-flight rejection — it is NOT the security
 	// boundary. Because the resolution it performs is separate from the one
@@ -122,6 +123,18 @@ type config struct {
 	// application data; the only unverified handshake is the diagnostic probe
 	// (probeTLS), which reads certificates and nothing else.
 	rootCAs *x509.CertPool
+
+	// allowLocal is the parsed --allow-local list. Empty means off: every
+	// private address stays blocked, exactly as in v1.3.0. See allowEntry for
+	// the syntax and localVerdict for what an entry permits.
+	allowLocal []allowEntry
+
+	// lookupIP replaces cfg.resolver for every lookup the proxy makes itself:
+	// the SSRF pre-check, localGuard and — whenever it is set — the dial path
+	// for targets that are not allowed as local, so a test can steer all of
+	// them with one answer. Test-only: main never sets it, and nil means
+	// cfg.resolver.
+	lookupIP func(ctx context.Context, host string) ([]net.IPAddr, error)
 }
 
 // dialControlOrDefault returns the configured dial Control hook, falling back
@@ -133,14 +146,97 @@ func (c *config) dialControlOrDefault() func(network, address string, c syscall.
 	return safeDialControl
 }
 
-// blocksHost reports whether the target hostname should be rejected before any
-// connection is attempted. It is a convenience wrapper around the configured
-// ssrfCheck, defaulting to a DNS-based private-range lookup.
-func (c *config) blocksHost(ctx context.Context, hostname string) bool {
+// precheck reports whether u must be rejected before any connection is
+// attempted, and why (a blockReason value). It is the fast pre-flight check
+// for the start URL and every redirect target, not the security boundary:
+// localGuard and safeDialControl decide again on the address actually dialled.
+//
+// localStart says whether the request's start URL is an --allow-local target
+// (allowLocalMatchURL); it must be the request's value, not that of u.
+func (c *config) precheck(ctx context.Context, u *url.URL, localStart bool) (blocked bool, reason string) {
 	if c.ssrfCheck != nil {
-		return c.ssrfCheck(hostname)
+		// Test hook: keeps its v1.3.0 meaning, "private" being the v1.3.0 case.
+		if c.ssrfCheck(u.Hostname()) {
+			return true, reasonPrivate
+		}
+		return false, ""
 	}
-	return isPrivateHost(ctx, hostname, c.resolver)
+	host, port := hostPort(u)
+	return c.precheckHost(ctx, host, port, localStart)
+}
+
+// precheckHost is precheck for a bare host (no brackets) and port. A literal
+// IP is judged at once, without DNS. A name the --allow-local list covers, on
+// a request whose start URL is local, is not resolved here at all: the dialer
+// decides per IP (LOCAL-5). Every other name is resolved, and the strongest
+// reason over all its addresses wins. A lookup failure fails open — the dialer
+// re-checks the real address.
+func (c *config) precheckHost(ctx context.Context, host, port string, localStart bool) (blocked bool, reason string) {
+	if ip := net.ParseIP(host); ip != nil {
+		reason = c.blockReason(host, port, ip, localStart)
+		return reason != "", reason
+	}
+	if localStart && c.allowLocalMatch(host, port) {
+		return false, ""
+	}
+
+	// Bound the lookup: a black-holed DNS server would otherwise hang the
+	// handler indefinitely, since this runs outside the upstream request's
+	// own timeout.
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	ips, err := c.resolveHost(lookupCtx, host)
+	if err != nil {
+		return false, ""
+	}
+	for _, ip := range ips {
+		reason = strongerReason(reason, c.blockReason(host, port, ip, localStart))
+	}
+	return reason != "", reason
+}
+
+// resolveHost resolves a host name through the shared lookup hook: cfg.lookupIP
+// in tests, cfg.resolver otherwise. With an active --allow-local list,
+// "localhost" and "*.localhost" map to 127.0.0.1 and ::1 without DNS
+// (RFC 6761). A test hook reports its lookup to an httptrace attached to ctx,
+// as the stdlib resolver does on its own, so X-Upstream-Timing keeps its DNS
+// phase.
+func (c *config) resolveHost(ctx context.Context, host string) ([]net.IP, error) {
+	if c.allowLocalActive() && isLocalhostName(normHost(host)) {
+		return []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}, nil
+	}
+	var (
+		addrs []net.IPAddr
+		err   error
+	)
+	if c.lookupIP != nil {
+		trace := httptrace.ContextClientTrace(ctx)
+		if trace != nil && trace.DNSStart != nil {
+			trace.DNSStart(httptrace.DNSStartInfo{Host: host})
+		}
+		addrs, err = c.lookupIP(ctx, host)
+		if trace != nil && trace.DNSDone != nil {
+			trace.DNSDone(httptrace.DNSDoneInfo{Addrs: addrs, Err: err})
+		}
+	} else {
+		resolver := c.resolver
+		if resolver == nil {
+			resolver = net.DefaultResolver
+		}
+		addrs, err = resolver.LookupIPAddr(ctx, host)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		ips = append(ips, a.IP)
+	}
+	return ips, nil
 }
 
 // tokenValid compares the request's X-Proxy-Token against the session token in
@@ -189,6 +285,10 @@ type proxyError struct {
 	// every upstream failure and on a /proxy redirect hop refused by the SSRF
 	// pre-check; absent on the request-validation 4xx from authorizeRequest.
 	Type string `json:"type,omitempty"`
+	// Reason is a machine-readable sub-code for branching (since v1.4.0): set on
+	// auth_refused and blocked_target. Error stays the primary code; Type stays
+	// display text.
+	Reason string `json:"reason,omitempty"`
 }
 
 // writeJSONError writes a categorized JSON error response with CORS headers.
@@ -199,6 +299,13 @@ type proxyError struct {
 func writeJSONError(w http.ResponseWriter, r *http.Request, cfg *config, code string, message string, status int) {
 	writeCORSHeaders(w, r, cfg)
 	writeJSON(w, status, proxyError{Error: code, Message: message, Status: status})
+}
+
+// writeJSONErrorReason is writeJSONError with a reason sub-code, for the
+// request-validation rejections that carry one (blocked_target). Like
+// writeJSONError it sets no type.
+func writeJSONErrorReason(w http.ResponseWriter, r *http.Request, cfg *config, code, reason, message string, status int) {
+	writeUpstreamError(w, r, cfg, &proxyError{Error: code, Message: message, Status: status, Reason: reason})
 }
 
 // writeUpstreamError writes the JSON error for a failed upstream request. The
@@ -223,13 +330,24 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // Shared handler preamble
 // -----------------------------------------------------------------------
 
+// authorizedRequest is what authorizeRequest hands a handler that may proceed.
+type authorizedRequest struct {
+	// target is the parsed, pre-checked target URL.
+	target *url.URL
+	// localStart reports that target is an --allow-local target. Only then may
+	// the request — and every redirect hop it follows — reach a local address
+	// (LOCAL-6). The handler puts it on the request context (withLocalStart),
+	// from which every upstream request and the dialer read it.
+	localStart bool
+}
+
 // authorizeRequest runs the checks every authenticated endpoint shares: method,
 // CORS preflight, origin, token, target URL and the SSRF pre-check.
 //
 // It returns the parsed target and true when the caller should proceed. When it
 // returns false it has already written the complete response — including the
 // 204 for a preflight — and the caller must return immediately.
-func authorizeRequest(w http.ResponseWriter, r *http.Request, cfg *config, allowedMethods ...string) (*url.URL, bool) {
+func authorizeRequest(w http.ResponseWriter, r *http.Request, cfg *config, allowedMethods ...string) (*authorizedRequest, bool) {
 	if r.Method == http.MethodOptions {
 		writeCORSHeaders(w, r, cfg)
 		w.WriteHeader(http.StatusNoContent)
@@ -268,12 +386,16 @@ func authorizeRequest(w http.ResponseWriter, r *http.Request, cfg *config, allow
 		return nil, false
 	}
 
-	if cfg.blocksHost(r.Context(), target.Hostname()) {
-		writeJSONError(w, r, cfg, "blocked_target", "target resolves to a private or reserved address", http.StatusForbidden)
+	// Purely syntactic (no DNS): is the start URL itself an --allow-local
+	// target? Decides whether this request may reach local addresses at all.
+	localStart := cfg.allowLocalMatchURL(target)
+
+	if blocked, reason := cfg.precheck(r.Context(), target, localStart); blocked {
+		writeJSONErrorReason(w, r, cfg, "blocked_target", reason, "target resolves to a private or reserved address", http.StatusForbidden)
 		return nil, false
 	}
 
-	return target, true
+	return &authorizedRequest{target: target, localStart: localStart}, true
 }
 
 // classifyUpstreamError inspects the error chain from an upstream request and
@@ -382,7 +504,13 @@ func upstreamFailure(ctx context.Context, err error) *proxyError {
 	if code == "timeout" {
 		status = http.StatusGatewayTimeout
 	}
-	return &proxyError{Error: code, Message: message, Status: status, Type: proxyErrorType(code, err)}
+	pe := &proxyError{Error: code, Message: message, Status: status, Type: proxyErrorType(code, err)}
+	// A dialer block names its reason (private, not_allowlisted, always_blocked).
+	var be *blockedError
+	if code == "blocked_target" && errors.As(err, &be) {
+		pe.Reason = be.reason
+	}
+	return pe
 }
 
 // proxyErrorType returns the human-readable class for an error code, matching
@@ -612,11 +740,15 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 		// ------------------------------------------------------------------
 		// 1.-4. Method, CORS preflight, origin, token, target URL, SSRF.
 		// ------------------------------------------------------------------
-		target, ok := authorizeRequest(w, r, cfg,
+		auth, ok := authorizeRequest(w, r, cfg,
 			http.MethodGet, http.MethodHead, http.MethodPost)
 		if !ok {
 			return
 		}
+		target := auth.target
+		// Every upstream request below derives its context from r, so the
+		// dialer sees whether this request may reach local targets.
+		r = r.WithContext(withLocalStart(r.Context(), auth.localStart))
 		follow := r.URL.Query().Get("follow") == "1" && r.Method != http.MethodPost
 
 		// ------------------------------------------------------------------
@@ -659,15 +791,31 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 			if err != nil || visited[next.String()] {
 				break
 			}
+			// A public start never leads into an --allow-local target: a
+			// compromised site could otherwise redirect into the user's own
+			// network (LOCAL-6). Checked before the pre-check, which would
+			// report the hop as merely private or not allowlisted.
+			if !auth.localStart && cfg.allowLocalMatchURL(next) {
+				resp.Body.Close()
+				writeUpstreamError(w, r, cfg, &proxyError{
+					Error:   "blocked_target",
+					Message: "redirect from a public start URL into a local target",
+					Status:  http.StatusForbidden,
+					Type:    proxyErrorType("blocked_target", nil),
+					Reason:  reasonRedirectIntoLocal,
+				})
+				return
+			}
 			// SSRF pre-check on each redirect target, as for the original URL.
 			// The dialer enforces this again for the actual connection.
-			if cfg.blocksHost(ctx, next.Hostname()) {
+			if blocked, reason := cfg.precheck(ctx, next, auth.localStart); blocked {
 				resp.Body.Close()
 				writeUpstreamError(w, r, cfg, &proxyError{
 					Error:   "blocked_target",
 					Message: "redirect target resolves to a private or reserved address",
 					Status:  http.StatusForbidden,
 					Type:    proxyErrorType("blocked_target", nil),
+					Reason:  reason,
 				})
 				return
 			}
@@ -1585,11 +1733,20 @@ var errNoProbeAddress = errors.New("no connected address to probe")
 // request had already connected to — so there is no second DNS lookup and no
 // rebinding window — and it dials through the configured Control hook, i.e.
 // safeDialControl in production, which re-checks that literal IP.
+//
+// For a request whose start URL is an --allow-local target (localStartFrom on
+// ctx) the probe decides exactly as localGuard does: when localVerdict allows
+// host on that IP, it may dial that one ip:port and nothing else (LOCAL-5).
 func probeTLS(ctx context.Context, cfg *config, host, port, ip string) (*tls.ConnectionState, error) {
 	ctx, cancel := context.WithTimeout(ctx, tlsProbeTimeout) // never exceeds the parent's deadline
 	defer cancel()
 
-	dialer := &net.Dialer{Timeout: tlsProbeTimeout, Control: cfg.dialControlOrDefault()}
+	control := cfg.dialControlOrDefault()
+	if parsed := net.ParseIP(ip); parsed != nil && localStartFrom(ctx) &&
+		cfg.localVerdict(host, port, parsed) == verdictAllowed {
+		control = exactAddressControl(parsed, port, control)
+	}
+	dialer := &net.Dialer{Timeout: tlsProbeTimeout, Control: control}
 	raw, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 	if err != nil {
 		return nil, err
@@ -1805,10 +1962,13 @@ func probeContentEncoding(ctx context.Context, client *http.Client, target strin
 func inspectHandler(cfg *config, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		target, ok := authorizeRequest(w, r, cfg, http.MethodGet, http.MethodHead)
+		auth, ok := authorizeRequest(w, r, cfg, http.MethodGet, http.MethodHead)
 		if !ok {
 			return
 		}
+		target := auth.target
+		// Carried to the dialer and the TLS probe (see proxyHandler).
+		r = r.WithContext(withLocalStart(r.Context(), auth.localStart))
 
 		query := r.URL.Query()
 		includeBody := query.Get("body") == "1"
@@ -2247,6 +2407,9 @@ type pageHop struct {
 	// ErrorCategory is the proxy error code of a failed hop (tls_error,
 	// dns_error, timeout, redirect_loop, too_many_redirects, blocked_target, …).
 	ErrorCategory string `json:"errorCategory,omitempty"`
+	// ErrorReason is the error's reason sub-code (since v1.4.0), set where the
+	// top-level error carries one — a blocked_target hop.
+	ErrorReason string `json:"errorReason,omitempty"`
 	// ErrorType is the classified failure text, only for a tls_error hop.
 	ErrorType string `json:"errorType,omitempty"`
 	// Certificate summary of the hop's verified connection (https only).
@@ -2359,13 +2522,14 @@ type hopFailure struct {
 }
 
 // chainStop builds the top-level error for a chain stopped by one of the
-// tracer's own rules. message is the hop's error text.
-func chainStop(code, message string) *proxyError {
+// tracer's own rules. message is the hop's error text, reason its sub-code
+// ("" for none).
+func chainStop(code, reason, message string) *proxyError {
 	status := http.StatusBadGateway
 	if code == "timeout" {
 		status = http.StatusGatewayTimeout
 	}
-	return &proxyError{Error: code, Message: message, Status: status, Type: proxyErrorType(code, nil)}
+	return &proxyError{Error: code, Message: message, Status: status, Type: proxyErrorType(code, nil), Reason: reason}
 }
 
 // traceRedirectChain follows redirect hops via HEAD requests, recording
@@ -2379,37 +2543,41 @@ func chainStop(code, message string) *proxyError {
 // additionally gets its own per-request timeout, but the parent deadline always
 // wins — otherwise maxHops slow redirects could keep the handler alive for
 // maxHops × requestTimeout, and a client disconnect would not stop any of it.
+//
+// Whether the chain may reach --allow-local targets is read from parent
+// (localStartFrom): a public start never redirects into one.
 func traceRedirectChain(parent context.Context, client *http.Client, startURL string, browserReq *http.Request,
 	maxHops int, cfg *config) (hops []pageHop, finalURL string, fail *hopFailure) {
 	visited := make(map[string]bool)
+	localStart := localStartFrom(parent)
 
 	// stop appends an error-only hop for a rule that ended the chain.
-	stop := func(hop int, rawURL string, u *url.URL, code, message string) {
-		hops = append(hops, pageHop{Hop: hop, URL: rawURL, Error: message, ErrorCategory: code})
-		fail = &hopFailure{pe: chainStop(code, message), url: u}
+	stop := func(hop int, rawURL string, u *url.URL, code, reason, message string) {
+		hops = append(hops, pageHop{Hop: hop, URL: rawURL, Error: message, ErrorCategory: code, ErrorReason: reason})
+		fail = &hopFailure{pe: chainStop(code, reason, message), url: u}
 	}
 
 	current, err := url.Parse(startURL)
 	if err != nil {
-		stop(1, startURL, nil, "bad_request", "invalid URL")
+		stop(1, startURL, nil, "bad_request", "", "invalid URL")
 		return hops, startURL, fail
 	}
 
 	for i := 0; ; i++ {
 		currentURL := current.String()
 		if parent.Err() != nil {
-			stop(i+1, currentURL, current, "timeout", "timeout: redirect chain exceeded the time budget")
+			stop(i+1, currentURL, current, "timeout", "", "timeout: redirect chain exceeded the time budget")
 			break
 		}
 		if visited[currentURL] {
-			stop(i+1, currentURL, current, "redirect_loop", "redirect loop detected")
+			stop(i+1, currentURL, current, "redirect_loop", "", "redirect loop detected")
 			break
 		}
 		// maxHops redirects followed, and the last request still redirected
 		// here — a 21st redirect. Like the Fetch standard, exactly maxHops
 		// redirects are fine.
 		if i > maxHops {
-			stop(i+1, currentURL, current, "too_many_redirects", fmt.Sprintf("too_many_redirects: more than %d redirects", maxHops))
+			stop(i+1, currentURL, current, "too_many_redirects", "", fmt.Sprintf("too_many_redirects: more than %d redirects", maxHops))
 			break
 		}
 		visited[currentURL] = true
@@ -2447,6 +2615,7 @@ func traceRedirectChain(parent context.Context, client *http.Client, startURL st
 			log.Printf("page redirect trace error: %v", err)
 			hop.Error = pe.Error + ": " + pe.Message
 			hop.ErrorCategory = pe.Error
+			hop.ErrorReason = pe.Reason
 			if pe.Error == "tls_error" {
 				hop.ErrorType = pe.Type
 			}
@@ -2477,20 +2646,27 @@ func traceRedirectChain(parent context.Context, client *http.Client, startURL st
 		if err != nil {
 			hops = append(hops, hop)
 			if errors.Is(err, errUnsupportedRedirectScheme) {
-				stop(i+2, strings.TrimSpace(loc), nil, "blocked_target", "blocked_target: redirect target uses an unsupported scheme")
+				stop(i+2, strings.TrimSpace(loc), nil, "blocked_target", reasonUnsupportedScheme, "blocked_target: redirect target uses an unsupported scheme")
 			} else {
-				stop(i+2, strings.TrimSpace(loc), nil, "bad_request", "bad_request: invalid redirect target")
+				stop(i+2, strings.TrimSpace(loc), nil, "bad_request", "", "bad_request: invalid redirect target")
 			}
 			break
 		}
 		hop.Location = next.String()
 		hops = append(hops, hop)
 
+		// No redirect from a public start into an --allow-local target
+		// (LOCAL-6); checked before the pre-check, as on /proxy.
+		if !localStart && cfg.allowLocalMatchURL(next) {
+			stop(i+2, next.String(), next, "blocked_target", reasonRedirectIntoLocal, "blocked_target: redirect from a public start URL into a local target")
+			break
+		}
+
 		// SSRF pre-check on each redirect target. The dialer enforces this
 		// again for the actual connection; this only fails faster and
 		// records a clearer reason in the chain.
-		if cfg.blocksHost(parent, next.Hostname()) {
-			stop(i+2, next.String(), next, "blocked_target", "blocked_target: redirect target resolves to a private or reserved address")
+		if blocked, reason := cfg.precheck(parent, next, localStart); blocked {
+			stop(i+2, next.String(), next, "blocked_target", reason, "blocked_target: redirect target resolves to a private or reserved address")
 			break
 		}
 		current = next
@@ -2507,10 +2683,14 @@ func traceRedirectChain(parent context.Context, client *http.Client, startURL st
 func pageHandler(cfg *config, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		target, ok := authorizeRequest(w, r, cfg, http.MethodGet)
+		auth, ok := authorizeRequest(w, r, cfg, http.MethodGet)
 		if !ok {
 			return
 		}
+		target := auth.target
+		// Carried to the redirect tracer, the dialer and the TLS probe (see
+		// proxyHandler).
+		r = r.WithContext(withLocalStart(r.Context(), auth.localStart))
 		rawTarget := target.String()
 		diag := r.URL.Query().Get("diag") == "1"
 
@@ -2810,6 +2990,10 @@ func isBlockedIP(ip net.IP) bool {
 // It also covers every code path for free — redirect hops, HEAD probes and the
 // final GET all dial through the same transport, and the TLS diagnostic probe
 // (probeTLS) dials with the same hook.
+//
+// It knows neither the requested host name nor the proxy's own port, so its
+// blockedError says "private" or "always_blocked"; localGuard refines that
+// (refineBlocked) where it knows more.
 func safeDialControl(_, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -2819,55 +3003,815 @@ func safeDialControl(_, address string, _ syscall.RawConn) error {
 	if ip == nil {
 		// Control is called post-resolution, so a non-IP here means something
 		// unexpected happened. Refuse rather than guess.
-		return fmt.Errorf("%w: unresolved address %q", errBlockedTarget, host)
+		return &blockedError{detail: fmt.Sprintf("unresolved address %q", host), reason: reasonAlwaysBlocked}
 	}
 	if isBlockedIP(ip) {
-		return fmt.Errorf("%w: %s", errBlockedTarget, ip)
+		reason := reasonPrivate
+		if isAlwaysBlockedIP(ip) {
+			reason = reasonAlwaysBlocked
+		}
+		return &blockedError{ip: ip, addr: address, detail: ip.String(), reason: reason}
 	}
 	return nil
 }
 
+// blockedError is a connection the SSRF guard refused. It unwraps to
+// errBlockedTarget, so classifyUpstreamError keeps reporting blocked_target,
+// and upstreamFailure copies reason into the JSON error. Its text is the one
+// v1.3.0 logged ("target address is blocked: 127.0.0.1").
+type blockedError struct {
+	ip     net.IP // the refused address; nil when there was none to parse
+	addr   string // the dialled "ip:port", when known
+	detail string // what Error() names after the common prefix
+	reason string // reasonPrivate, reasonNotAllowlisted or reasonAlwaysBlocked
+}
+
+func (e *blockedError) Error() string { return errBlockedTarget.Error() + ": " + e.detail }
+func (e *blockedError) Unwrap() error { return errBlockedTarget }
+
 // isPrivateHost resolves the hostname and reports whether any of its addresses
-// fall in a blocked range.
+// fall in a blocked range — the v1.3.0 pre-check without --allow-local, port
+// and reason. A port or brackets in hostname are ignored.
 //
 // This is a fast pre-flight rejection so obvious cases fail before a connection
 // is attempted; it is deliberately fail-open, because a lookup failure here
 // would otherwise block legitimate domains during a DNS hiccup. Failing open is
 // safe precisely because safeDialControl re-checks the real address later.
 func isPrivateHost(ctx context.Context, hostname string, resolver *net.Resolver) bool {
-	// Strip port if present.
 	host, _, err := net.SplitHostPort(hostname)
 	if err != nil {
 		host = hostname
 	}
+	blocked, _ := (&config{resolver: resolver}).precheckHost(ctx, strings.Trim(host, "[]"), "", false)
+	return blocked
+}
 
-	// A literal IP needs no lookup — and must not be able to dodge the check by
-	// being unresolvable.
-	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
-		return isBlockedIP(ip)
+// -----------------------------------------------------------------------
+// Local targets (--allow-local)
+// -----------------------------------------------------------------------
+//
+// Off by default. With --allow-local the user names the local sites the proxy
+// may reach (a DDEV project, wp-env, an intranet host). The rules, in short:
+//
+//   - A name entry (exact or *.suffix) reaches loopback only — unless the
+//     address also lies in an IP/CIDR entry. A spoofed DNS answer for a
+//     listed name therefore cannot point the proxy into the LAN.
+//   - An IP/CIDR entry allows URLs with an IP literal in that range, and opens
+//     that range to the name entries.
+//   - Without a port an entry covers 80 and 443 only.
+//   - Some addresses are never reachable, whatever the list says
+//     (isAlwaysBlockedIP, and loopback on the proxy's own port).
+//   - Only a request whose start URL is on the list may reach a local target;
+//     a redirect from a public start into one is refused (LOCAL-6).
+//
+// The decision falls in the dialer (localGuard), where the requested name and
+// the address actually dialled are both known; the pre-check (precheck) and the
+// TLS probe (probeTLS) apply the same rules through localVerdict.
+
+// Reason sub-codes of blocked_target (proxyError.Reason, LOCAL-7).
+const (
+	// reasonPrivate: a private address, and --allow-local is not set — the
+	// v1.3.0 case.
+	reasonPrivate = "private"
+	// reasonNotAllowlisted: --allow-local is set, but this target (name, port
+	// or address) is not covered by it.
+	reasonNotAllowlisted = "not_allowlisted"
+	// reasonAlwaysBlocked: never reachable, with or without --allow-local.
+	reasonAlwaysBlocked = "always_blocked"
+	// reasonRedirectIntoLocal: a redirect from a public start URL into an
+	// --allow-local target.
+	reasonRedirectIntoLocal = "redirect_into_local"
+	// reasonUnsupportedScheme: /page only, a redirect to a scheme other than
+	// http/https.
+	reasonUnsupportedScheme = "unsupported_scheme"
+)
+
+// strongerReason returns the stronger of two block reasons: always_blocked
+// beats not_allowlisted beats private beats "" (not blocked).
+func strongerReason(a, b string) string {
+	rank := func(r string) int {
+		switch r {
+		case reasonAlwaysBlocked:
+			return 3
+		case reasonNotAllowlisted:
+			return 2
+		case reasonPrivate:
+			return 1
+		}
+		return 0
 	}
-
-	if resolver == nil {
-		resolver = net.DefaultResolver
+	if rank(b) > rank(a) {
+		return b
 	}
+	return a
+}
 
-	// Bound the lookup: a black-holed DNS server would otherwise hang the
-	// handler indefinitely, since this runs outside the upstream request's
-	// own timeout.
-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	addrs, err := resolver.LookupHost(lookupCtx, host)
-	if err != nil {
-		return false
+// mustParseCIDRs parses a fixed CIDR table at startup.
+func mustParseCIDRs(cidrs ...string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic("invalid CIDR: " + cidr)
+		}
+		nets = append(nets, network)
 	}
+	return nets
+}
 
-	for _, addr := range addrs {
-		if isBlockedIP(net.ParseIP(addr)) {
+// allowableClasses are the parts of privateRangeCIDRs an --allow-local entry
+// can open: loopback, RFC 1918, CGNAT and IPv6 unique local. Everything else in
+// privateRangeCIDRs stays blocked whatever the list says (LOCAL-3).
+var allowableClasses = mustParseCIDRs(
+	"127.0.0.0/8",
+	"::1/128",
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"100.64.0.0/10",
+	"fc00::/7",
+)
+
+// metadataAddrs are cloud metadata services inside the allowable classes. They
+// stay blocked even when an entry's range contains them.
+var metadataAddrs = mustParseCIDRs(
+	"fd00:ec2::254/128",  // AWS IMDS over IPv6 (in fc00::/7)
+	"100.100.100.200/32", // Alibaba Cloud metadata (in 100.64.0.0/10)
+)
+
+// inAnyNet reports whether ip lies in one of nets.
+func inAnyNet(nets []*net.IPNet, ip net.IP) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
 			return true
 		}
 	}
 	return false
+}
+
+// isAlwaysBlockedIP reports an address no --allow-local entry can open: a
+// blocked range outside the allowable classes (link-local with the cloud
+// metadata address 169.254.169.254, 0/8, multicast, documentation, NAT64 and
+// 6to4, …) or one of metadataAddrs. nil counts as blocked.
+func isAlwaysBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if !isBlockedIP(ip) {
+		return false
+	}
+	return !inAnyNet(allowableClasses, ip) || inAnyNet(metadataAddrs, ip)
+}
+
+// allowEntryKind tells the three kinds of --allow-local entry apart.
+type allowEntryKind int
+
+const (
+	entryName     allowEntryKind = iota // exactly this host name
+	entryWildcard                       // any name ending in "."+host
+	entryNet                            // an IP address or CIDR range
+)
+
+// allowEntry is one parsed --allow-local entry.
+type allowEntry struct {
+	kind allowEntryKind
+	// host is the name (entryName) or the suffix after "*." (entryWildcard):
+	// lower case, without a trailing dot.
+	host string
+	// network is the range of an entryNet; a single address is a /32 or /128.
+	network *net.IPNet
+	// port is the one port the entry allows; "" means 80 and 443.
+	port string
+}
+
+// String renders the entry in its canonical form, as the banner shows it.
+func (e allowEntry) String() string {
+	var s string
+	switch e.kind {
+	case entryWildcard:
+		s = "*." + e.host
+	case entryNet:
+		ones, bits := e.network.Mask.Size()
+		s = e.network.IP.String()
+		if ones != bits {
+			s = e.network.String()
+		}
+		if e.network.IP.To4() == nil {
+			s = "[" + s + "]"
+		}
+	default:
+		s = e.host
+	}
+	if e.port != "" {
+		s += ":" + e.port
+	}
+	return s
+}
+
+// portAllows applies the entry's port rule to a target port.
+func (e allowEntry) portAllows(port string) bool {
+	if e.port == "" {
+		return port == "80" || port == "443"
+	}
+	return port == e.port
+}
+
+// matchesName reports whether a (normalised) host name falls under a name or
+// wildcard entry, ignoring the port.
+func (e allowEntry) matchesName(host string) bool {
+	switch e.kind {
+	case entryName:
+		return host == e.host
+	case entryWildcard:
+		// At least one label in front: "*.ddev.site" covers "a.ddev.site" and
+		// "a.b.ddev.site", but neither "ddev.site" nor "xddev.site".
+		return strings.HasSuffix(host, "."+e.host) && len(host) > len(e.host)+1
+	}
+	return false
+}
+
+// dangerousPorts are services that must not be opened to browser pages, even
+// on a local host the user trusts: an HTTP request there can reconfigure or
+// read out the service.
+var dangerousPorts = map[int]string{
+	2375:  "Docker API",
+	2376:  "Docker API (TLS)",
+	2379:  "etcd",
+	3306:  "MySQL",
+	5432:  "PostgreSQL",
+	6379:  "Redis",
+	9200:  "Elasticsearch",
+	10250: "kubelet",
+	11211: "memcached",
+	27017: "MongoDB",
+}
+
+// wildcardDNSServices are public DNS zones that resolve any name with an
+// embedded IP to that IP (10.0.0.1.nip.io → 10.0.0.1). A wildcard on them
+// would cover every address the user's network has.
+var wildcardDNSServices = []string{"nip.io", "sslip.io", "xip.io", "localtest.me", "lvh.me", "traefik.me"}
+
+// homeNetworkSuffixes name every device on a home network (router, NAS,
+// printer — some routers change settings on a GET). Only exact names may use
+// them.
+var homeNetworkSuffixes = []string{"home.arpa", "fritz.box"}
+
+// parseAllowLocal parses the --allow-local values (the flag may be repeated;
+// each value is a comma-separated list) into entries. listenPort is --port; an
+// entry may not name it. Every error names the offending entry.
+func parseAllowLocal(values []string, listenPort int) ([]allowEntry, error) {
+	var entries []allowEntry
+	for _, value := range values {
+		for _, raw := range strings.Split(value, ",") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			e, err := parseAllowEntry(raw, listenPort)
+			if err != nil {
+				return nil, fmt.Errorf("--allow-local entry %q: %w", raw, err)
+			}
+			entries = append(entries, e)
+		}
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("--allow-local is empty; to keep local targets off, leave the flag out")
+	}
+	return entries, nil
+}
+
+// quoteChars are the straight and typographic quotation marks that can reach
+// an --allow-local value when a shell or a copied example leaves them in.
+const quoteChars = "\"'\u201c\u201d\u201e\u2018\u2019\u201a\u00ab\u00bb"
+
+// parseAllowEntry parses one --allow-local entry (see parseAllowLocal).
+func parseAllowEntry(raw string, listenPort int) (allowEntry, error) {
+	// Windows PowerShell 5.1, cmd.exe wrappers, shortcuts and typographic
+	// quotes copied from a document can leave the quotation marks inside the
+	// value; every later check would then report something misleading.
+	if strings.ContainsAny(raw, quoteChars) {
+		return allowEntry{}, errors.New("remove the quotation marks: they reached the proxy as part of the value (quote for the shell, not inside the value)")
+	}
+	hostPart, portPart, bracketed := raw, "", false
+	hasPort := false
+	switch {
+	case strings.Contains(raw, "://"):
+		// A pasted URL would otherwise fail later as a confusing "port".
+		return allowEntry{}, errors.New(`write the host without a scheme or path, e.g. "wp.test" or "wp.test:8443"`)
+	case strings.HasPrefix(raw, "["):
+		end := strings.Index(raw, "]")
+		if end < 0 {
+			return allowEntry{}, errors.New(`missing "]"`)
+		}
+		hostPart, bracketed = raw[1:end], true
+		if rest := raw[end+1:]; rest != "" {
+			if !strings.HasPrefix(rest, ":") {
+				return allowEntry{}, errors.New(`unexpected text after "]"`)
+			}
+			portPart, hasPort = rest[1:], true
+		}
+	case strings.Count(raw, ":") > 1:
+		// fd00::5:8443 is itself a valid address; a port meant here would
+		// silently become part of a different IP.
+		return allowEntry{}, errors.New(`IPv6 addresses must be in brackets, e.g. "[fd00::5]" or "[fd00::5]:8443"`)
+	case strings.Contains(raw, ":"):
+		i := strings.LastIndex(raw, ":")
+		hostPart, portPart, hasPort = raw[:i], raw[i+1:], true
+	}
+
+	e := allowEntry{}
+	if hasPort {
+		port, err := parseAllowPort(portPart, listenPort)
+		if err != nil {
+			return allowEntry{}, err
+		}
+		e.port = port
+	}
+
+	switch {
+	case strings.Contains(hostPart, "/"):
+		ip, network, err := net.ParseCIDR(hostPart)
+		if err != nil {
+			return allowEntry{}, errors.New("not a valid CIDR range")
+		}
+		if err := checkBrackets(ip, bracketed); err != nil {
+			return allowEntry{}, err
+		}
+		if !ip.Equal(network.IP) {
+			return allowEntry{}, fmt.Errorf("has host bits set; the range starts at %s", network.IP)
+		}
+		ones, bits := network.Mask.Size()
+		switch {
+		case ones == 0:
+			return allowEntry{}, errors.New("would allow every address")
+		case bits == 32 && ones < 16:
+			return allowEntry{}, errors.New("IPv4 ranges must be /16 or narrower")
+		case bits == 128 && ones < 48:
+			return allowEntry{}, errors.New("IPv6 ranges must be /48 or narrower")
+		}
+		e.kind, e.network = entryNet, network
+	case net.ParseIP(hostPart) != nil:
+		ip := net.ParseIP(hostPart)
+		if err := checkBrackets(ip, bracketed); err != nil {
+			return allowEntry{}, err
+		}
+		if v4 := ip.To4(); v4 != nil {
+			e.network = &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)}
+		} else {
+			e.network = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+		}
+		e.kind = entryNet
+	default:
+		if bracketed {
+			return allowEntry{}, errors.New("brackets are for IPv6 addresses only")
+		}
+		kind, host, err := parseAllowName(hostPart)
+		if err != nil {
+			return allowEntry{}, err
+		}
+		e.kind, e.host = kind, host
+	}
+
+	if e.kind == entryNet {
+		if err := checkAllowRange(e.network); err != nil {
+			return allowEntry{}, err
+		}
+	}
+	return e, nil
+}
+
+// parseAllowPort validates the port of an entry: digits only (no "*", no
+// ranges), 1–65535, not the proxy's own port, not a dangerous service.
+func parseAllowPort(s string, listenPort int) (string, error) {
+	if s == "" {
+		return "", errors.New("empty port")
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return "", errors.New("the port must be a single number (no wildcards or ranges)")
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || n > 65535 {
+		return "", errors.New("the port must be between 1 and 65535")
+	}
+	if listenPort != 0 && n == listenPort {
+		return "", fmt.Errorf("port %d is the proxy's own --port", n)
+	}
+	if name, ok := dangerousPorts[n]; ok {
+		return "", fmt.Errorf("port %d (%s) is never allowed: a request from a web page could reconfigure or read out that service", n, name)
+	}
+	return strconv.Itoa(n), nil
+}
+
+// checkBrackets enforces "IPv6 in brackets, IPv4 without". An IPv4-mapped
+// IPv6 form (::ffff:a.b.c.d) must be written as plain IPv4.
+func checkBrackets(ip net.IP, bracketed bool) error {
+	isV4 := ip.To4() != nil
+	switch {
+	case isV4 && bracketed:
+		return errors.New("write IPv4 addresses without brackets")
+	case !isV4 && !bracketed:
+		return errors.New(`IPv6 addresses must be in brackets, e.g. "[fd00::5]"`)
+	}
+	return nil
+}
+
+// checkAllowRange accepts a range only when it lies wholly inside exactly one
+// allowable class and is not one of the always-blocked metadata addresses.
+func checkAllowRange(n *net.IPNet) error {
+	first, last := n.IP, lastIP(n)
+	for _, class := range allowableClasses {
+		if class.Contains(first) && class.Contains(last) {
+			for _, m := range metadataAddrs {
+				if m.Contains(first) && m.Contains(last) {
+					return errors.New("is a cloud metadata address and always blocked")
+				}
+			}
+			return nil
+		}
+	}
+	overlaps := false
+	for _, blocked := range privateRangeCIDRs {
+		if blocked.Contains(first) && blocked.Contains(last) {
+			return errors.New("lies in a range that is always blocked (link-local, metadata, multicast, reserved or documentation space)")
+		}
+		if blocked.Contains(first) || blocked.Contains(last) || n.Contains(blocked.IP) {
+			overlaps = true
+		}
+	}
+	if overlaps {
+		return errors.New("mixes address classes; use ranges that lie wholly inside 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, [::1] or [fc00::/7]")
+	}
+	return errors.New("is a public range; public addresses are allowed anyway and need no entry")
+}
+
+// lastIP returns the last address of n.
+func lastIP(n *net.IPNet) net.IP {
+	last := make(net.IP, len(n.IP))
+	for i := range n.IP {
+		last[i] = n.IP[i] | ^n.Mask[i]
+	}
+	return last
+}
+
+// parseAllowName validates a host name entry: an exact name, or a wildcard
+// "*.suffix" whose suffix is "test", "localhost" or has at least two labels —
+// and is neither a home-network suffix nor a wildcard DNS service.
+func parseAllowName(s string) (allowEntryKind, string, error) {
+	h := normHost(s)
+	if h == "*" {
+		return 0, "", errors.New(`"*" would allow every name`)
+	}
+	kind, base := entryName, h
+	if strings.HasPrefix(h, "*.") {
+		kind, base = entryWildcard, h[2:]
+	}
+	if strings.Contains(base, "*") {
+		return 0, "", errors.New(`a wildcard is allowed only as the whole first label, e.g. "*.ddev.site"`)
+	}
+	if !isASCII(base) {
+		return 0, "", errors.New("internationalised names must be written in Punycode (xn--…)")
+	}
+	if !validHostName(base) {
+		return 0, "", errors.New("not a valid host name")
+	}
+	if kind == entryName {
+		return kind, base, nil
+	}
+
+	if base != "test" && base != "localhost" && !strings.Contains(base, ".") {
+		return 0, "", fmt.Errorf("*.%s would cover every device named on the network; list exact names (e.g. \"nas.%s\") instead", base, base)
+	}
+	for _, suffix := range homeNetworkSuffixes {
+		// Below these endings only exact names: "*.nas.home.arpa" would
+		// still cover whatever the router names in that subzone.
+		if base == suffix {
+			return 0, "", fmt.Errorf("*.%s would cover every device on the home network; list exact names (e.g. \"wp.%s\") instead", base, base)
+		}
+		if strings.HasSuffix(base, "."+suffix) {
+			return 0, "", fmt.Errorf("below .%s only exact names are allowed, no wildcards; list them (e.g. \"wp.%s\") instead", suffix, base)
+		}
+	}
+	for _, svc := range wildcardDNSServices {
+		if base == svc || strings.HasSuffix(base, "."+svc) {
+			return 0, "", fmt.Errorf("%s is a public wildcard DNS service that resolves names to any embedded IP address; a wildcard on it would open the whole network", svc)
+		}
+	}
+	return kind, base, nil
+}
+
+// validHostName checks LDH host name syntax: labels of 1–63 letters, digits
+// and hyphens, not starting or ending with a hyphen, at most 253 characters,
+// and a last label that is not all digits (which would look like an IP).
+func validHostName(h string) bool {
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	labels := strings.Split(h, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	last := labels[len(labels)-1]
+	return strings.Trim(last, "0123456789") != ""
+}
+
+// normHost lower-cases a host name and drops a trailing dot.
+func normHost(h string) string {
+	return strings.TrimSuffix(strings.ToLower(h), ".")
+}
+
+// isLocalhostName reports "localhost" and its subdomains (RFC 6761), which the
+// proxy maps to loopback without DNS once --allow-local is active.
+func isLocalhostName(h string) bool {
+	return h == "localhost" || strings.HasSuffix(h, ".localhost")
+}
+
+// hostPort returns u's host (no brackets) and its effective port.
+func hostPort(u *url.URL) (host, port string) {
+	host, port = u.Hostname(), u.Port()
+	if port == "" {
+		port = "80"
+		if strings.EqualFold(u.Scheme, "https") {
+			port = "443"
+		}
+	}
+	return host, port
+}
+
+// allowLocalActive reports whether --allow-local is set.
+func (c *config) allowLocalActive() bool {
+	return len(c.allowLocal) > 0
+}
+
+// allowLocalMatch is the syntactic test, without DNS: is host:port an
+// --allow-local target? A name is matched against the name and wildcard
+// entries, an IP literal against the IP/CIDR entries — never across:
+// "localhost:8888" does not cover "127.0.0.1:8888".
+func (c *config) allowLocalMatch(host, port string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return c.netEntryAllows(ip, port)
+	}
+	return c.nameEntryAllows(normHost(host), port)
+}
+
+// nameEntryAllows reports whether a name or wildcard entry covers the
+// normalised host name h on port. h must pass the same syntax check as a name
+// entry (validHostName): "a..ddev.site" is not covered by "*.ddev.site".
+func (c *config) nameEntryAllows(h, port string) bool {
+	if !validHostName(h) {
+		return false
+	}
+	for _, e := range c.allowLocal {
+		if e.matchesName(h) && e.portAllows(port) {
+			return true
+		}
+	}
+	return false
+}
+
+// allowLocalMatchURL is allowLocalMatch for a URL.
+func (c *config) allowLocalMatchURL(u *url.URL) bool {
+	if !c.allowLocalActive() {
+		return false
+	}
+	host, port := hostPort(u)
+	return c.allowLocalMatch(host, port)
+}
+
+// netEntryAllows reports whether an IP/CIDR entry covers ip on port.
+func (c *config) netEntryAllows(ip net.IP, port string) bool {
+	for _, e := range c.allowLocal {
+		if e.kind == entryNet && e.network.Contains(ip) && e.portAllows(port) {
+			return true
+		}
+	}
+	return false
+}
+
+// inNetEntries reports whether ip lies in the range of any IP/CIDR entry,
+// whatever that entry's port: the second role of those entries, opening their
+// range to the name entries.
+func (c *config) inNetEntries(ip net.IP) bool {
+	for _, e := range c.allowLocal {
+		if e.kind == entryNet && e.network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// isOwnPort reports loopback on the proxy's own listening port — the proxy
+// would call itself.
+func (c *config) isOwnPort(ip net.IP, port string) bool {
+	return c.port != 0 && ip.IsLoopback() && port == strconv.Itoa(c.port)
+}
+
+// verdict is localVerdict's answer for one address.
+type verdict int
+
+const (
+	verdictPublic         verdict = iota // not a private address: the normal path
+	verdictAllowed                       // a local address the list opens for this host:port
+	verdictNotAllowlisted                // a private address the list does not open
+	verdictAlwaysBlocked                 // never reachable
+)
+
+// localVerdict decides whether host:port may be reached on ip (LOCAL-2). host
+// is the requested name or IP literal, ip the address that would be dialled.
+func (c *config) localVerdict(host, port string, ip net.IP) verdict {
+	if !isBlockedIP(ip) {
+		return verdictPublic
+	}
+	if isAlwaysBlockedIP(ip) || c.isOwnPort(ip, port) {
+		return verdictAlwaysBlocked
+	}
+	if lit := net.ParseIP(host); lit != nil {
+		if lit.Equal(ip) && c.netEntryAllows(ip, port) {
+			return verdictAllowed
+		}
+		return verdictNotAllowlisted
+	}
+	// Name entries reach loopback only, or a range an IP/CIDR entry opens
+	// explicitly.
+	if c.nameEntryAllows(normHost(host), port) && (ip.IsLoopback() || c.inNetEntries(ip)) {
+		return verdictAllowed
+	}
+	return verdictNotAllowlisted
+}
+
+// blockReason is the reason for refusing host:port on ip, or "" when it may be
+// reached. localStart is the request's own value: an allowed target is only
+// allowed for a request that started there. Pre-check, dialer and TLS probe
+// all use it, so they report the same reason (LOCAL-7).
+func (c *config) blockReason(host, port string, ip net.IP, localStart bool) string {
+	switch c.localVerdict(host, port, ip) {
+	case verdictPublic:
+		return ""
+	case verdictAlwaysBlocked:
+		return reasonAlwaysBlocked
+	case verdictAllowed:
+		if localStart {
+			return ""
+		}
+		return reasonNotAllowlisted
+	}
+	if !c.allowLocalActive() {
+		return reasonPrivate
+	}
+	return reasonNotAllowlisted
+}
+
+// localStartKey is the context key for the request's localStart value.
+type localStartKey struct{}
+
+// withLocalStart records on ctx whether the request's start URL is an
+// --allow-local target. The stdlib carries context values down to the
+// transport's DialContext, where localGuard reads them.
+func withLocalStart(ctx context.Context, localStart bool) context.Context {
+	return context.WithValue(ctx, localStartKey{}, localStart)
+}
+
+// localStartFrom reads the value withLocalStart recorded. A missing value
+// means false: a code path that forgot to set it can only block, never open.
+func localStartFrom(ctx context.Context) bool {
+	v, _ := ctx.Value(localStartKey{}).(bool)
+	return v
+}
+
+// exactAddressControl returns a dial Control hook that lets exactly ip:port
+// through and hands every other address to next — normally safeDialControl,
+// which keeps refusing private ones.
+func exactAddressControl(ip net.IP, port string, next func(network, address string, c syscall.RawConn) error) func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, rc syscall.RawConn) error {
+		if h, p, err := net.SplitHostPort(address); err == nil && p == port {
+			if got := net.ParseIP(h); got != nil && got.Equal(ip) {
+				return nil
+			}
+		}
+		return next(network, address, rc)
+	}
+}
+
+// refineBlocked adds what safeDialControl cannot know to its blockedError:
+// loopback on the proxy's own port is always_blocked, and with --allow-local
+// active a private address is not_allowlisted rather than private. Any other
+// error is returned unchanged.
+func (c *config) refineBlocked(err error) error {
+	var be *blockedError
+	if !errors.As(err, &be) || be.ip == nil || be.reason != reasonPrivate {
+		return err
+	}
+	if _, port, splitErr := net.SplitHostPort(be.addr); splitErr == nil && c.isOwnPort(be.ip, port) {
+		be.reason = reasonAlwaysBlocked
+	} else if c.allowLocalActive() {
+		be.reason = reasonNotAllowlisted
+	}
+	return err
+}
+
+// localGuard wraps the transport's dialer and is where --allow-local is
+// enforced (LOCAL-4). The transport hands it the target's host:port
+// unresolved (no Transport.Proxy is set), so it knows the requested name; it
+// then resolves that name itself and dials IP literals, so there is exactly
+// one resolution and the address checked is the address connected to —
+// rebinding has nothing to gain.
+//
+//   - No list and no test hook: base.DialContext, exactly the v1.3.0 path.
+//   - The request did not start at a local target (localStartFrom), or
+//     host:port is not on the list: the base dialer, whose safeDialControl
+//     keeps every private address blocked.
+//   - Otherwise each address in turn: public → the base dialer; allowed by
+//     localVerdict → a dialer that lets exactly that ip:port through; anything
+//     else is refused. The first successful connection wins.
+//
+// Whether a connection may reach a local address depends on the request that
+// dialled it, so a connection must never serve a request of the other class.
+// DisableKeepAlives makes HTTP/1.1 connections single-use, but it does not
+// stop HTTP/2: concurrent requests to the same authority may share a fresh h2
+// connection. With --allow-local active newUpstreamClient therefore keeps two
+// transports, one per localStart value (localSplitTransport). Within one class
+// the verdict depends only on the authority — the h2 pool key — so sharing
+// there opens nothing a fresh dial would not.
+func localGuard(cfg *config, base *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if !cfg.allowLocalActive() && cfg.lookupIP == nil {
+			conn, err := base.DialContext(ctx, network, addr)
+			return conn, cfg.refineBlocked(err)
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		local := localStartFrom(ctx) && cfg.allowLocalMatch(host, port)
+		if !local && cfg.lookupIP == nil {
+			conn, err := base.DialContext(ctx, network, addr)
+			return conn, cfg.refineBlocked(err)
+		}
+
+		// Resolve here: for a local target always, for any other target only
+		// when the test hook is set, so the base path sees its answers too.
+		var ips []net.IP
+		if ip := net.ParseIP(host); ip != nil {
+			ips = []net.IP{ip}
+		} else if ips, err = cfg.resolveHost(ctx, host); err != nil {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: err}
+		}
+
+		var blocked *blockedError
+		var dialErr error
+		for _, ip := range ips {
+			target := net.JoinHostPort(ip.String(), port)
+			d := base
+			if local {
+				switch cfg.localVerdict(host, port, ip) {
+				case verdictPublic:
+				case verdictAllowed:
+					exact := *base
+					exact.Control = exactAddressControl(ip, port, cfg.dialControlOrDefault())
+					d = &exact
+				default:
+					be := &blockedError{ip: ip, addr: target, detail: ip.String(), reason: cfg.blockReason(host, port, ip, true)}
+					if blocked == nil || strongerReason(blocked.reason, be.reason) != blocked.reason {
+						blocked = be
+					}
+					continue
+				}
+			}
+			conn, err := d.DialContext(ctx, network, target)
+			if err == nil {
+				return conn, nil
+			}
+			err = cfg.refineBlocked(err)
+			var be *blockedError
+			if errors.As(err, &be) {
+				if blocked == nil || strongerReason(blocked.reason, be.reason) != blocked.reason {
+					blocked = be
+				}
+			} else if dialErr == nil {
+				dialErr = err
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		// An address that was allowed but could not be reached says more than
+		// the addresses that were refused.
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		if blocked != nil {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: blocked}
+		}
+		return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("no address to dial")}
+	}
 }
 
 // -----------------------------------------------------------------------
@@ -3032,35 +3976,20 @@ func copyResponseHeaders(src *http.Response, dst http.ResponseWriter) {
 // newUpstreamClient builds the http.Client used for every outbound request.
 //
 // The dialer carries safeDialControl (cfg.dialControl only in tests), which is
-// where SSRF is actually enforced (see its documentation). Note that the DNS resolver deliberately uses its own
+// where SSRF is actually enforced (see its documentation); localGuard wraps it
+// for --allow-local. Note that the DNS resolver deliberately uses its own
 // plain dialer: with --dns system the configured nameserver may itself be a
 // loopback address such as systemd-resolved on 127.0.0.53, and applying the
 // guard there would break name resolution entirely.
+//
+// Without --allow-local the client has one *http.Transport, exactly as in
+// v1.3.0. With it, a localSplitTransport routes requests with and without the
+// localStart allowance to two separate transports, so no connection — HTTP/2
+// pools included — is ever shared between the two classes (see localGuard).
 func newUpstreamClient(cfg *config) *http.Client {
-	dialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Resolver:  cfg.resolver,
-		Control:   cfg.dialControlOrDefault(),
-	}
-	transport := &http.Transport{
-		DialContext:           dialer.DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: cfg.requestTimeout,
-		MaxIdleConns:          50,
-		IdleConnTimeout:       60 * time.Second,
-		ForceAttemptHTTP2:     true,
-		DisableKeepAlives:     true, // Fresh connection per request — accurate httptrace timing and IP.
-		// TLS verification stays enabled for every connection that carries
-		// application data: this transport never sets InsecureSkipVerify
-		// (test-enforced). The only unverified handshake in the program is
-		// probeTLS — diag=1 after a tls_error, handshake only, never handed
-		// to this transport.
-	}
-	if cfg.rootCAs != nil {
-		// Tests only: trust a test CA instead of the system store. Still a
-		// fully verified connection.
-		transport.TLSClientConfig = &tls.Config{RootCAs: cfg.rootCAs}
+	var transport http.RoundTripper = newUpstreamTransport(cfg)
+	if cfg.allowLocalActive() {
+		transport = &localSplitTransport{local: newUpstreamTransport(cfg), public: newUpstreamTransport(cfg)}
 	}
 	return &http.Client{
 		Transport: transport,
@@ -3076,6 +4005,334 @@ func newUpstreamClient(cfg *config) *http.Client {
 	}
 }
 
+// localSplitTransport sends each request through the transport of its class:
+// local when the request's start URL is an --allow-local target
+// (localStartFrom), public otherwise. Each transport keeps its own connection
+// pool, so a connection dialled with the local allowance never carries a
+// request without it — not even an HTTP/2 connection that a concurrent request
+// to the same authority picks up before its first stream (LOCAL-4).
+type localSplitTransport struct {
+	local, public *http.Transport
+}
+
+func (t *localSplitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if localStartFrom(req.Context()) {
+		return t.local.RoundTrip(req)
+	}
+	return t.public.RoundTrip(req)
+}
+
+// CloseIdleConnections lets http.Client.CloseIdleConnections reach both pools.
+func (t *localSplitTransport) CloseIdleConnections() {
+	t.local.CloseIdleConnections()
+	t.public.CloseIdleConnections()
+}
+
+// newUpstreamTransport builds one upstream transport (see newUpstreamClient).
+func newUpstreamTransport(cfg *config) *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Resolver:  cfg.resolver,
+		Control:   cfg.dialControlOrDefault(),
+	}
+	transport := &http.Transport{
+		// localGuard enforces --allow-local and, without it, is the plain
+		// dialer.DialContext (see its documentation).
+		DialContext:           localGuard(cfg, dialer),
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: cfg.requestTimeout,
+		MaxIdleConns:          50,
+		IdleConnTimeout:       60 * time.Second,
+		ForceAttemptHTTP2:     true,
+		// Fresh connection per request — accurate httptrace timing and IP.
+		// Security: whether a connection may reach an --allow-local target
+		// depends on the request that dialled it (localStartFrom); a pooled
+		// HTTP/1.1 connection would carry that permission over to the next
+		// request for the same host. This does not cover HTTP/2, whose
+		// concurrent requests to one authority may share a connection; that
+		// is why --allow-local splits the transport (localSplitTransport).
+		DisableKeepAlives: true,
+		// TLS verification stays enabled for every connection that carries
+		// application data: this transport never sets InsecureSkipVerify
+		// (test-enforced). The only unverified handshake in the program is
+		// probeTLS — diag=1 after a tls_error, handshake only, never handed
+		// to this transport.
+	}
+	if cfg.rootCAs != nil {
+		// Tests only: trust a test CA instead of the system store. Still a
+		// fully verified connection.
+		transport.TLSClientConfig = &tls.Config{RootCAs: cfg.rootCAs}
+	}
+	return transport
+}
+
+// -----------------------------------------------------------------------
+// Start-up flags and banner
+// -----------------------------------------------------------------------
+
+// listFlag is a repeatable string flag: every occurrence is kept, so
+// "--allow-local a --allow-local b" means the same as "--allow-local a,b".
+type listFlag struct {
+	values []string
+	set    bool // the flag appeared at least once, even with an empty value
+}
+
+func (f *listFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return strings.Join(f.values, ",")
+}
+
+func (f *listFlag) Set(v string) error {
+	f.values = append(f.values, v)
+	f.set = true
+	return nil
+}
+
+// startFlags are the raw command-line values validateFlags checks.
+type startFlags struct {
+	port         int
+	timeoutSec   int
+	maxMB        int64
+	rawOrigins   string
+	allowAnyHost bool
+	// allowLocal holds every --allow-local value; allowLocalSet tells "not
+	// given" (off) from "given, but empty" (a start-up error).
+	allowLocal    []string
+	allowLocalSet bool
+	// args are the positional arguments left after the flags (flag.Args).
+	args []string
+}
+
+// startConfig is what validateFlags derives from valid flags.
+type startConfig struct {
+	origins    []string
+	allowLocal []allowEntry
+	// warnings are extra banner lines (the text after the label).
+	warnings []string
+}
+
+// validateFlags checks the command line before anything starts. Problems are
+// caught here rather than surfacing later as a mystery: a zero timeout, for
+// instance, produces a context that is already past its deadline, so every
+// single upstream request would fail instantly. Every error is fatal; main
+// prints it with a "fatal: " prefix.
+//
+// Without --allow-local the checks are exactly those of v1.3.0, plus a banner
+// warning for positional arguments (which v1.3.0 ignored silently).
+func validateFlags(f startFlags) (*startConfig, error) {
+	if f.port < 0 || f.port > 65535 {
+		return nil, fmt.Errorf("--port must be between 0 and 65535, got %d", f.port)
+	}
+	if f.timeoutSec < 1 {
+		return nil, fmt.Errorf("--timeout must be at least 1 second, got %d", f.timeoutSec)
+	}
+	const maxAllowedMB = 1024 * 1024 // 1 TB; guards the byte multiplication in main
+	if f.maxMB < 0 || f.maxMB > maxAllowedMB {
+		return nil, fmt.Errorf("--max-mb must be between 0 and %d, got %d", maxAllowedMB, f.maxMB)
+	}
+
+	start := &startConfig{}
+	for _, o := range strings.Split(f.rawOrigins, ",") {
+		if trimmed := strings.TrimSpace(o); trimmed != "" {
+			start.origins = append(start.origins, trimmed)
+		}
+	}
+
+	// Go's flag package stops at the first non-flag argument, so everything
+	// after it — further flags included — is silently ignored. PowerShell
+	// produces exactly that from an unquoted list: "--allow-local a,b" arrives
+	// as "a" and "b". With the new flag that would quietly drop --origin or
+	// part of the list, so it is fatal; a v1.3.0 command line only gets a
+	// warning, so no existing start-up breaks.
+	if len(f.args) > 0 {
+		if f.allowLocalSet || argsNameAllowLocal(f.args) {
+			return nil, fmt.Errorf("unexpected arguments %q: they and every flag after them would be ignored; quote the list: --allow-local \"a,b\"", f.args)
+		}
+		start.warnings = append(start.warnings,
+			fmt.Sprintf("ignored arguments %q and every flag after them (quote values with commas or spaces)", f.args))
+	}
+
+	if !f.allowLocalSet {
+		return start, nil
+	}
+
+	entries, err := parseAllowLocal(f.allowLocal, f.port)
+	if err != nil {
+		return nil, err
+	}
+	if len(start.origins) == 0 {
+		return nil, errors.New("--allow-local requires --origin (otherwise any website could use the proxy to reach your local network)")
+	}
+	if f.allowAnyHost {
+		return nil, errors.New("--allow-local cannot be combined with --allow-any-host")
+	}
+	for _, o := range start.origins {
+		if !isStrictOrigin(o) {
+			return nil, fmt.Errorf("with --allow-local every --origin must be an https origin without a path (got %q)", o)
+		}
+	}
+	start.allowLocal = entries
+	return start, nil
+}
+
+// argsNameAllowLocal reports whether the left-over positional arguments
+// contain --allow-local itself: an unquoted list split earlier on the command
+// line (PowerShell: "--origin a,b --allow-local x") stops the flag parser
+// before it, so the flag is never set although the user clearly gave it.
+// v1.3.0 knew no such flag, so no working v1.3.0 command line contains it.
+func argsNameAllowLocal(args []string) bool {
+	for _, a := range args {
+		name, ok := strings.CutPrefix(a, "--")
+		if !ok {
+			name, ok = strings.CutPrefix(a, "-")
+		}
+		if ok && (name == "allow-local" || strings.HasPrefix(name, "allow-local=")) {
+			return true
+		}
+	}
+	return false
+}
+
+// isStrictOrigin reports whether o is a bare web origin as --allow-local
+// requires it: "https://host[:port]", or "http://localhost[:port]" /
+// "http://127.0.0.1[:port]" for a tool served locally. No path (not even
+// "/"), query, fragment or userinfo; "null" and "*" are not origins.
+func isStrictOrigin(o string) bool {
+	if strings.ContainsAny(o, "?#") {
+		return false
+	}
+	u, err := url.Parse(o)
+	if err != nil || u.Opaque != "" || u.User != nil || u.Path != "" || u.RawPath != "" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" || strings.HasSuffix(u.Host, ":") {
+		return false
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return false
+		}
+	}
+	switch u.Scheme {
+	case "https":
+		return net.ParseIP(host) != nil || validHostName(normHost(host))
+	case "http":
+		h := strings.ToLower(host)
+		return h == "localhost" || h == "127.0.0.1"
+	}
+	return false
+}
+
+// bannerInfo is what the start-up banner shows.
+type bannerInfo struct {
+	version      string
+	port         int
+	token        string
+	dnsLabel     string
+	origins      []string
+	allowAnyHost bool
+	allowLocal   []allowEntry
+	warnings     []string
+}
+
+// bannerLines renders the start-up banner, one string per output line. The
+// --allow-local entries appear only here, in the local terminal — never in an
+// HTTP response.
+func bannerLines(b bannerInfo) []string {
+	title := fmt.Sprintf("localproxy %s  —  ready", b.version)
+	addressLine := fmt.Sprintf("  Address  :  http://127.0.0.1:%d", b.port)
+	tokenLine := fmt.Sprintf("  Token    :  %s", b.token)
+	dnsLine := fmt.Sprintf("  DNS      :  %s", b.dnsLabel)
+	var originsLine string
+	if len(b.origins) > 0 {
+		originsLine = fmt.Sprintf("  Origins  :  %s", strings.Join(b.origins, ", "))
+	} else {
+		originsLine = "  Origins  :  (all — pass --origin for production)"
+	}
+	hostLine := "  Host     :  localhost only"
+	if b.allowAnyHost {
+		hostLine = "  Host     :  ANY (--allow-any-host — not recommended)"
+	}
+	// Lines after the Host line: --allow-local, then warnings. Absent
+	// without the new flags and positional arguments, so the v1.3.0 banner
+	// is unchanged.
+	var extraLines []string
+	if len(b.allowLocal) > 0 {
+		names := make([]string, 0, len(b.allowLocal))
+		for _, e := range b.allowLocal {
+			names = append(names, e.String())
+		}
+		extraLines = append(extraLines,
+			"  Local    :  "+strings.Join(names, ", "),
+			"  WARNING  :  local network access enabled for the allowed origins")
+	}
+	for _, w := range b.warnings {
+		extraLines = append(extraLines, "  WARNING  :  "+w)
+	}
+	licenseLine := fmt.Sprintf("  License  :  %s", License)
+	authorLine := fmt.Sprintf("  Author   :  %s [%s]", Author, AuthorURL)
+	repoLine := fmt.Sprintf("  Repo     :  %s", RepoURL)
+
+	// Determine box width from the longest content line (rune-aware for UTF-8)
+	runeWidth := func(s string) int { return utf8.RuneCountInString(s) }
+	innerWidth := runeWidth(title)
+	widthLines := []string{addressLine, tokenLine, dnsLine, originsLine, hostLine, licenseLine, authorLine, repoLine}
+	for _, line := range append(widthLines, extraLines...) {
+		if w := runeWidth(line); w > innerWidth {
+			innerWidth = w
+		}
+	}
+	innerWidth += 4 // 2 spaces padding on each side
+
+	hBar := strings.Repeat("═", innerWidth)
+	pad := func(s string) string {
+		gap := innerWidth - runeWidth(s) - 2 // subtract the 2 leading spaces inside ║
+		if gap < 0 {
+			gap = 0
+		}
+		return "║  " + s + strings.Repeat(" ", gap) + "║"
+	}
+
+	// Center the title
+	titlePad := (innerWidth - runeWidth(title)) / 2
+	titleRight := innerWidth - runeWidth(title) - titlePad
+	centeredTitle := "║" + strings.Repeat(" ", titlePad) + title + strings.Repeat(" ", titleRight) + "║"
+
+	thinBar := "╟" + strings.Repeat("─", innerWidth) + "╢"
+
+	lines := []string{
+		"",
+		"╔" + hBar + "╗",
+		centeredTitle,
+		"╠" + hBar + "╣",
+		pad(addressLine),
+		pad(tokenLine),
+		thinBar,
+		pad(dnsLine),
+		pad(originsLine),
+		pad(hostLine),
+	}
+	for _, line := range extraLines {
+		lines = append(lines, pad(line))
+	}
+	return append(lines,
+		thinBar,
+		pad(licenseLine),
+		pad(authorLine),
+		pad(repoLine),
+		"╚"+hBar+"╝",
+		"",
+		"  Enter the address and token in your online tool.",
+		"  Press Ctrl+C to stop.",
+		"",
+	)
+}
+
 // -----------------------------------------------------------------------
 // Entry point
 // -----------------------------------------------------------------------
@@ -3088,6 +4345,8 @@ func main() {
 	maxMB := flag.Int64("max-mb", 50, "Maximum upstream response size in megabytes (0 = unlimited)")
 	rawDNS := flag.String("dns", "1.1.1.1,8.8.8.8", `Comma-separated DNS servers (e.g. "9.9.9.9,8.8.4.4"), or "system" for OS defaults`)
 	allowAnyHost := flag.Bool("allow-any-host", false, "Accept requests with a non-localhost Host header (not recommended)")
+	var allowLocal listFlag
+	flag.Var(&allowLocal, "allow-local", `Comma-separated `+"`list`"+` of local targets the proxy may reach, e.g. "mysite.ddev.site,localhost:8888,10.0.5.0/24" (quote the list; IPv6 in brackets; without a port only 80/443; names reach loopback only). Off by default; requires --origin, and every --origin must then be https://host[:port] (or http://localhost[:port], http://127.0.0.1[:port]) without a path`)
 	showVersion := flag.Bool("version", false, "Print version information and exit")
 	flag.Parse()
 
@@ -3100,30 +4359,20 @@ func main() {
 	}
 
 	// ---- Validate flags --------------------------------------------------
-	// Caught here rather than surfacing later as a mystery: a zero timeout
-	// produces a context that is already past its deadline, so every single
-	// upstream request would fail instantly.
-	if *port < 0 || *port > 65535 {
-		log.Fatalf("fatal: --port must be between 0 and 65535, got %d", *port)
+	start, err := validateFlags(startFlags{
+		port:          *port,
+		timeoutSec:    *timeoutSec,
+		maxMB:         *maxMB,
+		rawOrigins:    *rawOrigins,
+		allowAnyHost:  *allowAnyHost,
+		allowLocal:    allowLocal.values,
+		allowLocalSet: allowLocal.set,
+		args:          flag.Args(),
+	})
+	if err != nil {
+		log.Fatalf("fatal: %v", err)
 	}
-	if *timeoutSec < 1 {
-		log.Fatalf("fatal: --timeout must be at least 1 second, got %d", *timeoutSec)
-	}
-	const maxAllowedMB = 1024 * 1024 // 1 TB; guards the byte multiplication below
-	if *maxMB < 0 || *maxMB > maxAllowedMB {
-		log.Fatalf("fatal: --max-mb must be between 0 and %d, got %d", maxAllowedMB, *maxMB)
-	}
-
-	// ---- Parse origins ---------------------------------------------------
-	var origins []string
-	if *rawOrigins != "" {
-		for _, o := range strings.Split(*rawOrigins, ",") {
-			trimmed := strings.TrimSpace(o)
-			if trimmed != "" {
-				origins = append(origins, trimmed)
-			}
-		}
-	}
+	origins := start.origins
 
 	// ---- Generate session token ------------------------------------------
 	token, err := generateToken(24) // 48 hex chars
@@ -3173,6 +4422,7 @@ func main() {
 		maxResponseBytes: *maxMB * 1024 * 1024,
 		resolver:         resolver,
 		allowAnyHost:     *allowAnyHost,
+		allowLocal:       start.allowLocal,
 	}
 
 	httpClient := newUpstreamClient(cfg)
@@ -3228,69 +4478,18 @@ func main() {
 	}
 
 	// ---- Print startup information ---------------------------------------
-	title := fmt.Sprintf("localproxy %s  —  ready", Version)
-	addressLine := fmt.Sprintf("  Address  :  http://127.0.0.1:%d", actualPort)
-	tokenLine := fmt.Sprintf("  Token    :  %s", token)
-	dnsLine := fmt.Sprintf("  DNS      :  %s", dnsLabel)
-	var originsLine string
-	if len(origins) > 0 {
-		originsLine = fmt.Sprintf("  Origins  :  %s", strings.Join(origins, ", "))
-	} else {
-		originsLine = "  Origins  :  (all — pass --origin for production)"
+	for _, line := range bannerLines(bannerInfo{
+		version:      Version,
+		port:         actualPort,
+		token:        token,
+		dnsLabel:     dnsLabel,
+		origins:      origins,
+		allowAnyHost: cfg.allowAnyHost,
+		allowLocal:   cfg.allowLocal,
+		warnings:     start.warnings,
+	}) {
+		fmt.Println(line)
 	}
-	hostLine := "  Host     :  localhost only"
-	if cfg.allowAnyHost {
-		hostLine = "  Host     :  ANY (--allow-any-host — not recommended)"
-	}
-	licenseLine := fmt.Sprintf("  License  :  %s", License)
-	authorLine := fmt.Sprintf("  Author   :  %s [%s]", Author, AuthorURL)
-	repoLine := fmt.Sprintf("  Repo     :  %s", RepoURL)
-
-	// Determine box width from the longest content line (rune-aware for UTF-8)
-	runeWidth := func(s string) int { return utf8.RuneCountInString(s) }
-	innerWidth := runeWidth(title)
-	for _, line := range []string{addressLine, tokenLine, dnsLine, originsLine, hostLine, licenseLine, authorLine, repoLine} {
-		if w := runeWidth(line); w > innerWidth {
-			innerWidth = w
-		}
-	}
-	innerWidth += 4 // 2 spaces padding on each side
-
-	hBar := strings.Repeat("═", innerWidth)
-	pad := func(s string) string {
-		gap := innerWidth - runeWidth(s) - 2 // subtract the 2 leading spaces inside ║
-		if gap < 0 {
-			gap = 0
-		}
-		return "║  " + s + strings.Repeat(" ", gap) + "║"
-	}
-
-	// Center the title
-	titlePad := (innerWidth - runeWidth(title)) / 2
-	titleRight := innerWidth - runeWidth(title) - titlePad
-	centeredTitle := "║" + strings.Repeat(" ", titlePad) + title + strings.Repeat(" ", titleRight) + "║"
-
-	thinBar := "╟" + strings.Repeat("─", innerWidth) + "╢"
-
-	fmt.Println()
-	fmt.Println("╔" + hBar + "╗")
-	fmt.Println(centeredTitle)
-	fmt.Println("╠" + hBar + "╣")
-	fmt.Println(pad(addressLine))
-	fmt.Println(pad(tokenLine))
-	fmt.Println(thinBar)
-	fmt.Println(pad(dnsLine))
-	fmt.Println(pad(originsLine))
-	fmt.Println(pad(hostLine))
-	fmt.Println(thinBar)
-	fmt.Println(pad(licenseLine))
-	fmt.Println(pad(authorLine))
-	fmt.Println(pad(repoLine))
-	fmt.Println("╚" + hBar + "╝")
-	fmt.Println()
-	fmt.Println("  Enter the address and token in your online tool.")
-	fmt.Println("  Press Ctrl+C to stop.")
-	fmt.Println()
 
 	// ---- Graceful shutdown -----------------------------------------------
 	quit := make(chan os.Signal, 1)
