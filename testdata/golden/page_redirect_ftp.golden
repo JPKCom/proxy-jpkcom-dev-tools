@@ -17,6 +17,7 @@
   "error": {
     "error": "blocked_target",
     "message": "blocked_target: redirect target uses an unsupported scheme",
+    "reason": "unsupported_scheme",
     "status": 502,
     "type": "Blocked target"
   },
@@ -42,6 +43,7 @@
     {
       "error": "blocked_target: redirect target uses an unsupported scheme",
       "errorCategory": "blocked_target",
+      "errorReason": "unsupported_scheme",
       "hop": 2,
       "ip": "",
       "ssl": false,

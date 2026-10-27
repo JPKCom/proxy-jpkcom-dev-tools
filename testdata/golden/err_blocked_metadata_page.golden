@@ -15,5 +15,6 @@
 {
   "error": "blocked_target",
   "message": "target resolves to a private or reserved address",
+  "reason": "always_blocked",
   "status": 403
 }

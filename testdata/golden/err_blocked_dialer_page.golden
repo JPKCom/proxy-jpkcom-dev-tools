@@ -17,6 +17,7 @@
   "error": {
     "error": "blocked_target",
     "message": "blocked_target: target resolves to a private or reserved address",
+    "reason": "private",
     "status": 502,
     "type": "Blocked target"
   },
@@ -32,6 +33,7 @@
     {
       "error": "blocked_target: target resolves to a private or reserved address",
       "errorCategory": "blocked_target",
+      "errorReason": "private",
       "hop": 1,
       "ip": "",
       "method": "HEAD",

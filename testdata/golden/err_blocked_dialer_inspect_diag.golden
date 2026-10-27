@@ -16,6 +16,7 @@
   "error": {
     "error": "blocked_target",
     "message": "target resolves to a private or reserved address",
+    "reason": "private",
     "status": 502,
     "type": "Blocked target"
   },

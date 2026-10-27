@@ -8,7 +8,7 @@
 < Access-Control-Allow-Origin: https://test.example.com
 < Access-Control-Allow-Private-Network: true
 < Access-Control-Max-Age: 600
-< Content-Length: 101
+< Content-Length: 127
 < Content-Type: application/json
 < Date: <date>
 < Vary: Origin
@@ -17,5 +17,6 @@
 {
   "error": "blocked_target",
   "message": "target resolves to a private or reserved address",
+  "reason": "always_blocked",
   "status": 403
 }
