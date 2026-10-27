@@ -1,0 +1,28 @@
+> GET /proxy?url=http://127.0.0.1:<plain-port>/markdown&follow=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+> Accept: text/markdown, text/plain;q=0.9, */*;q=0.1
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Expose-Headers: Content-Length, Content-Type, Date, Vary, X-Upstream-Content-Encoding, X-Upstream-Content-Length, X-Upstream-Final-URL, X-Upstream-IP, X-Upstream-Location, X-Upstream-Protocol, X-Upstream-Redirects, X-Upstream-Timing, X-Upstream-Truncated
+< Access-Control-Max-Age: 600
+< Content-Length: 25
+< Content-Type: text/markdown; charset=utf-8
+< Date: <date>
+< Vary: Origin
+< Vary: Accept
+< X-Content-Type-Options: nosniff
+< X-Upstream-Content-Length: 25
+< X-Upstream-Final-Url: http://127.0.0.1:<plain-port>/markdown
+< X-Upstream-Ip: 127.0.0.1
+< X-Upstream-Protocol: HTTP/1.1
+< X-Upstream-Redirects: 0
+< X-Upstream-Timing: dns=<ms>;tcp=<ms>;ssl=<ms>;ttfb=<ms>;total=<ms>
+
+# Golden
+
+Markdown body.

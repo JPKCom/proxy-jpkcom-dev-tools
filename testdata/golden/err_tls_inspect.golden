@@ -1,0 +1,20 @@
+> GET /inspect?url=https://127.0.0.1:<tls-port>/ok
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 502
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "error": "tls_error",
+  "message": "TLS certificate signed by unknown authority",
+  "status": 502,
+  "type": "Self-signed certificate"
+}

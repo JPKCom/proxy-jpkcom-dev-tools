@@ -1,0 +1,126 @@
+> GET /inspect?url=https://127.0.0.1:<tls-port>/ok&diag=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "headers": {
+    "Access-Control-Allow-Origin": [
+      "https://upstream.example"
+    ],
+    "Alt-Svc": [
+      "h3=\":443\"; ma=86400"
+    ],
+    "Cache-Control": [
+      "max-age=60"
+    ],
+    "Content-Type": [
+      "text/html; charset=utf-8"
+    ],
+    "Date": [
+      "<date>"
+    ],
+    "Link": [
+      "</style.css>; rel=preload; as=style"
+    ],
+    "Server": [
+      "golden-target"
+    ],
+    "Set-Cookie": [
+      "a=1; Path=/; Expires=Wed, 01 Jan 2031 00:00:00 GMT",
+      "b=2; Path=/; HttpOnly"
+    ],
+    "X-Custom": [
+      "hello"
+    ]
+  },
+  "http3": true,
+  "ip": "127.0.0.1",
+  "maxBodySize": 1048576,
+  "method": "HEAD",
+  "protocol": "HTTP/1.1",
+  "ssl": {
+    "bits": 128,
+    "certSource": "connection",
+    "chain": [
+      {
+        "daysLeft": "<days>",
+        "isCA": true,
+        "issuer": "golden.test",
+        "issuerDN": "O=JPKCom Golden Test, CN=golden.test",
+        "issuerOrg": "JPKCom Golden Test",
+        "key": "EC P-256 (256 bit)",
+        "keyBits": null,
+        "label": "Server certificate",
+        "pem": "-----BEGIN CERTIFICATE-----\nMIIB2zCCAYGgAwIBAgIEATUoozAKBggqhkjOPQQDAjAzMRswGQYDVQQKExJKUEtD\nb20gR29sZGVuIFRlc3QxFDASBgNVBAMTC2dvbGRlbi50ZXN0MCAXDTI2MDEwMTAw\nMDAwMFoYDzIxMjYwMTAxMDAwMDAwWjAzMRswGQYDVQQKExJKUEtDb20gR29sZGVu\nIFRlc3QxFDASBgNVBAMTC2dvbGRlbi50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D\nAQcDQgAEWSZdqVdqsoZF6y73nTieiEQ0ocS+ORVOHh86KI+g7vR4rpEn633xDvOe\nJB4H/MvcncsoixaVLbNKeJ2isFIOPKOBgDB+MA4GA1UdDwEB/wQEAwIChDATBgNV\nHSUEDDAKBggrBgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBQRhuzG\nXMi2PijGGmVn9O1Tw55aJDAnBgNVHREEIDAeggtnb2xkZW4udGVzdIIJbG9jYWxo\nb3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQCeh+Ux6luvtG14ntliI5j0kjWe\nCIuUU/YmnAvRnDvZ/QIgcrhDa5ZFzu7Pl8EiOjUJeUGlpePOS7nH+ZF7EZdft4U=\n-----END CERTIFICATE-----\n",
+        "position": 1,
+        "sans": [
+          "golden.test",
+          "localhost",
+          "127.0.0.1"
+        ],
+        "selfIssued": true,
+        "serial": "01:35:28:A3",
+        "sha1": "FC:46:83:A8:8B:67:66:38:FE:12:1F:C9:A4:DC:88:61:89:A6:C1:E0",
+        "sha256": "31:39:85:42:B5:C8:86:E5:5B:CE:BC:82:67:53:E6:6A:A4:D3:38:64:AC:5D:A4:91:DA:37:8E:46:EF:9F:55:74",
+        "signatureAlgorithm": "ecdsa-with-SHA256",
+        "signatureValid": true,
+        "subject": "golden.test",
+        "subjectDN": "O=JPKCom Golden Test, CN=golden.test",
+        "subjectOrg": "JPKCom Golden Test",
+        "validFrom": "2026-01-01 00:00:00 UTC",
+        "validFromTs": 1767225600,
+        "validUntil": "2126-01-01 00:00:00 UTC",
+        "validUntilTs": 4922899200
+      }
+    ],
+    "cipher": "TLS_AES_128_GCM_SHA256",
+    "cipherSuite": "TLS_AES_128_GCM_SHA256",
+    "daysLeft": "<days>",
+    "error": null,
+    "errorType": null,
+    "hostMatch": true,
+    "issuer": "golden.test",
+    "issuerOrg": "JPKCom Golden Test",
+    "issues": [
+      {
+        "msg": "The certificate is self-signed — browsers will not trust it.",
+        "type": "error"
+      }
+    ],
+    "organization": "JPKCom Golden Test",
+    "protocol": "TLSv1.3",
+    "publicKeyAlgorithm": "ECDSA",
+    "sans": [
+      "golden.test",
+      "localhost",
+      "127.0.0.1"
+    ],
+    "selfSigned": true,
+    "signatureAlgorithm": "ECDSA-SHA256",
+    "subject": "golden.test",
+    "valid": true,
+    "validFrom": "2026-01-01T00:00:00Z",
+    "validTo": "2126-01-01T00:00:00Z",
+    "verified": true,
+    "version": "TLS 1.3"
+  },
+  "status": 200,
+  "timing": {
+    "dnsLookup": "<ms>",
+    "sslHandshake": "<ms>",
+    "tcpConnect": "<ms>",
+    "total": "<ms>",
+    "ttfb": "<ms>"
+  },
+  "truncated": false
+}

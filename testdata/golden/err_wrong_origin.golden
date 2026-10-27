@@ -1,0 +1,9 @@
+> GET /proxy?url=http://127.0.0.1:<plain-port>/ok
+> Origin: https://evil.example
+> X-Proxy-Token: <token>
+
+< 403
+< Content-Type: text/plain; charset=utf-8
+< X-Content-Type-Options: nosniff
+
+forbidden: origin not allowed

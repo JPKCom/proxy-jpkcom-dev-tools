@@ -1,0 +1,51 @@
+> GET /page?url=http://127.0.0.1:<plain-port>/slow&diag=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "contentEncoding": "",
+  "error": {
+    "error": "timeout",
+    "message": "timeout: upstream request timed out",
+    "status": 504,
+    "type": "Connection timeout"
+  },
+  "finalUrl": "http://127.0.0.1:<plain-port>/slow",
+  "headers": null,
+  "html": "",
+  "http3": false,
+  "httpVersion": "",
+  "ip": "127.0.0.1",
+  "maxBodySize": 1048576,
+  "rawHeaders": "",
+  "redirectChain": [
+    {
+      "error": "timeout: upstream request timed out",
+      "errorCategory": "timeout",
+      "hop": 1,
+      "ip": "127.0.0.1",
+      "method": "HEAD",
+      "ssl": false,
+      "status": 0,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/slow"
+    }
+  ],
+  "size": 0,
+  "ssl": null,
+  "status": 0,
+  "timing": null,
+  "transferSize": 0,
+  "truncated": false,
+  "url": "http://127.0.0.1:<plain-port>/slow"
+}

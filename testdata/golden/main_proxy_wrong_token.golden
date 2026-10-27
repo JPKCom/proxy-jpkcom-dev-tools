@@ -1,0 +1,21 @@
+> GET /proxy?url=https://example.com/
+> Origin: https://test.example.com
+> X-Proxy-Token: wrong-token
+
+< 403
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Length: 78
+< Content-Type: application/json
+< Date: <date>
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "error": "forbidden",
+  "message": "invalid or missing proxy token",
+  "status": 403
+}

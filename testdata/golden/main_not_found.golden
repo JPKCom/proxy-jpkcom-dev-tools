@@ -1,0 +1,10 @@
+> GET /nope
+> Origin: https://test.example.com
+
+< 404
+< Content-Length: 19
+< Content-Type: text/plain; charset=utf-8
+< Date: <date>
+< X-Content-Type-Options: nosniff
+
+404 page not found

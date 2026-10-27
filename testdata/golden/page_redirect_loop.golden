@@ -1,0 +1,61 @@
+> GET /page?url=http://127.0.0.1:<plain-port>/loop&diag=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "contentEncoding": "",
+  "error": {
+    "error": "redirect_loop",
+    "message": "redirect loop detected",
+    "status": 502,
+    "type": "Redirect loop detected"
+  },
+  "finalUrl": "http://127.0.0.1:<plain-port>/loop",
+  "headers": null,
+  "html": "",
+  "http3": false,
+  "httpVersion": "",
+  "ip": "",
+  "maxBodySize": 1048576,
+  "rawHeaders": "",
+  "redirectChain": [
+    {
+      "hop": 1,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/loop",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /loop\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/loop"
+    },
+    {
+      "error": "redirect loop detected",
+      "errorCategory": "redirect_loop",
+      "hop": 2,
+      "ip": "",
+      "ssl": false,
+      "status": 0,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/loop"
+    }
+  ],
+  "size": 0,
+  "ssl": null,
+  "status": 0,
+  "timing": null,
+  "transferSize": 0,
+  "truncated": false,
+  "url": "http://127.0.0.1:<plain-port>/loop"
+}

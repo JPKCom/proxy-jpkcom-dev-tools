@@ -1,0 +1,15 @@
+> GET /ping
+> Origin: https://evil.example
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Length: 14
+< Content-Type: text/plain
+< Date: <date>
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+localproxy ok

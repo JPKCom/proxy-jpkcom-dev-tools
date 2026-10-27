@@ -1,0 +1,66 @@
+> GET /page?url=http://127.0.0.1:<plain-port>/gzip&diag=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "contentEncoding": "gzip",
+  "error": null,
+  "finalUrl": "http://127.0.0.1:<plain-port>/gzip",
+  "headers": {
+    "Content-Encoding": [
+      "gzip"
+    ],
+    "Content-Length": [
+      "55"
+    ],
+    "Content-Type": [
+      "text/html; charset=utf-8"
+    ],
+    "Date": [
+      "<date>"
+    ]
+  },
+  "html": "<p>compressed golden body</p>\n",
+  "http3": false,
+  "httpVersion": "HTTP/1.1",
+  "ip": "127.0.0.1",
+  "maxBodySize": 1048576,
+  "rawHeaders": "HTTP/1.1 200 OK\nContent-Encoding: gzip\nContent-Length: 55\nContent-Type: text/html; charset=utf-8\nDate: <date>\n",
+  "redirectChain": [
+    {
+      "hop": 1,
+      "ip": "127.0.0.1",
+      "method": "GET",
+      "rawHeaders": "HTTP/1.1 200 OK\nContent-Encoding: gzip\nContent-Length: 55\nContent-Type: text/html; charset=utf-8\nDate: <date>\n",
+      "ssl": false,
+      "status": 200,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/gzip"
+    }
+  ],
+  "size": 30,
+  "ssl": null,
+  "status": 200,
+  "timing": {
+    "dnsLookup": "<ms>",
+    "downloadSize": 30,
+    "speed": 0,
+    "sslHandshake": "<ms>",
+    "tcpConnect": "<ms>",
+    "total": "<ms>",
+    "ttfb": "<ms>"
+  },
+  "transferSize": 55,
+  "truncated": false,
+  "url": "http://127.0.0.1:<plain-port>/gzip"
+}

@@ -1,0 +1,20 @@
+> GET /proxy?url=http://127.0.0.1:<plain-port>/redirect-blocked&follow=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 403
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "error": "blocked_target",
+  "message": "redirect target resolves to a private or reserved address",
+  "status": 403,
+  "type": "Blocked target"
+}

@@ -1,0 +1,11 @@
+> GET /ping
+> Host: evil.example
+> Origin: https://test.example.com
+
+< 403
+< Content-Length: 48
+< Content-Type: text/plain; charset=utf-8
+< Date: <date>
+< X-Content-Type-Options: nosniff
+
+forbidden: proxy must be addressed as localhost

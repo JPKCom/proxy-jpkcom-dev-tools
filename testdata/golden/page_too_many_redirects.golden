@@ -1,0 +1,281 @@
+> GET /page?url=http://127.0.0.1:<plain-port>/hop/0&diag=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "contentEncoding": "",
+  "error": {
+    "error": "too_many_redirects",
+    "message": "too_many_redirects: more than 20 redirects",
+    "status": 502,
+    "type": "Too many redirects"
+  },
+  "finalUrl": "http://127.0.0.1:<plain-port>/hop/21",
+  "headers": null,
+  "html": "",
+  "http3": false,
+  "httpVersion": "",
+  "ip": "",
+  "maxBodySize": 1048576,
+  "rawHeaders": "",
+  "redirectChain": [
+    {
+      "hop": 1,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/1",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/1\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/0"
+    },
+    {
+      "hop": 2,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/2",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/2\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/1"
+    },
+    {
+      "hop": 3,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/3",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/3\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/2"
+    },
+    {
+      "hop": 4,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/4",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/4\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/3"
+    },
+    {
+      "hop": 5,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/5",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/5\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/4"
+    },
+    {
+      "hop": 6,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/6",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/6\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/5"
+    },
+    {
+      "hop": 7,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/7",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/7\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/6"
+    },
+    {
+      "hop": 8,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/8",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/8\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/7"
+    },
+    {
+      "hop": 9,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/9",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/9\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/8"
+    },
+    {
+      "hop": 10,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/10",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/10\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/9"
+    },
+    {
+      "hop": 11,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/11",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/11\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/10"
+    },
+    {
+      "hop": 12,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/12",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/12\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/11"
+    },
+    {
+      "hop": 13,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/13",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/13\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/12"
+    },
+    {
+      "hop": 14,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/14",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/14\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/13"
+    },
+    {
+      "hop": 15,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/15",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/15\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/14"
+    },
+    {
+      "hop": 16,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/16",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/16\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/15"
+    },
+    {
+      "hop": 17,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/17",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/17\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/16"
+    },
+    {
+      "hop": 18,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/18",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/18\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/17"
+    },
+    {
+      "hop": 19,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/19",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/19\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/18"
+    },
+    {
+      "hop": 20,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/20",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/20\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/19"
+    },
+    {
+      "hop": 21,
+      "ip": "127.0.0.1",
+      "location": "http://127.0.0.1:<plain-port>/hop/21",
+      "method": "HEAD",
+      "rawHeaders": "HTTP/1.1 302 Found\nDate: <date>\nLocation: /hop/21\n",
+      "ssl": false,
+      "status": 302,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/20"
+    },
+    {
+      "error": "too_many_redirects: more than 20 redirects",
+      "errorCategory": "too_many_redirects",
+      "hop": 22,
+      "ip": "",
+      "ssl": false,
+      "status": 0,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/hop/21"
+    }
+  ],
+  "size": 0,
+  "ssl": null,
+  "status": 0,
+  "timing": null,
+  "transferSize": 0,
+  "truncated": false,
+  "url": "http://127.0.0.1:<plain-port>/hop/0"
+}

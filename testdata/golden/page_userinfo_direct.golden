@@ -1,0 +1,63 @@
+> GET /page?url=http://user:pa55@127.0.0.1:<plain-port>/auth&diag=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "contentEncoding": "",
+  "error": null,
+  "finalUrl": "http://user:pa55@127.0.0.1:<plain-port>/auth",
+  "headers": {
+    "Content-Length": [
+      "35"
+    ],
+    "Content-Type": [
+      "text/plain; charset=utf-8"
+    ],
+    "Date": [
+      "<date>"
+    ]
+  },
+  "html": "basic=true user=\"user\" pass=\"pa55\"\n",
+  "http3": false,
+  "httpVersion": "HTTP/1.1",
+  "ip": "127.0.0.1",
+  "maxBodySize": 1048576,
+  "rawHeaders": "HTTP/1.1 200 OK\nContent-Length: 35\nContent-Type: text/plain; charset=utf-8\nDate: <date>\n",
+  "redirectChain": [
+    {
+      "hop": 1,
+      "ip": "127.0.0.1",
+      "method": "GET",
+      "rawHeaders": "HTTP/1.1 200 OK\nContent-Length: 35\nContent-Type: text/plain; charset=utf-8\nDate: <date>\n",
+      "ssl": false,
+      "status": 200,
+      "timing": "<ms>",
+      "url": "http://user:pa55@127.0.0.1:<plain-port>/auth"
+    }
+  ],
+  "size": 35,
+  "ssl": null,
+  "status": 200,
+  "timing": {
+    "dnsLookup": "<ms>",
+    "downloadSize": 35,
+    "speed": 0,
+    "sslHandshake": "<ms>",
+    "tcpConnect": "<ms>",
+    "total": "<ms>",
+    "ttfb": "<ms>"
+  },
+  "transferSize": 35,
+  "truncated": false,
+  "url": "http://user:pa55@127.0.0.1:<plain-port>/auth"
+}

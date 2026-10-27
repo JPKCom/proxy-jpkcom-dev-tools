@@ -1,0 +1,57 @@
+> GET /inspect?url=http://127.0.0.1:<plain-port>/upstream-headers
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "headers": {
+    "Content-Length": [
+      "16"
+    ],
+    "Content-Type": [
+      "text/plain; charset=utf-8"
+    ],
+    "Date": [
+      "<date>"
+    ],
+    "X-Upstream-Auth": [
+      "sent"
+    ],
+    "X-Upstream-Final-Url": [
+      "https://evil.example/final"
+    ],
+    "X-Upstream-Ip": [
+      "203.0.113.66"
+    ],
+    "X-Upstream-Location": [
+      "https://evil.example/forged"
+    ],
+    "X-Upstream-Redirects": [
+      "9"
+    ]
+  },
+  "http3": false,
+  "ip": "127.0.0.1",
+  "maxBodySize": 1048576,
+  "method": "HEAD",
+  "protocol": "HTTP/1.1",
+  "ssl": null,
+  "status": 200,
+  "timing": {
+    "dnsLookup": "<ms>",
+    "sslHandshake": "<ms>",
+    "tcpConnect": "<ms>",
+    "total": "<ms>",
+    "ttfb": "<ms>"
+  },
+  "truncated": false
+}

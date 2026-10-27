@@ -1,0 +1,86 @@
+> GET /page?url=http://127.0.0.1:<plain-port>/ok&diag=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "contentEncoding": "",
+  "error": null,
+  "finalUrl": "http://127.0.0.1:<plain-port>/ok",
+  "headers": {
+    "Access-Control-Allow-Origin": [
+      "https://upstream.example"
+    ],
+    "Alt-Svc": [
+      "h3=\":443\"; ma=86400"
+    ],
+    "Cache-Control": [
+      "max-age=60"
+    ],
+    "Content-Length": [
+      "87"
+    ],
+    "Content-Type": [
+      "text/html; charset=utf-8"
+    ],
+    "Date": [
+      "<date>"
+    ],
+    "Link": [
+      "</style.css>; rel=preload; as=style"
+    ],
+    "Server": [
+      "golden-target"
+    ],
+    "Set-Cookie": [
+      "a=1; Path=/; Expires=Wed, 01 Jan 2031 00:00:00 GMT",
+      "b=2; Path=/; HttpOnly"
+    ],
+    "X-Custom": [
+      "hello"
+    ]
+  },
+  "html": "<!doctype html><html><head><title>Golden</title></head><body><h1>ok</h1></body></html>\n",
+  "http3": true,
+  "httpVersion": "HTTP/1.1",
+  "ip": "127.0.0.1",
+  "maxBodySize": 1048576,
+  "rawHeaders": "HTTP/1.1 200 OK\nAccess-Control-Allow-Origin: https://upstream.example\nAlt-Svc: h3=\":443\"; ma=86400\nCache-Control: max-age=60\nContent-Length: 87\nContent-Type: text/html; charset=utf-8\nDate: <date>\nLink: </style.css>; rel=preload; as=style\nServer: golden-target\nSet-Cookie: a=1; Path=/; Expires=Wed, 01 Jan 2031 00:00:00 GMT\nSet-Cookie: b=2; Path=/; HttpOnly\nX-Custom: hello\n",
+  "redirectChain": [
+    {
+      "hop": 1,
+      "ip": "127.0.0.1",
+      "method": "GET",
+      "rawHeaders": "HTTP/1.1 200 OK\nAccess-Control-Allow-Origin: https://upstream.example\nAlt-Svc: h3=\":443\"; ma=86400\nCache-Control: max-age=60\nContent-Length: 87\nContent-Type: text/html; charset=utf-8\nDate: <date>\nLink: </style.css>; rel=preload; as=style\nServer: golden-target\nSet-Cookie: a=1; Path=/; Expires=Wed, 01 Jan 2031 00:00:00 GMT\nSet-Cookie: b=2; Path=/; HttpOnly\nX-Custom: hello\n",
+      "server": "golden-target",
+      "ssl": false,
+      "status": 200,
+      "timing": "<ms>",
+      "url": "http://127.0.0.1:<plain-port>/ok"
+    }
+  ],
+  "size": 87,
+  "ssl": null,
+  "status": 200,
+  "timing": {
+    "dnsLookup": "<ms>",
+    "downloadSize": 87,
+    "speed": 0,
+    "sslHandshake": "<ms>",
+    "tcpConnect": "<ms>",
+    "total": "<ms>",
+    "ttfb": "<ms>"
+  },
+  "transferSize": 87,
+  "truncated": false,
+  "url": "http://127.0.0.1:<plain-port>/ok"
+}

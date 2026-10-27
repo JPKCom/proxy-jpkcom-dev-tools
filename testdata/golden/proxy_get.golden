@@ -1,0 +1,29 @@
+> GET /proxy?url=http://127.0.0.1:<plain-port>/ok
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Expose-Headers: Alt-Svc, Cache-Control, Content-Length, Content-Type, Date, Link, Server, Set-Cookie, X-Custom, X-Upstream-Content-Encoding, X-Upstream-Content-Length, X-Upstream-Final-URL, X-Upstream-IP, X-Upstream-Location, X-Upstream-Protocol, X-Upstream-Redirects, X-Upstream-Timing, X-Upstream-Truncated
+< Access-Control-Max-Age: 600
+< Alt-Svc: h3=":443"; ma=86400
+< Cache-Control: max-age=60
+< Content-Length: 87
+< Content-Type: text/html; charset=utf-8
+< Date: <date>
+< Link: </style.css>; rel=preload; as=style
+< Server: golden-target
+< Set-Cookie: a=1; Path=/; Expires=Wed, 01 Jan 2031 00:00:00 GMT
+< Set-Cookie: b=2; Path=/; HttpOnly
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+< X-Custom: hello
+< X-Upstream-Content-Length: 87
+< X-Upstream-Ip: 127.0.0.1
+< X-Upstream-Protocol: HTTP/1.1
+< X-Upstream-Timing: dns=<ms>;tcp=<ms>;ssl=<ms>;ttfb=<ms>;total=<ms>
+
+<!doctype html><html><head><title>Golden</title></head><body><h1>ok</h1></body></html>

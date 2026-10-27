@@ -1,0 +1,13 @@
+> OPTIONS /proxy
+> Origin: https://test.example.com
+> Access-Control-Request-Method: GET
+> Access-Control-Request-Headers: x-proxy-token
+
+< 204
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Vary: Origin
+

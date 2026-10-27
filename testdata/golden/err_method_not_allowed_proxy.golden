@@ -1,0 +1,20 @@
+> PUT /proxy?url=http://127.0.0.1:<plain-port>/ok
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 405
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Allow: GET, HEAD, POST
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "error": "method_not_allowed",
+  "message": "method not allowed on this endpoint",
+  "status": 405
+}

@@ -1,0 +1,45 @@
+> GET /inspect?url=http://127.0.0.1:<plain-port>/echo&body=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+> Accept: text/html
+> User-Agent: GoldenBrowser/1.0
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "body": "{\"body\":\"\",\"headers\":{\"Accept\":[\"text/html\"],\"Accept-Encoding\":[\"gzip, deflate\"],\"Connection\":[\"close\"],\"User-Agent\":[\"GoldenBrowser/1.0\"]},\"method\":\"GET\",\"uri\":\"/echo\"}\n",
+  "headers": {
+    "Content-Length": [
+      "170"
+    ],
+    "Content-Type": [
+      "application/json"
+    ],
+    "Date": [
+      "<date>"
+    ]
+  },
+  "http3": false,
+  "ip": "127.0.0.1",
+  "maxBodySize": 1048576,
+  "method": "GET",
+  "protocol": "HTTP/1.1",
+  "ssl": null,
+  "status": 200,
+  "timing": {
+    "dnsLookup": "<ms>",
+    "sslHandshake": "<ms>",
+    "tcpConnect": "<ms>",
+    "total": "<ms>",
+    "ttfb": "<ms>"
+  },
+  "truncated": false
+}
