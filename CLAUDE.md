@@ -14,8 +14,8 @@ This proxy is the **"Expertenmodus"** companion for the **JPKCom Tools** project
 
 ## Language & Stack
 
-- **Language:** Go (single-file, no external dependencies — stdlib only)
-- **Entry point:** `main.go` (contains all logic)
+- **Language:** Go (no external dependencies — stdlib only)
+- **Entry point:** `main.go` (contains all logic). Since v1.4.0 two small platform files hold the OS-specific part of `--token-file`: `tokenfile_unix.go` (`//go:build unix`: `O_NOFOLLOW`, owner/mode checks) and `tokenfile_other.go` (`//go:build !unix`, in practice Windows: no permission check, banner warning outside the user profile)
 - **Go version:** 1.27 series — `go.mod` declares `go 1.27.3`; CI pin is `go-version: "1.27"` (auto-resolves to latest 1.27.x patch). Release builds since v1.2.4 use 1.27.3+ (security release, `crypto/x509` distrust). Building with 1.27 raises the macOS floor for the darwin binaries to **macOS 13 Ventura**.
 - **Module:** `github.com/jpk/localproxy` (`go.mod`)
 
@@ -31,7 +31,20 @@ GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o localproxy-windows-amd64.exe .
 
 # Run
-./localproxy [--port 8765] [--origin https://example.com] [--timeout 30] [--max-mb 50] [--dns "1.1.1.1,8.8.8.8"] [--allow-any-host]
+./localproxy [--port 8765] [--origin https://example.com] [--timeout 30] [--max-mb 50] [--dns "1.1.1.1,8.8.8.8"] [--allow-any-host] \
+             [--allow-local "mysite.ddev.site,localhost:8888"] [--token-file "$HOME/.config/localproxy/token"]
+```
+
+All nine release targets locally (what the `build` job does; `-X main.Version=<tag>`):
+
+```bash
+for t in linux/amd64/linux-amd64 linux/arm64/linux-arm64 darwin/amd64/macos-intel darwin/arm64/macos-apple-silicon \
+         windows/amd64/windows-amd64.exe freebsd/amd64/freebsd-amd64 freebsd/arm64/freebsd-arm64 \
+         openbsd/amd64/openbsd-amd64 netbsd/amd64/netbsd-amd64; do
+  os=${t%%/*}; r=${t#*/}; arch=${r%%/*}; suf=${r#*/}
+  GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -ldflags="-s -w -X main.Version=dev" -trimpath -o dist/localproxy-$suf .
+done
+(cd dist && sha256sum localproxy-* > SHA256SUMS && sha256sum -c SHA256SUMS)
 ```
 
 ## CI/CD
@@ -40,7 +53,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 - Three jobs: `verify` → `build` → `release`
 - `verify` runs on **every push to main and every PR**, plus on tags: `gofmt`, `go vet`, `staticcheck`, `govulncheck`, `go test -race`
 - `build` only runs on tags / `workflow_dispatch`; cross-compiles for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64, freebsd/amd64, freebsd/arm64, openbsd/amd64, netbsd/amd64
-- `release` creates a GitHub Release with all binaries via `softprops/action-gh-release@v2`
+- `release` (since v1.4.0) writes `SHA256SUMS` for the nine binaries (fails unless exactly nine are present, then `sha256sum -c`), takes `.github/release-notes/<tag>.md` as release text when it exists (GitHub's generated notes are appended), and creates a **draft** GitHub Release with all files via `softprops/action-gh-release@v2`. The draft is published by hand after the JPKCom Tools deploy
 - `GITHUB_TOKEN` is read-only at workflow level; only `release` gets `contents: write`
 - Injects version via `-ldflags "-X main.Version=$TAG"` into `var Version` in `main.go`
 
@@ -48,8 +61,13 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 
 Single-file proxy with these components (all in `main.go`):
 
-- **config struct** — runtime configuration (port, allowed origins, session token, timeouts, response cap, DNS resolver, `allowAnyHost`, plus the test-only hooks `dialControl` and `rootCAs` — `main` never sets them). Methods: `blocksHost` (SSRF pre-check), `tokenValid` (constant-time), `pageBudget` (overall `/page` deadline), `dialControlOrDefault` (falls back to `safeDialControl`, so production code can never dial without it)
-- **authorizeRequest** — shared handler preamble: CORS preflight, origin, method, token, target URL parse, SSRF pre-check. Writes its own error response and returns `(target, false)` when the caller must stop. Used by all three authenticated endpoints (answers their OPTIONS preflights too)
+- **config struct** — runtime configuration (port, allowed origins, session token, `tokenPersistent`, timeouts, response cap, DNS resolver, `allowAnyHost`, `allowLocal` (parsed `--allow-local` entries), plus the test-only hooks `ssrfCheck`, `dialControl`, `rootCAs` and `lookupIP` — `main` never sets them). Methods: `precheck` / `precheckHost` (SSRF pre-check with block reason; replaces the old `blocksHost`), `resolveHost` (the **one** resolution hook: `lookupIP` in tests, else `resolver` — used by the pre-check, `localGuard` and, when `lookupIP` is set, the base dial path), `tokenValid` (constant-time), `pageBudget` (overall `/page` deadline), `dialControlOrDefault` (falls back to `safeDialControl`, so production code can never dial without it), `allowLocalActive` / `allowLocalMatch` / `allowLocalMatchURL` (syntactic list match, no DNS), `localVerdict` / `blockReason` (one decision for pre-check, dialer and TLS probe)
+- **authorizeRequest(w, r, cfg, endpoint, methods…)** — shared handler preamble, fixed order: CORS preflight, origin, method, token, target URL parse, `checkTargetAuth` (credential rules; also strips userinfo from the target), `localStart := allowLocalMatchURL(target)`, SSRF pre-check (`blocked_target` + `reason`), then `insecure_scheme` (header credentials over http to a non-listed target). Returns `*authorizedRequest{target, localStart, creds}`; writes its own error response and returns `false` when the caller must stop. Used by all three authenticated endpoints (answers their OPTIONS preflights too). The token is checked before the `url`, so `GET /inspect` with a token and without `url` is the token probe (TOK-1: 400 valid / 403 invalid, nothing contacted)
+- **Target credentials (since v1.4.0)** — `checkTargetAuth` (AUTH-2…13: form, `X-Target-Origin`, endpoint, GET/HEAD, override guard, userinfo; `reason` constants `reason*`, messages in `authRefused`), `writesViaOverride` / `phpURLDecode` (rebuilds how PHP fills `$_GET` — splits at `&` and `;`, `.`/space → `_`, `[`, NUL; the value is compared with `asciiUpper` like PHP 8's `strtoupper`, never the Unicode `strings.ToUpper`, which maps `OPTıONS` to `OPTIONS`), `originOf` (scheme + host + effective port). Credentials travel on the request **context** (`withTargetAuth` / `targetAuthFrom`), and `attachTargetAuth` — called last in `doTraced` (after the tweak) and in `probeContentEncoding`, both of which build their request with `newUpstreamRequest` (strips userinfo, picks the header copier) — is the **only** place that sets `Authorization`: only to the credentials' origin and only for a URL that passes the override guard; otherwise it marks `withheld`. With credentials `copyAllowedRequestHeaders` (allowlist) replaces `copyRequestHeaders`. `/proxy` ends a `follow=1` chain before another origin (`withheld-cross-origin`) or a writing override (`withheld-method-override`), sets `X-Upstream-Auth`, `no-store` + `X-Upstream-Cache-Control` (drops `ETag`/`Expires`); `varyTargetAuthWriter` adds `Vary: X-Target-Authorization` to every `/proxy` response. Nothing of the value is ever logged or echoed (LOG-1)
+- **Local targets (`--allow-local`, since v1.4.0)** — `parseAllowLocal` / `parseAllowEntry` (syntax, wildcards, dangerous ports, ranges), `validateFlags` (needs `--origin` with strict https origins, not with `--allow-any-host`, leftover positional args fatal). Enforcement: `localGuard` is the transport's `DialContext`; it resolves itself (via `resolveHost`), runs `localVerdict` per IP and dials the IP **literal** through `exactAddressControl` (admits exactly that `ip:port`, everything else goes to `dialControlOrDefault`). Context values: `localStart` (`withLocalStart` / `localStartFrom`; missing = false, fail closed) and `authOverHTTP` (`withAuthOverHTTP`; then only loopback, else `errInsecureAuth` → `auth_refused`/`insecure_scheme`, via `loopbackOnlyControl`). `localSplitTransport` keeps local and public requests in separate pools. **Security dependency:** both context values are only correct because every connection serves exactly one request — `DisableKeepAlives: true` (commented at the line, test `TestAllowLocal_NoConnectionReuse`). `refineBlocked` turns dialer errors into `blockedError{reason}` (`Unwrap() → errBlockedTarget`). Redirect hops: `redirect_into_local` when a non-local start redirects to a listed target. The TLS probe uses the same allowance
+- **pingHandler / versionHandler (since v1.4.0 out of `main`)** — `/ping` unchanged. `/version` = `versionResponse` (old five string keys first, then `capabilities`, `localTargets`, `tokenPersistent`, `limits`, optional `proof`). `capabilities` is a package var (the list only grows). `?challenge=<64 hex>` → `proof = hex(HMAC-SHA256(key = token as 48 ASCII chars, "localproxy-proof:" + port + ":" + challenge))` (`versionProof`; `port` = local port of the connection via `http.LocalAddrContextKey`, `cfg.port` only as fallback, never the Host header — stops a relay from a squatted old port) plus `Cache-Control: no-store`; an invalid or repeated challenge is ignored
+- **Token file (since v1.4.0)** — `checkTokenFilePath` (absolute, no `%`/`$`/leading `~`), `loadOrCreateToken(path) (token, created, err)`: `MkdirAll(0700)`, `checkTokenDir`, `readTokenFile` (platform `openTokenFile` + `checkTokenFileInfo`, content `^[0-9a-f]{48}$` after `TrimSpace`); missing → temp file `0600` + `Sync` + `os.Link` (EEXIST → read the winner's file), temp file always removed. Flag type `optionalFlag` (knows "given but empty")
+- **Flags and banner** — `validateFlags(startFlags) (*startConfig, error)` (all start-up checks, testable), `bannerLines(bannerInfo) []string`. New lines appear only with the new flags (`Local`, `Tokenfile`, `WARNING`), so the v1.3.0 banner is unchanged
 - **localhostOnly** — middleware wrapping the whole mux; rejects requests whose `Host` header is not loopback (DNS-rebinding defense). Bypass via `--allow-any-host`
 - **safeDialControl / newUpstreamClient** — `net.Dialer.Control` hook that is the authoritative SSRF boundary; runs post-resolution, pre-connect. The DNS resolver deliberately uses a separate dialer *without* the hook, because `--dns system` may point at a loopback resolver (systemd-resolved on 127.0.0.53). The client never follows redirects (`http.ErrUseLastResponse`) and never sets `InsecureSkipVerify` (test-enforced); `rootCAs` replaces the trust store in tests only
 - **doTraced / isHeadRefused / probeContentEncoding** — `doTraced` runs one upstream request with a `connTrace` of its own, so timing and IP describe exactly that request. `isHeadRefused` (405/501) triggers the HEAD→GET fallback in `/inspect` and the `/page` tracer (GET body closed unread). `probeContentEncoding` is the **untraced** HEAD with the browser's full `Accept-Encoding` that `/inspect?body=1` and `/page` use to learn the true `Content-Encoding`
@@ -66,9 +84,9 @@ Single-file proxy with these components (all in `main.go`):
 - **CORS helpers** — `writeCORSHeaders` (base CORS headers), `isOriginAllowed`. `Access-Control-Expose-Headers` is set dynamically per endpoint: `proxyHandler` enumerates the forwarded upstream response headers + the nine `X-Upstream-*` metadata headers, sorted (wildcard `*` only works with `Allow-Origin: *`, not with specific origins per Fetch spec)
 - **pageHandler** — full page analysis endpoint (`/page`): traces the redirect chain (`traceRedirectChain`), then fetches the final page via GET with body decompression and HEAD pre-check for true `Content-Encoding`. Returns a single JSON response with redirect chain, HTML body (`readDecodedBody`: `truncated`, `maxBodySize`, `decodeError`), SSL info for the final host, timing, transfer size, and content encoding. On a chain failure the final GET is skipped and `error` carries the hop's real code; with `diag=1` a `tls_error` (chain or final GET) gets `ssl` via `diagnoseRequestTLS`, and `finalUrl` names the failing URL. Designed as 1:1 replacement for PHP proxy's `handlePageAction`
 - **traceRedirectChain** — HEAD per hop (GET fallback on 405/501), own per-hop timeout under the `/page` budget, returns `(hops, finalURL, *hopFailure)`. Each hop: `method`, `location`, `rawHeaders` (`rawHeaderBlock` = `statusLine` + sorted `formatRawHeaders`), cert summary (`setHopCert`: first CN only via `firstAttr` — not `Subject.CommonName`, which keeps the last —, `YYYY-MM-DD`, floored days). Every stop sets `errorCategory` (`chainStop` builds the top-level error): `timeout` (budget or per-hop), `redirect_loop`, `too_many_redirects` (stops when `i > maxHops`: 20 redirects followed and the 21st request redirected again; hop 22 is an error hop, never requested), `blocked_target` (pre-check or non-http(s) scheme), `bad_request` (unparseable URL/`Location`), or the transport code; `errorType` only for `tls_error`
-- **SSRF protection** — two layers. `safeDialControl` in the dialer is the security boundary (immune to DNS rebinding, covers every code path including the TLS probe). `isPrivateHost` / `cfg.blocksHost` is a fast-fail pre-check only and is deliberately fail-open on lookup errors; it also runs on every redirect target (`/proxy?follow=1`, `/page`)
-- **Header forwarding** — `copyRequestHeaders` / `copyResponseHeaders` strip hop-by-hop headers, `Connection`-listed headers (RFC 9110 §7.6.1), proxy-internal headers, and — on requests — `sensitiveRequestHeaders` (`Cookie`, `Authorization`, `Origin`, `Referer`, `Sec-Fetch-*`). `forwardsResponseHeader` is the single rule for responses: also drops upstream `access-control-*` and **`Location`**
-- **Endpoints:** `/proxy` (streaming proxy, `follow=1`), `/inspect` (metadata + SSL inspection, `body=1`, `get=1`, `diag=1`), `/page` (full page analysis with redirect chain, `diag=1`), `/ping` (health check, no auth, with CORS for browser access), `/version` (version info as JSON, no auth, with CORS)
+- **SSRF protection** — two layers. `safeDialControl` in the dialer is the security boundary (immune to DNS rebinding, covers every code path including the TLS probe; with `--allow-local` `localGuard` sits in front of it). `cfg.precheck` is a fast-fail pre-check only and is deliberately fail-open on lookup errors; it also runs on every redirect target (`/proxy?follow=1`, `/page`), and skips DNS for a listed start URL (the dialer decides per IP)
+- **Header forwarding** — `copyRequestHeaders` / `copyResponseHeaders` strip hop-by-hop headers, `Connection`-listed headers (RFC 9110 §7.6.1), proxy-internal headers (`X-Proxy-Token`, `X-Target-Authorization`, `X-Target-Origin`), and — on requests — `sensitiveRequestHeaders` (`Cookie`, `Authorization`, `Origin`, `Referer`, `Sec-Fetch-*`). Names are compared via `normHeader` (lower case, `_` → `-`), so `Sec_Fetch_Site` counts as `Sec-Fetch-Site`. With credentials `copyAllowedRequestHeaders` forwards only `Accept`, `Accept-Language`, `Accept-Encoding`, `User-Agent`, `Cache-Control`, `Pragma`. `forwardsResponseHeader` is the single rule for responses: also drops upstream `access-control-*`, **`Location`** and every **`x-upstream-*`**, also in underscore spelling via `normHeader` (AUTH-14); `X-Target-*`/`X-Proxy-Token` from a target fall under hop-by-hop (difference 6 in the changelog)
+- **Endpoints:** `/proxy` (streaming proxy, `follow=1`, target credentials), `/inspect` (metadata + SSL inspection, `body=1`, `get=1`, `diag=1`), `/page` (full page analysis with redirect chain, `diag=1`), `/ping` (health check, no auth, with CORS for browser access), `/version` (version, capabilities, runtime state, `proof`; no auth, with CORS)
 
 ## Security Design
 
@@ -86,7 +104,11 @@ Single-file proxy with these components (all in `main.go`):
 - The HTTP client never follows redirects itself (`http.ErrUseLastResponse`). `/proxy` never forwards `Location` to the browser — `fetch()` would follow it straight to the target with `X-Proxy-Token` attached — and reports `X-Upstream-Location` instead. Redirects are followed only by the proxy's own loops: `/proxy?follow=1` (max. 5, GET/HEAD) and `/page` (max. 20); every target must be http/https (userinfo dropped) and passes the SSRF pre-check before it is requested
 - Response body capped (default 50 MB), applied to the decompressed stream too; truncation drops `Content-Length` and sets `X-Upstream-Truncated: 1`. On `/proxy` that marker works for bodies with `Content-Length` and for compressed chunked bodies (buffered via `readCapped` before `WriteHeader`); a chunked body **without** `Content-Encoding` is streamed and cut silently (known limitation)
 - Every upstream request derives from the client's request context; `/page` has an overall budget of `3 × --timeout`
-- Flags validated at startup (`--port`, `--timeout`, `--max-mb`)
+- Flags validated at startup (`--port`, `--timeout`, `--max-mb`, `--allow-local`, `--token-file`); leftover positional arguments are fatal with the new flags, a banner warning without them
+- **Target credentials (v1.4.0):** only via `X-Target-Authorization` + `X-Target-Origin`, only `/proxy`, only GET/HEAD, no method override on any hop, only the exact origin (cross-origin redirect ends the chain), only HTTPS except `--allow-local` on a loopback address, header allowlist, `no-store`, never logged. Userinfo in the `url` is implicit Basic credentials and is stripped from every URL. "Read only" = no writing methods and overrides; side effects of GET routes are the tool's business
+- **Local targets (v1.4.0):** off by default; names reach loopback only, LAN only through IP/CIDR entries; fixed blocks (metadata, link-local, reserved, own port) always win; needs `--origin` (https), not with `--allow-any-host`; no redirect from a public start into a local target; entries only in the banner, never in a response
+- **Token file (v1.4.0):** absolute path; Unix: `O_NOFOLLOW`, regular file of the user, no group/other bits, folder and every folder above it (also link targets) owned by user/root and not group/world-writable (sticky allowed) — ssh `StrictModes`; atomic creation via hard link. `/version` shows only `tokenPersistent`
+- **Proof (v1.4.0):** `/version?challenge=` lets a tool verify the proxy holds its token before sending it (port squatting)
 
 ## Error Response Format
 
@@ -110,6 +132,7 @@ When an upstream request fails, the proxy returns a **JSON error response** with
 |---|---|---|
 | `bad_request` | 400 | `url` parameter missing or not a valid http/https URL |
 | `forbidden` | 403 | Invalid or missing `X-Proxy-Token` |
+| `auth_refused` | 400 | Since v1.4.0: credentials (`X-Target-Authorization` or userinfo) used in a way the proxy refuses; always with `reason`, never with `type` or `X-Upstream-Protocol`; nothing contacted |
 | `blocked_target` | 403 / 502 | Target resolves to a private or reserved address. 403 for the pre-check (start URL; a `/proxy?follow=1` hop with `type`); 502 with `type` `Blocked target` when the dialer blocks after DNS resolution (rebinding, or the fail-open pre-check) on `/proxy`/`/inspect` — `upstreamFailure` maps every non-timeout code to 502, unchanged since v1.2.x; on `/page` inline with `status` 502 (also for a non-http(s) redirect scheme) |
 | `method_not_allowed` | 405 | HTTP method not accepted on this endpoint |
 | `dns_error` | 502 | Hostname could not be resolved |
@@ -121,6 +144,8 @@ When an upstream request fails, the proxy returns a **JSON error response** with
 | `timeout` | 504 | Upstream request timed out — request deadline, `/page` budget, or a dial/TLS-handshake/response-header timeout of the transport |
 
 `bad_request` also appears inline on `/page` for an unparseable `Location` (`status` 502).
+
+**`reason` (since v1.4.0, `proxyError.Reason`, `omitempty`):** machine-readable sub-code on `auth_refused` (`invalid_value`, `endpoint`, `method`, `method_override`, `userinfo`, `origin_mismatch`, `insecure_scheme`) and `blocked_target` (`private`, `not_allowlisted`, `always_blocked`, `redirect_into_local`, `unsupported_scheme`). JSON paths: top-level `reason` on `/proxy` and every rejection in `authorizeRequest` (`writeJSONErrorReason`); `error.reason` on `/inspect?diag=1` and `/page`; hop field `errorReason` on `/page`. Order of the credential checks: `invalid_value` → `endpoint` → `method` → `method_override` → `userinfo` → `origin_mismatch` → SSRF pre-check → `insecure_scheme` (pre-stage) → `insecure_scheme` at dial time.
 
 **`type` (since v1.3.0):** human-readable class with the PHP proxy's `error.type` texts — `tls_error` → `classifyTLSFailure` (`Certificate expired`, `Certificate not yet valid`, `Host name does not match the certificate`, `Self-signed certificate`, `Untrusted root certificate in the chain`, `Incomplete chain or unknown issuer`, `TLS protocol not supported`, `TLS/SSL error`); `dns_error` → `Could not resolve host`; `connection_error` → `Could not connect to host`; `timeout` → `Connection timeout`; `blocked_target` → `Blocked target`; `redirect_loop` → `Redirect loop detected`; `too_many_redirects` → `Too many redirects`; `bad_request` (`/page` chain) → `Invalid URL`; otherwise `Upstream error`. Set on every upstream failure, every `/page` chain stop and the `/proxy` 403 for a blocked redirect target; **not** on the request-validation 4xx from `authorizeRequest` (`omitempty`).
 
@@ -160,6 +185,16 @@ Tests in `main_test.go` cover: token generation and constant-time comparison (`t
 - **Helpers:** `TestResolveRedirect` (all RFC 3986 §5.4.1/§5.4.2 examples, userinfo, schemes), `TestReadCapped`, `TestTrimPartialUTF8`, `TestReadDecodedBody` (incl. unknown tokens with UTF-8/binary bodies, every undecodable registered coding, stacked codings, `identity` spellings)
 
 Not covered: the `diag` path for a `tls_error` that only hits the final `/page` GET (HEAD succeeds, GET fails TLS — hard to stage with `httptest`); the chain-failure path is tested.
+
+**Since v1.4.0** (test files next to `main_test.go`):
+
+- **`compat_golden_test.go` — `TestCompat_Golden`:** fixed request matrix (call patterns of the 7 tools, error paths, preflights, size limit, underscore headers, method overrides without credentials, `main()` with `--origin` and with **no flags at all**) against `httptest` targets; every response compared byte for byte with `testdata/golden/*.golden` (only `Date`, timings, `daysLeft` and ports normalised). The files were recorded on **v1.3.0 code** (commit `92f51d6`; later cases by copying the harness into an export of that commit and running `-update` there). Only the differences of spec section 4.1 may appear. `-update` only on purpose, review every diff line, golden changes in a commit of their own
+- **`compat_v13_test.go`:** v1.3.0 behaviour of flags, help, banner and start-up (subprocess via `compat13RunMain`)
+- **`target_auth_test.go`:** AUTH-1…14 and LOG-1 (incl. redirect host/port/scheme changes, underscore and case variants, CR/LF/NUL, `_method` in query/hop/header/body, encoded and empty userinfo, nothing in logs/headers/bodies)
+- **`local_attack_test.go`** + LOCAL tests in `main_test.go`: `--allow-local` parser, matching, rebinding, fixed blocks, own port, redirects into local, all endpoints, `reason`, no connection reuse
+- **`cap_tok_test.go`:** `TestPingHandler`, `TestVersionHandler_Capabilities`, `TestVersionHandler_Proof` (openssl-computed vectors with port, invalid challenges, full stack), `TestVersionHandler_ProofBoundToPort` (relay from another port does not verify), `TestTokenProbe_Contract` (no pre-check/DNS/dial), `TestTokenFile_*` (relative paths, create/reuse, content, 20 rounds of 8 concurrent starts), `TestBanner_TokenFileLines`, subprocess tests for `--token-file` across restarts and `--help`
+- **`tokenfile_unix_test.go`** (`//go:build unix`): file and folder permissions, whole folder chain incl. link targets (`TestTokenFile_FolderChain`), sticky folder, symlinks (also dangling), FIFO
+- **`workflow_test.go`:** the release workflow has no `${{ … }}` inside `run:` scripts (tag names → `env:`) and every checkout uses `persist-credentials: false`
 
 ## Linting
 
@@ -222,6 +257,17 @@ bleibt auf PHP), WYSIWYG, MD, llms und robots-sitemap ✅ integriert — alle mi
 aber erst ab v1.3.0 (mit älteren Proxys scheitern diese wie zuvor am
 CORS-Preflight → „Failed to fetch“).
 
+Ab v1.4.0 kommt ein achtes Tool dazu: der **WP REST API Explorer** (`wp-api`).
+Er läuft **nur** über den lokalen Proxy (kein PHP-Pfad). Zugangsdaten
+(`X-Target-Authorization` + `X-Target-Origin`) und lokale Ziele
+(`--allow-local`) gibt es erst ab v1.4.0; er erkennt sie an `capabilities` in
+`/version` und prüft vorher `proof`. Mit v1.3.0 oder einem `dev`-Build ohne
+`capabilities` läuft er nur im Grundumfang (öffentliche Seiten). Die 7 anderen
+Tools brauchen v1.4.0 nicht; `MIN_VERSION` bleibt `v1.3.0`. Anforderungen:
+`/home/jpk/ddev/jpkcom-tools/.claude/knowledge/projects/localproxy-v1.4.0.md`.
+Release nur gemeinsam mit dem Explorer: Tag bauen, Entwurf prüfen, erst
+`jpkcom-tools` deployen, dann den Entwurf veröffentlichen.
+
 ### Empfohlene Startup-Konfiguration
 
 User startet `localproxy` mit dem Origin der jeweiligen Umgebung:
@@ -241,14 +287,27 @@ User startet `localproxy` mit dem Origin der jeweiligen Umgebung:
 
 # System-DNS verwenden statt Cloudflare/Google
 ./localproxy --origin https://www.jpkc.com --dns system
+
+# Ab v1.4.0: lokales DDEV-Projekt für den WP REST API Explorer freigeben
+# (genau die Seite; "*.ddev.site" gibt JEDES lokale DDEV-Projekt frei)
+./localproxy --origin "https://www.jpkc.com" --port 8765 --allow-local "mysite.ddev.site"
+
+# Ab v1.4.0: Token übersteht Neustarts (immer mit --port, absoluter Pfad)
+./localproxy --origin "https://www.jpkc.com" --port 8765 --token-file "$HOME/.config/localproxy/token"
+
+# Lab des Explorers (WSL, DDEV-Origin der Tools)
+./localproxy --origin https://jpkcom-tools.ddev.site --port 18765 \
+  --allow-local "*.ddev.site" --token-file /home/jpk/tmp/wp-api-explorer/proxy.token
 ```
+
+Werte immer quoten (bash/zsh globben `*` und `[…]`, PowerShell zerlegt Kommalisten).
 
 ### Wichtige Architektur-Punkte
 
 - **`/page`-Endpoint** verfolgt Redirect-Chains serverseitig und liefert die komplette `redirectChain` mit Timing/IP/Status/Headers pro Hop (ab v1.3.0 zusätzlich `method`, `location`, `errorCategory`, `errorType`, `certCN`/`certExpiry`/`certDaysLeft`, `rawHeaders` mit Statuszeile) — 1:1-Ersatz für `p.php?action=page`. Tools, die nur den Body brauchen (Source, WYSIWYG, MD, llms, robots-sitemap, SEO-Nebenabrufe), nutzen `/proxy?follow=1`: der **Proxy** folgt den Redirects (max. 5) und meldet `X-Upstream-Final-URL` / `X-Upstream-Redirects`. Den Browser den 3xx selbst auflösen zu lassen klappte nur bei CORS-offenen Zielen (sonst CORS-Fehler bzw. proxy-lokaler 404) und trug dabei den `X-Proxy-Token` ans Ziel — deshalb leitet `/proxy` ab v1.3.0 `Location` nicht mehr weiter, sondern liefert `X-Upstream-Location`. Link-Checks laufen über `LocalProxy.headCheck()` (auf `/inspect`, Client-Schleife über `data.location`, max. 5).
 - **Header-Format ab v1.0.3:** `/inspect` und `/page` liefern `headers` als `map[string][]string` (Array pro Key). Frontend-Konsumenten brauchen `Array.isArray()`-Guards oder `headers["X"][0]`-Zugriff — siehe INTEGRATION.md.
 - **Verhaltensänderungen ab v1.1.0** (alle rückwärtskompatibel, im Tools-Repo war nichts anzupassen): 4xx-Antworten liefern jetzt CORS + JSON statt Plaintext ohne CORS — dadurch unterscheidet das Frontend „falscher Token" von „Proxy läuft nicht"; `Origin`/`Referer` werden nicht mehr an Zielserver weitergereicht (kein Tool verlässt sich darauf, `Accept: text/markdown` aus `seo.js` bleibt unberührt); der Host-Header muss Loopback sein (`127.0.0.0/8`, `localhost`, `[::1]` — deckt alles ab, was User realistisch eintippen).
-- **`MIN_VERSION` im Frontend** (`tools/assets/js/tools/localproxy.js`) steht auf **`v1.3.0`**. Rein beratend: `isEnabled()` ignoriert die Version, ein älterer Proxy funktioniert weiter (Badge + „outdated"-Toast höchstens einmal pro Browser-Session und Version). `localproxy.js` wird im Footer mit `?v=<filemtime>` geladen; neue API-Funktionen (`headCheck`, `readUpstreamMeta`, `buildProxyError`) nutzen die Tools nur hinter `typeof LocalProxy.x === 'function'`.
+- **`MIN_VERSION` im Frontend** (`tools/assets/js/tools/localproxy.js`) steht auf **`v1.3.0`** (bleibt so mit v1.4.0; der Explorer prüft `capabilities` statt der Version). Rein beratend: `isEnabled()` ignoriert die Version, ein älterer Proxy funktioniert weiter (Badge + „outdated"-Toast höchstens einmal pro Browser-Session und Version). `localproxy.js` wird im Footer mit `?v=<filemtime>` geladen; neue API-Funktionen (`headCheck`, `readUpstreamMeta`, `buildProxyError`) nutzen die Tools nur hinter `typeof LocalProxy.x === 'function'`.
 - **Release-Reihenfolge ab v1.3.0: erst die Tools deployen, dann localproxy v1.3.0 veröffentlichen.** Das neue JS läuft auch mit alten Proxys (unbekannte Query-Parameter wie `diag`/`follow` werden ignoriert, neue Felder feature-detected). Umgekehrt verliert altes Produktions-JS mit dem neuen Proxy die Fälle, in denen der Browser `Location` direkt zu einem CORS-offenen Ziel folgte — es bekäme einen nackten 3xx.
 - **PHP-Parität ab v1.3.0 (`proxy.php` 2.8.0):** `/inspect` und `/page` liefern `ssl` mit voller Chain (Label, `signatureValid`, DN, Orgs, Serial, OpenSSL-Signaturname, Key, SANs, SHA-256/SHA-1, PEM), `protocol`/`cipher` in OpenSSL-Notation, `cipherSuite` (IANA), `bits`, `verified`/`valid`, `error` (OpenSSL-Verify-Text, Feld für SEO) / `errorType` (Feld für DNS-SSL), `hostMatch`, `selfSigned`, `issues`, `certSource`. Fehler-JSON trägt `type` mit den PHP-Texten. `daysLeft` wird gefloort (wie DNS-SSL und die Lib; das SEO-PHP rundet — keine SEO-Parität behaupten).
 - **`diag=1` (opt-in, `/inspect` + `/page`):** Upstream-Fehler kommen inline (HTTP 200 + `error`), bei `tls_error` füllt die handshake-only Probe `ssl` mit `valid:false`. Bewusst opt-in: altes `seo.js` rechnet `valid = daysLeft > 0` und würde ein kaputtes Zertifikat sonst als gültig anzeigen; altes DNS-SSL-JS wirft bei `!resp.ok`. Ohne `diag` bleibt der 502/504-Vertrag (plus `type`).

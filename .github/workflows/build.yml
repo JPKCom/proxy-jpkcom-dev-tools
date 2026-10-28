@@ -24,8 +24,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # No job needs to push, so the token is not left in .git/config.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -116,22 +119,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.27"
 
+      # Expressions go through env, never straight into the script: a tag
+      # name may hold $( ), ; or | (script injection). TestWorkflow_NoExpressionsInRun
+      # guards this.
       - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          VERSION: ${{ github.ref_name }}
+          OUT: localproxy-${{ matrix.suffix }}${{ matrix.ext }}
         run: |
           go build \
-            -ldflags="-s -w -X main.Version=${{ github.ref_name }}" \
+            -ldflags="-s -w -X main.Version=$VERSION" \
             -trimpath \
-            -o localproxy-${{ matrix.suffix }}${{ matrix.ext }} \
+            -o "$OUT" \
             .
 
       - name: Upload artifact
@@ -150,16 +160,57 @@ jobs:
       contents: write
 
     steps:
+      # Only for the release notes file (.github/release-notes/<tag>.md).
+      # persist-credentials: false keeps the write token out of .git/config.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      # Since v1.4.0: one SHA256SUMS file for all nine binaries, in the format
+      # of `sha256sum` (check with `sha256sum -c SHA256SUMS` on Linux/WSL,
+      # `shasum -a 256 -c SHA256SUMS` on macOS, Get-FileHash in PowerShell).
+      # The step fails unless exactly nine binaries are present and every
+      # line verifies against the files that get uploaded.
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          count=$(ls -1 localproxy-* | wc -l)
+          if [ "$count" -ne 9 ]; then
+            echo "expected 9 binaries, found $count:"
+            ls -l
+            exit 1
+          fi
+          sha256sum localproxy-* > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      # Hand-written notes for this tag, if the repo has them; GitHub's
+      # generated list of changes is appended either way.
+      - name: Find release notes
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          f=".github/release-notes/$TAG.md"
+          if [ -f "$f" ]; then
+            echo "path=$f" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Created as a draft (since v1.4.0): the binaries are downloaded and
+      # checked first, and the draft is published by hand after the JPKCom
+      # Tools deploy (release order: tools first, then the proxy).
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
-          draft: false
+          draft: true
           prerelease: false

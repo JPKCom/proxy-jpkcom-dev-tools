@@ -43,6 +43,53 @@ Ventura or later**. On macOS 12 Monterey and older, stay on
 [v1.1.1](https://github.com/JPKCom/proxy-jpkcom-dev-tools/releases/tag/v1.1.1) —
 it is functionally identical and built with Go 1.26.6.
 
+### Verify the download (SHA256SUMS)
+
+Since v1.4.0 every release has a `SHA256SUMS` file with the SHA-256 checksum of
+all nine binaries. Download it next to the binary and compare:
+
+```bash
+# Linux / WSL
+grep localproxy-linux-amd64 SHA256SUMS | sha256sum -c
+
+# macOS
+grep localproxy-macos-apple-silicon SHA256SUMS | shasum -a 256 -c
+```
+
+```powershell
+# Windows PowerShell: compare the printed hash with the line in SHA256SUMS
+(Get-FileHash -Algorithm SHA256 .\localproxy-windows-amd64.exe).Hash.ToLower()
+Select-String localproxy-windows-amd64.exe .\SHA256SUMS
+```
+
+The binaries are not signed; the checksums show that the file is the one the
+release build produced.
+
+### Windows: first start
+
+1. Open PowerShell in the download folder (in Explorer: right-click the folder →
+   "Open in Terminal").
+2. Start the proxy with the origin of your tool and a fixed port:
+
+   ```powershell
+   .\localproxy-windows-amd64.exe --origin "https://www.jpkc.com" --port 8765
+   ```
+
+3. SmartScreen may say "Windows protected your PC", because the binary is not
+   signed. Click "More info" → "Run anyway".
+4. A firewall prompt normally does not appear: the proxy listens on
+   `127.0.0.1` only.
+
+A double-click starts the proxy **without flags** — every origin allowed, a
+random port. For a repeatable start, put the command into a `.cmd` file next to
+the binary:
+
+```bat
+@echo off
+"%~dp0localproxy-windows-amd64.exe" --origin "https://www.jpkc.com" --port 8765
+pause
+```
+
 ### macOS / Linux: Make the binary executable
 
 ```bash
@@ -50,6 +97,10 @@ chmod +x ./localproxy-macos-apple-silicon
 # macOS: bypass Gatekeeper warning (unsigned binary):
 xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 ```
+
+On macOS you can also start it once, then allow it under **System Settings →
+Privacy & Security → Open Anyway**. macOS 13 Ventura or later is required (see
+above).
 
 ---
 
@@ -64,7 +115,7 @@ xattr -dr com.apple.quarantine ./localproxy-macos-apple-silicon
 Output:
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║              localproxy v1.3.0  —  ready                         ║
+║              localproxy v1.4.0  —  ready                         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Address  :  http://127.0.0.1:54321                              ║
 ║  Token    :  a3f8c2...                                           ║
@@ -108,11 +159,26 @@ By default, localproxy uses **Cloudflare (1.1.1.1)** and **Google (8.8.8.8)** fo
 --max-mb          int64   Maximum upstream response size in MB (0 = unlimited) [default: 50]
 --dns             string  DNS servers, comma-separated, or "system" for OS defaults [default: "1.1.1.1,8.8.8.8"]
 --allow-any-host          Accept a non-localhost Host header (not recommended)
+--allow-local     list    Local targets the proxy may reach (off by default; needs --origin)  [since v1.4.0]
+--token-file      path    Absolute path of a file that keeps the token across restarts (off)  [since v1.4.0]
 --version                 Print version information and exit
 ```
 
 `--port`, `--timeout` and `--max-mb` are validated at startup; an out-of-range
 value aborts with a message instead of failing later in a confusing way.
+
+**Quote every value** — lists, paths, patterns. bash and zsh expand `*` and
+`[…]` (`[fd00::5]` fails with "no matches found"), and PowerShell turns an
+unquoted comma list into separate arguments. Go's flag parser stops at the
+first argument that is not a flag, so every flag after it would be ignored.
+With `--allow-local` or `--token-file` such a leftover argument is a start-up
+error; on a v1.3.0 command line it only produces a `WARNING` line in the banner.
+
+| Shell | Example |
+|---|---|
+| bash / zsh | `./localproxy --origin "https://www.jpkc.com" --port 8765 --allow-local "mysite.ddev.site,localhost:8888" --token-file "$HOME/.config/localproxy/token"` |
+| PowerShell | `.\localproxy-windows-amd64.exe --origin "https://www.jpkc.com" --port 8765 --allow-local "mysite.ddev.site,localhost:8888" --token-file "$env:LOCALAPPDATA\localproxy\token"` |
+| cmd.exe / `.cmd` file | `localproxy-windows-amd64.exe --origin "https://www.jpkc.com" --port 8765 --allow-local "mysite.ddev.site,localhost:8888" --token-file "%LOCALAPPDATA%\localproxy\token"` |
 
 ### `--allow-any-host`
 
@@ -124,6 +190,135 @@ blocks DNS rebinding: without it, a web page can point a hostname it controls at
 You only need `--allow-any-host` if you reach the proxy under some other local
 name (for example through a container alias). Prefer `--origin` over disabling
 the check.
+
+### `--allow-local` (local and staging sites, since v1.4.0)
+
+By default the proxy refuses every private address — loopback, LAN, CGNAT — so
+a website cannot use it to reach your machine or your network. `--allow-local`
+opens exactly the targets you list, for example a DDEV project or wp-env:
+
+```bash
+./localproxy --origin "https://www.jpkc.com" --port 8765 --allow-local "mysite.ddev.site"
+./localproxy --origin "https://www.jpkc.com" --port 8765 --allow-local "localhost:8888"
+./localproxy --origin "https://www.jpkc.com" --port 8765 --allow-local "wp.intranet.example,10.0.5.0/24" --dns system
+```
+
+**Threat model.** Any script anywhere on an allowed origin that has the token
+can reach these hosts — Chrome's Local Network Access prompt does not cover
+this: it only sees the page talking to `127.0.0.1`, not what the proxy sends on
+into your network. Use the narrowest entries possible.
+
+**"Read only" stops at the tool.** With `--allow-local`, "read only" for local
+targets relies on the tool's code alone. Any script on an allowed origin that
+holds the token could send POST requests and `_method` overrides to the allowed
+local sites. Start the proxy with `--allow-local` only while you test, and only
+for the names you need. (With credentials the proxy itself refuses writing
+methods, see [Target authentication](#target-authentication-since-v140).)
+
+**Entries** (comma-separated; the flag may be given more than once):
+
+| Entry | Allows |
+|---|---|
+| `mysite.ddev.site` | exactly this name (lower case, no trailing dot, IDN as punycode) |
+| `*.ddev.site` | every name with at least one label in front (`a.ddev.site`, `a.b.ddev.site`), not `ddev.site` itself. This allows **every** local DDEV project |
+| `localhost`, `*.localhost` | fixed to `127.0.0.1` and `::1`, no DNS (RFC 6761) |
+| `10.0.5.20`, `[fd00::5]` | exactly this IP |
+| `10.0.5.0/24`, `[fd00::/64]` | this IP range (IPv4 at least `/16`, IPv6 at least `/48`) |
+| `…:8888` | only this port. **Without a port only 80 and 443** |
+
+- **IPv6 always in brackets** (`[fd00::5]`, `[fd00::/64]:8443`); `fd00::5:8443`
+  would be a different address, so it is refused.
+- **Names reach loopback only.** A name entry connects only to `127.0.0.0/8` or
+  `::1`, even if DNS says otherwise — plain DNS can be forged in a café Wi-Fi. A
+  LAN address is reachable only when it also lies in an IP or CIDR entry:
+  `--allow-local "wp.intranet.example,10.0.5.0/24"`. A name that is not on the
+  list stays blocked, whatever it resolves to (DNS rebinding gains nothing).
+- **Wildcards** only in front, and only for `*.test`, `*.localhost` and
+  suffixes with at least two labels (`*.ddev.site`, `*.intranet.example`).
+  Refused: `*`, `*.lan`, `*.local`, `*.internal`, `*.home.arpa`, `*.fritz.box`
+  (they cover every device of a home network — use exact names such as
+  `nas.lan`), and public wildcard DNS services that resolve any embedded IP
+  (`*.nip.io`, `*.sslip.io`, `*.xip.io`, `*.localtest.me`, `*.lvh.me`,
+  `*.traefik.me`).
+- **Refused ranges and ports:** `0.0.0.0/0`, `::/0`, ranges wider than `/16`
+  (IPv4) or `/48` (IPv6), ranges that are public or not entirely inside one
+  private class; port 0, the proxy's own `--port`, and the ports of services
+  that must never be reached from a browser: 2375, 2376 (Docker API), 2379
+  (etcd), 3306 (MySQL), 5432 (PostgreSQL), 6379 (Redis), 9200
+  (Elasticsearch), 10250 (kubelet), 11211 (memcached), 27017 (MongoDB).
+- **Always blocked**, whatever the list says: link-local and cloud metadata
+  (`169.254.0.0/16`, `fd00:ec2::254`, `100.100.100.200`), documentation and
+  benchmark ranges, multicast, reserved space, NAT64/6to4, and the proxy's own
+  port on loopback.
+- **Requires `--origin`**, and every `--origin` must then be an `https` origin
+  without a path (`https://host[:port]`), or `http://localhost[:port]` /
+  `http://127.0.0.1[:port]`. It cannot be combined with `--allow-any-host`.
+- **No redirects from public into local targets.** A local target is reachable
+  only when the URL you ask for is already on the list; a public site that
+  redirects to your DDEV project ends with `blocked_target` / `redirect_into_local`.
+  Local → local and local → public are fine.
+- All three endpoints (`/proxy`, `/inspect`, `/page`) reach the listed targets.
+- The banner shows the entries and a `WARNING` line. They are never part of an
+  HTTP response; `/version` only says `localTargets: true`.
+
+**DDEV notes.**
+
+- **DNS:** `*.ddev.site` resolves publicly to `127.0.0.1`, so the default
+  `--dns 1.1.1.1,8.8.8.8` works. Do **not** use `--dns system` for DDEV: routers
+  with DNS-rebind protection (e.g. FRITZ!Box) answer `*.ddev.site` with nothing,
+  and you get `dns_error`. Intranet names need `--dns system`; if you need both,
+  put the DDEV names into your hosts file.
+- **TLS stays verified.** DDEV's mkcert certificates are accepted only when the
+  mkcert CA is in the trust store **of the machine that runs the proxy** (run
+  `mkcert -install` there). Otherwise you get `tls_error` with `type`
+  `Untrusted root certificate in the chain` or `Incomplete chain or unknown
+  issuer`. There is no switch to skip verification.
+- **Windows proxy, DDEV in WSL2:** `127.0.0.1:443` reaches the DDEV router
+  through WSL's localhost forwarding.
+
+### `--token-file` (keep the token across restarts, since v1.4.0)
+
+Without it the token changes on every start, and every tool asks for it again.
+With `--token-file` the first start writes a new token to the file; every later
+start reads it back. Delete the file to get a new token.
+
+```bash
+./localproxy --origin "https://www.jpkc.com" --port 8765 --token-file "$HOME/.config/localproxy/token"
+```
+
+```powershell
+.\localproxy-windows-amd64.exe --origin "https://www.jpkc.com" --port 8765 --token-file "$env:LOCALAPPDATA\localproxy\token"
+```
+
+```bat
+localproxy-windows-amd64.exe --origin "https://www.jpkc.com" --port 8765 --token-file "%LOCALAPPDATA%\localproxy\token"
+```
+
+- **Absolute path only.** A relative path, or one that still contains `%`, `$`
+  or a leading `~`, is a start-up error: PowerShell does not expand
+  `%LOCALAPPDATA%` (cmd syntax), and bash/zsh do not expand `~` inside quotes or
+  after `=`. Use `$HOME`, `$env:LOCALAPPDATA` or `%LOCALAPPDATA%` as shown.
+- **Always with `--port`.** Otherwise the address changes on every start (the
+  banner warns).
+- **Content:** exactly the 48 lowercase hex characters the proxy generates;
+  anything else is refused — no hand-made, weak tokens.
+- **Rights (Linux, macOS, BSD):** the file must be a regular file of your user
+  with mode `0600` or stricter (`chmod 600 <path>`), not a symbolic link; its
+  folder must belong to you (or root) and must not be writable by others
+  (`chmod 700 <folder>`), unless it has the sticky bit like `/tmp`. The same
+  holds for **every folder above it** up to `/` (`chmod go-w <folder>`) and
+  for the targets of symbolic links on the way — like ssh with `StrictModes`;
+  otherwise another user could swap a folder and plant a token they know. The
+  proxy creates a missing folder with `0700` and the file with `0600`. Like
+  ssh, it refuses to start otherwise. In WSL, keep the file on the Linux file system,
+  not under `/mnt/c`.
+- **Windows:** no permission check; `%LOCALAPPDATA%` is protected by the ACL of
+  your user profile. A path outside your profile (e.g. `C:\Users\Public\…`)
+  gets a `WARNING` line in the banner.
+- **Trade-off:** a stolen token stays valid longer — across restarts, until you
+  delete the file. Together with `--allow-local` that matters more.
+- The banner shows `Token : <hex> (from token file)` and the path in a
+  `Tokenfile:` line; `/version` only says `tokenPersistent: true`.
 
 ---
 
@@ -142,7 +337,81 @@ the check.
 | `GET /page?url=...&diag=1` | Yes (`X-Proxy-Token`) | Same; a `tls_error` also carries the failing server's certificate details |
 | `OPTIONS /proxy`, `OPTIONS /inspect`, `OPTIONS /page` | No | CORS preflight (returns 204 with CORS + PNA headers) |
 | `GET /ping` | No | Health check (returns `localproxy ok`) |
-| `GET /version` | No | Version info as JSON (version, license, author, repo) |
+| `GET /version` | No | Version info as JSON: version, license, author, repo; since v1.4.0 also `capabilities`, `localTargets`, `tokenPersistent`, `limits` |
+| `GET /version?challenge=<64 hex>` | No | Same, plus `proof` — shows that the proxy holds your token, without sending it (since v1.4.0) |
+
+### `/version`: capabilities and proof (since v1.4.0)
+
+```json
+{
+  "author": "Jean Pierre Kolb",
+  "license": "GPL-2.0-or-later",
+  "repo": "https://github.com/JPKCom/proxy-jpkcom-dev-tools",
+  "url": "https://www.jpkc.com/",
+  "version": "v1.4.0",
+  "capabilities": ["follow", "diag", "inspect-get", "no-location", "error-type",
+                   "target-auth", "allow-local", "token-file", "error-reason", "proof"],
+  "localTargets": false,
+  "tokenPersistent": false,
+  "limits": { "maxBytes": 52428800, "timeoutSeconds": 30 }
+}
+```
+
+- **`capabilities`** lists what the binary can do, so a tool tests for a
+  feature instead of comparing versions (a local build reports `dev`). The list
+  only grows; names are lower case with hyphens.
+
+  | Capability | Meaning | Since |
+  |---|---|---|
+  | `follow` | `/proxy?follow=1` | v1.3.0 |
+  | `diag` | `diag=1` on `/inspect` and `/page` | v1.3.0 |
+  | `inspect-get` | `/inspect?get=1` | v1.3.0 |
+  | `no-location` | `/proxy` never sends `Location`, but `X-Upstream-Location` | v1.3.0 |
+  | `error-type` | field `type` in errors | v1.3.0 |
+  | `target-auth` | [Target authentication](#target-authentication-since-v140) (`X-Target-Authorization` + `X-Target-Origin`) | v1.4.0 |
+  | `allow-local` | the binary knows `--allow-local` (not: whether it is set) | v1.4.0 |
+  | `token-file` | the binary knows `--token-file` (not: whether it is set) | v1.4.0 |
+  | `error-reason` | field `reason` on `auth_refused` and `blocked_target` | v1.4.0 |
+  | `proof` | `/version?challenge=…` answers with `proof` | v1.4.0 |
+
+- **`localTargets`** = `--allow-local` is set; **`tokenPersistent`** =
+  `--token-file` is set. Booleans only: `/version` needs no token and, without
+  `--origin`, every website can read it — so it never shows a list entry or a
+  path.
+- **`limits`:** `maxBytes` is `--max-mb` in bytes (0 = unlimited),
+  `timeoutSeconds` is `--timeout`.
+- **`proof`** (only with `?challenge=` and exactly 64 hex digits; otherwise the
+  answer is the same as without a challenge):
+
+  ```
+  proof = hex( HMAC-SHA256( key = token,
+                            message = "localproxy-proof:" + port + ":" + challenge ) )
+  ```
+
+  The key is the token as the banner shows it — its 48 ASCII characters.
+  `port` is the TCP port the proxy received the request on, in decimal
+  (`8765`); the message uses the challenge exactly as sent. A tool that knows
+  the token checks the proof **before** it sends the token or credentials
+  anywhere, computed with the port **it** talks to: if another program has
+  taken the port while the proxy was not running, it cannot compute the
+  proof — and it cannot pass on a proof it fetched from the real proxy on
+  another port either (with `--token-file` but without `--port`, the token
+  stays the same while the port changes). The HMAC reveals nothing about the
+  token. Example in the browser:
+
+  ```javascript
+  const enc = new TextEncoder();
+  const challenge = Array.from(crypto.getRandomValues(new Uint8Array(32)),
+    b => b.toString(16).padStart(2, "0")).join("");
+  const data = await (await fetch(`${PROXY_BASE}/version?challenge=${challenge}`)).json();
+  const key = await crypto.subtle.importKey("raw", enc.encode(PROXY_TOKEN),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const port = new URL(PROXY_BASE).port;     // the port you send the request to
+  const mac = await crypto.subtle.sign("HMAC", key,
+    enc.encode("localproxy-proof:" + port + ":" + challenge));
+  const expected = Array.from(new Uint8Array(mac), b => b.toString(16).padStart(2, "0")).join("");
+  const genuine = data.proof === expected;   // false → do not send the token
+  ```
 
 ---
 
@@ -161,8 +430,13 @@ Every `/proxy` response includes upstream connection metadata as custom headers:
 | `X-Upstream-Location` | `https://www.example.com/` | On any 3xx: the target's last `Location` value, resolved against the URL that returned it (absolute, http/https only, userinfo dropped); absent when there is no usable `Location`. Replaces `Location`, which is never forwarded |
 | `X-Upstream-Final-URL` | `https://www.example.com/` | With `follow=1` only: the URL the returned response came from |
 | `X-Upstream-Redirects` | `1` | With `follow=1` only: how many redirects were followed (`0` if none) |
+| `X-Upstream-Auth` | `sent` | Only with credentials (since v1.4.0): `sent`, `withheld-cross-origin`, `withheld-method-override` or `withheld` — see [Target authentication](#target-authentication-since-v140) |
+| `X-Upstream-Cache-Control` | `public, max-age=3600` | Only with credentials (since v1.4.0): the target's `Cache-Control`; the response itself gets `no-store` |
 
-All upstream response headers are readable by JavaScript — `Access-Control-Expose-Headers` is dynamically built from the forwarded upstream response headers plus the nine `X-Upstream-*` metadata headers. With `follow=1`, all metadata headers describe the final hop.
+All upstream response headers are readable by JavaScript — `Access-Control-Expose-Headers` is dynamically built from the forwarded upstream response headers plus the nine `X-Upstream-*` metadata headers (plus `X-Upstream-Auth` and `X-Upstream-Cache-Control` when credentials were used). With `follow=1`, all metadata headers describe the final hop.
+
+Every `X-Upstream-*` header comes from the proxy. Since v1.4.0 a target that
+sends such a header itself (e.g. a forged `X-Upstream-Location`) has it dropped.
 
 **Timing values:** `dns` = DNS lookup, `tcp` = TCP connect, `ssl` = TLS handshake, `ttfb` = time to first byte (measured from the start of the request), `total` = total request time. Every request uses a fresh connection, so all timing phases are always populated.
 
@@ -199,6 +473,76 @@ curl -sD- -o /dev/null -H "X-Proxy-Token: $TOKEN" \
 # X-Upstream-Final-Url: https://www.example.com/robots.txt
 # X-Upstream-Redirects: 2
 ```
+
+---
+
+## Target authentication (since v1.4.0)
+
+A tool can send credentials **for the target** (a WordPress application
+password, a pasted JWT) through the proxy. The browser's own `Authorization`
+and `Cookie` headers are still never forwarded; credentials reach a target only
+when the caller hands them over explicitly:
+
+```
+GET /proxy?url=https://wp.example/wp-json/wp/v2/users/me?context=edit
+X-Proxy-Token: <token>
+X-Target-Authorization: Basic <base64(user:application-password)>
+X-Target-Origin: https://wp.example
+```
+
+- **Header form:** `X-Target-Authorization` holds the complete `Authorization`
+  value, `Basic <credentials>` or `Bearer <token>` (token68 syntax, at most
+  8192 bytes, sent once). `X-Target-Origin` is required and names the origin the
+  credentials were entered for (`scheme://host[:port]`, no path); the `url` must
+  be on exactly that origin. Both are allowed in the CORS preflight.
+- **Only `/proxy`.** `/inspect` and `/page` refuse the header (`reason:
+  endpoint`): checks and diagnostics run anonymously.
+- **Only GET and HEAD.** POST with credentials is refused (`method`). POST
+  without credentials works as before.
+- **No method override.** A request with credentials is refused when it carries
+  `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (any value,
+  also in underscore spelling), or a `_method` query parameter with a value
+  other than `GET`, `HEAD` or `OPTIONS` (WordPress reads `?_method=DELETE` as a
+  DELETE). The check runs on **every** request of a redirect chain.
+- **Only the exact origin.** `Authorization` is set only on requests to the
+  origin of the `url` (scheme, host and port). With `follow=1`, a redirect to
+  another origin ends the chain: the response is that 3xx with
+  `X-Upstream-Location` and `X-Upstream-Auth: withheld-cross-origin`, and the
+  other origin receives nothing. A same-origin redirect to a URL with a writing
+  `_method` ends the chain the same way (`withheld-method-override`).
+- **Only HTTPS**, except for an `--allow-local` target whose connected address is
+  loopback (`127.0.0.0/8`, `::1`). Credentials over `http` to anything else —
+  a public site, a LAN address, a listed name that resolves elsewhere — are
+  refused before a byte is sent (`insecure_scheme`).
+- **Allowlist of request headers.** With credentials only `Accept`,
+  `Accept-Language`, `Accept-Encoding`, `User-Agent`, `Cache-Control` and
+  `Pragma` are forwarded, plus the `Authorization` the proxy sets.
+- **Not cached.** Every `/proxy` response varies on `X-Target-Authorization`; a
+  response with credentials gets `Cache-Control: no-store` (the target's value
+  moves to `X-Upstream-Cache-Control`), without `ETag` and `Expires`.
+- **`X-Upstream-Auth`** (only with credentials): `sent` — `Authorization` went
+  with every request of this response; `withheld-cross-origin` and
+  `withheld-method-override` — the chain stopped before such a hop; `withheld` —
+  userinfo only (below): at least one request of the chain went without it.
+- **Never logged, never echoed.** The value appears in no log line, no error
+  message, no header and no JSON field. **Never put credentials into a query
+  parameter** (`?token=…`): target URLs do appear in the proxy's error log.
+- **Userinfo in the `url`** (`https://user:pass@host/`) counts as implicit Basic
+  credentials. It is removed from the URL before any request, so it never shows
+  up in `X-Upstream-Final-URL`, JSON or a log. GET and HEAD authenticate as
+  before (now also on same-origin redirect hops; a hop to another origin goes on
+  without it), POST and writing method overrides are refused, and `/proxy`
+  answers with `no-store` and `X-Upstream-Auth`. Userinfo together with
+  `X-Target-Authorization` is refused (`userinfo`).
+
+**What "read only" means here:** the proxy blocks writing HTTP methods and
+method overrides; it cannot prevent side effects of GET routes. Some GET routes
+do write (in WordPress, for example, `wp-block-editor/v1/navigation-fallback`
+or site-health tests); which routes a tool calls with credentials is up to the
+tool.
+
+Every refusal is HTTP 400 `auth_refused` with a `reason` (see
+[Error responses](#error-responses)); the target is not contacted.
 
 ---
 
@@ -639,7 +983,8 @@ Where the error object appears:
 |---|---|---|
 | `bad_request` | 400 | `url` parameter missing or not a valid http/https URL. On `/page` also a redirect `Location` that cannot be parsed (inline, `status` 502) |
 | `forbidden` | 403 | Invalid or missing `X-Proxy-Token` |
-| `blocked_target` | 403 / 502 | Target resolves to a private or reserved address. **403** when the SSRF pre-check catches it — the URL itself, or a redirect target on `/proxy?follow=1`. **502** (with `type` `Blocked target`) when the pre-check passed but the dialer blocks the connection after DNS resolution (e.g. DNS rebinding) on `/proxy` or `/inspect`. On `/page` a private redirect target, one with a scheme other than http/https, or a dialer block (inline, `status` 502) |
+| `auth_refused` | 400 | Since v1.4.0: the request carries credentials (`X-Target-Authorization` or userinfo in the `url`) in a way the proxy does not allow — see `reason` below. The target was not contacted |
+| `blocked_target` | 403 / 502 | Target resolves to a private or reserved address (since v1.4.0 with `reason`, see below). **403** when the SSRF pre-check catches it — the URL itself, or a redirect target on `/proxy?follow=1`. **502** (with `type` `Blocked target`) when the pre-check passed but the dialer blocks the connection after DNS resolution (e.g. DNS rebinding) on `/proxy` or `/inspect`. On `/page` a private redirect target, one with a scheme other than http/https, or a dialer block (inline, `status` 502) |
 | `method_not_allowed` | 405 | HTTP method not accepted on this endpoint |
 | `dns_error` | 502 | Hostname could not be resolved |
 | `tls_error` | 502 | Any TLS failure: certificate (expired, hostname mismatch, unknown CA) **or** handshake (no mutually supported protocol version or cipher suite, peer alert, target not speaking TLS) |
@@ -651,6 +996,38 @@ Where the error object appears:
 
 `message` is safe to display; full error details are logged to the proxy's
 terminal only.
+
+**`reason`** (since v1.4.0) is a machine-readable sub-code for branching, set on
+`auth_refused` and `blocked_target`. `error` stays the primary code, `type`
+stays display text. Where to find it:
+
+| Endpoint | Path |
+|---|---|
+| `/proxy`, and every rejection before the target is contacted | top-level `reason` |
+| `/inspect?diag=1` (inline error) | `error.reason` |
+| `/page` | `error.reason`, and `errorReason` on the redirect hop that stopped |
+
+| `error` | `reason` | Meaning |
+|---|---|---|
+| `auth_refused` | `invalid_value` | `X-Target-Authorization` malformed, empty, repeated or too long; an underscore variant of a credential header; `X-Target-Origin` missing, invalid, or sent alone |
+| `auth_refused` | `endpoint` | `X-Target-Authorization` on `/inspect` or `/page` |
+| `auth_refused` | `method` | credentials with a method other than GET or HEAD |
+| `auth_refused` | `method_override` | credentials with a method-override header or a writing `_method` in the URL |
+| `auth_refused` | `userinfo` | userinfo in the `url` together with `X-Target-Authorization` |
+| `auth_refused` | `origin_mismatch` | the `url` is not on the origin in `X-Target-Origin` |
+| `auth_refused` | `insecure_scheme` | credentials over `http` to a target that is not `--allow-local`, or whose connected address is not loopback |
+| `blocked_target` | `private` | a private address, and `--allow-local` is not set (the v1.3.0 case) |
+| `blocked_target` | `not_allowlisted` | `--allow-local` is set, but this target (name, port or address) is not on the list |
+| `blocked_target` | `always_blocked` | never reachable, with or without `--allow-local` (cloud metadata, link-local, reserved space, the proxy's own port) |
+| `blocked_target` | `redirect_into_local` | a redirect from a public URL to an `--allow-local` target |
+| `blocked_target` | `unsupported_scheme` | `/page`: a redirect to a scheme other than http/https |
+
+The checks run in a fixed order: origin, method, token, `url`, then the
+credential rules (`invalid_value` → `endpoint` → `method` → `method_override` →
+`userinfo` → `origin_mismatch`), the SSRF pre-check (`blocked_target`), and
+last `insecure_scheme`. A caller without a valid token therefore learns nothing
+about the credential rules, and `http://foo.ddev.site` that is not on the list
+reports the missing allowance (`not_allowlisted`) rather than the scheme.
 
 **`type`** (since v1.3.0) is a human-readable class with the same texts as the
 PHP proxy's `error.type`. It is set on every upstream failure, on every `/page`
@@ -698,6 +1075,7 @@ async function proxyError(response) {
       const data = await response.json();
       err.message = `Proxy error: ${data.message}` + (data.type ? ` (${data.type})` : "");
       err.code = data.error;  // "dns_error", "tls_error", "timeout", ...
+      err.reason = data.reason;  // since v1.4.0: "not_allowlisted", "method", ... (or undefined)
       err.type = data.type;   // "Certificate expired", ...
     } catch { /* not JSON */ }
   }
@@ -769,9 +1147,20 @@ async function testProxy(base) {
 
 ### Recommended setup flow
 
-1. User enters address (`http://127.0.0.1:PORT`) and token
-2. Tool calls `/ping` to verify the connection
-3. All subsequent requests go through `/proxy?url=...`
+1. User enters address (`http://127.0.0.1:PORT`) and token. With
+   `--token-file` and a fixed `--port` this is needed only once.
+2. Tool calls `/ping` to verify the connection.
+3. Tool calls `/version?challenge=<64 random hex digits>` and checks `proof`
+   with the token (see [`/version`](#version-capabilities-and-proof-since-v140))
+   **before** it sends the token. A missing or wrong proof from a proxy that
+   lists `proof` in `capabilities` means something else answers on that port:
+   send neither token nor credentials.
+4. Token probe: `GET /inspect` with `X-Proxy-Token` and **without** `url`. A
+   valid token gives `400 bad_request`, an invalid one `403 forbidden` — no
+   upstream request, no DNS. This answer is a fixed contract since v1.4.0.
+5. Tool reads `capabilities` and enables what the proxy can do (e.g.
+   credentials only with `target-auth`).
+6. All subsequent requests go through `/proxy?url=...`.
 
 ---
 
@@ -781,10 +1170,12 @@ async function testProxy(base) {
 |---|---|
 | **Localhost-only** | Binds exclusively to `127.0.0.1`, never to `0.0.0.0` |
 | **Host check** | Requests must address the proxy as `127.0.0.0/8`, `localhost` or `[::1]` — blocks DNS rebinding against the proxy itself |
-| **Session token** | 48-character cryptographic random token, regenerated on each start; compared in constant time |
+| **Session token** | 48-character cryptographic random token, regenerated on each start unless `--token-file` is set; compared in constant time. `/version?challenge=…` proves the proxy holds it without revealing it |
 | **Origin check** | Only configured origins are allowed to send requests |
 | **SSRF protection** | Enforced in the dialer, after DNS resolution and before connect — see below |
-| **Credential isolation** | `Cookie`, `Authorization`, `Origin`, `Referer` and `Sec-Fetch-*` are never forwarded to the target |
+| **Credential isolation** | The browser's `Cookie`, `Authorization`, `Origin`, `Referer` and `Sec-Fetch-*` are never forwarded to the target (since v1.4.0 also in underscore spelling, e.g. `Sec_Fetch_Site`). Credentials reach a target only when a tool passes them explicitly in `X-Target-Authorization`, and only to the exact origin in `X-Target-Origin`, GET/HEAD only, over HTTPS — see [Target authentication](#target-authentication-since-v140). They are never logged |
+| **Local targets (opt-in)** | Off by default. `--allow-local` opens only the listed names and ranges; names reach loopback only; fixed blocks stay; requires `--origin`; no redirects from public into local targets — see [`--allow-local`](#--allow-local-local-and-staging-sites-since-v140) |
+| **Token file (opt-in)** | Off by default. `--token-file` keeps the token across restarts; absolute path, file `0600`, folder not writable by others — see [`--token-file`](#--token-file-keep-the-token-across-restarts-since-v140) |
 | **Configurable DNS** | Uses Cloudflare + Google DNS by default; custom servers or system DNS via `--dns` |
 | **TLS verification** | Every connection that carries HTTP data is verified. The only exception is the handshake-only [diagnostic probe](#tls-diagnostic-probe) (`diag=1` after a `tls_error`), which reads certificates and nothing else |
 | **Redirect control** | The HTTP client never follows a redirect by itself, and `Location` is never forwarded to the browser (it would carry the token to the target) — `/proxy` reports `X-Upstream-Location` instead. Redirects are followed only by the proxy's own code: `/proxy?follow=1` (max. 5, GET/HEAD) and `/page` (max. 20). Every hop must be http/https and passes the SSRF pre-check; the dialer enforces the rule again |
@@ -792,6 +1183,12 @@ async function testProxy(base) {
 | **Bounded work** | Every upstream request hangs off the client's request context; `/page` has an overall time budget |
 | **Hop-by-hop filter** | Proxy-internal, hop-by-hop and `Connection`-listed headers are stripped |
 | **Private Network Access** | Responds with `Access-Control-Allow-Private-Network: true` for Chrome PNA preflights |
+| **Metadata integrity** | Since v1.4.0 every `X-Upstream-*` header comes from the proxy; the same names sent by a target are dropped |
+
+**Your IP address.** Every request the proxy makes comes from your internet
+connection. The proxy does not throttle; a tool that sends many requests (link
+checks, API exploration) must pace itself, or web application firewalls may
+block your address.
 
 ### SSRF protection
 
@@ -815,6 +1212,14 @@ Blocked ranges cover loopback, RFC 1918 private, CGNAT, link-local (including
 cloud metadata at `169.254.169.254`), multicast and reserved space, plus the
 IPv6 forms that embed an IPv4 address — IPv4-mapped (`::ffff:127.0.0.1`), NAT64
 (`64:ff9b::/96`) and 6to4 (`2002::/16`).
+
+With `--allow-local` (since v1.4.0) a second guard sits in front of the dialer.
+It sees the requested name **and** the address it resolves to, connects to the
+checked IP literal, and lets the `Control` hook re-check it. Only a request
+whose URL is itself on the list may reach a local address; the decision travels
+with the request's context, and because every request gets its own connection
+(`DisableKeepAlives`), a connection opened for one request is never reused by
+another. Without `--allow-local` the dialer works exactly as in v1.3.0.
 
 ### TLS diagnostic probe
 
@@ -855,7 +1260,15 @@ TLS 1.2, and SSLv3.
 
 ### HTTPS pages calling HTTP localhost
 
-Browsers treat `http://127.0.0.1` as a **"potentially trustworthy origin"** (W3C Secure Contexts spec). Requests from an HTTPS page to the local proxy are **not blocked** as mixed content. Chrome's Private Network Access preflight is handled automatically.
+Browsers treat `http://127.0.0.1` as a **"potentially trustworthy origin"** (W3C Secure Contexts spec). Requests from an HTTPS page to the local proxy are **not blocked** as mixed content.
+
+Chrome replaces Private Network Access with **Local Network Access**: the first
+time an HTTPS page talks to `127.0.0.1`, Chrome asks you whether the site may
+access devices on your local network. Allow it for the tool's site; you can
+change the decision later in the site settings. `Access-Control-Allow-Private-Network`
+(still sent) does not replace this prompt. The prompt only covers the page
+talking to the proxy — not what the proxy sends on with `--allow-local`.
+<!-- TODO(LNA hand test): confirm Chrome's exact prompt and setting labels. -->
 
 ---
 
@@ -980,11 +1393,15 @@ GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o l
 Push the GitHub Actions workflow (`.github/workflows/build.yml`) and create a tag to trigger a release:
 
 ```bash
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.4.0
+git push origin v1.4.0
 ```
 
-This cross-compiles binaries for all platforms and creates a GitHub Release automatically.
+This cross-compiles binaries for all platforms, writes `SHA256SUMS` for the nine
+binaries (and checks it), and creates a **draft** GitHub Release with all of
+them (since v1.4.0). Hand-written notes in `.github/release-notes/<tag>.md` are
+used as the release text when present, followed by GitHub's generated list of
+changes. Download and test the binaries from the draft, then publish it.
 
 ---
 
@@ -1028,6 +1445,27 @@ runs **real TLS servers** via `httptest` against it:
   `javascript:` targets, POST).
 - **Errors and helpers:** timeout detection, RFC 3986 redirect resolution (all
   §5.4 examples), capped reads and UTF-8-safe truncation.
+
+Since v1.4.0:
+
+- **Golden test** (`compat_golden_test.go`): a fixed request matrix — the call
+  patterns of the seven JPKCom tools, every error path, preflights, `main()`
+  with and without flags — against `httptest` targets; every response (status,
+  headers, body) is compared with a file under `testdata/golden/`. The files
+  were recorded with v1.3.0; only the differences listed in the v1.4.0 changelog
+  may appear. Run `go test -run TestCompat_Golden -update` **only on purpose**,
+  and review the diff of `testdata/golden/` line by line before committing it.
+- **Target authentication** (`target_auth_test.go`): header form, origin
+  binding, redirect stops, method and `_method` guards on every hop, https
+  rule, header allowlist, cache headers, userinfo, and that no credential ever
+  reaches a log, a header or a body.
+- **Local targets** (`main_test.go`, `local_attack_test.go`): the
+  `--allow-local` parser, matching, rebinding, fixed blocks, redirects into
+  local targets, all endpoints, `reason` values, no connection reuse.
+- **Capabilities and token** (`cap_tok_test.go`, `tokenfile_unix_test.go`):
+  `/version` fields and `proof` test vectors, the token probe, `--token-file`
+  (create and reuse, content, permissions, symbolic links, concurrent starts,
+  banner).
 
 None of the tests needs network access.
 
@@ -1076,6 +1514,84 @@ x/tools v0.51.0 or newer, a plain `go install` works again.
 ---
 
 ## Changelog
+
+### v1.4.0 (unreleased)
+
+Feature release for the **WP REST API Explorer** of the JPKCom Tools:
+credentials for the target, local and staging sites, feature detection and a
+persistent token. Same toolchain as v1.3.0 (Go 1.27.3); no new dependencies.
+
+**Upgrade:** no new flags needed — unless you want local targets
+(`--allow-local`) or a token that survives a restart (`--token-file`).
+
+**New**
+
+- **Target authentication** on `/proxy`: `X-Target-Authorization`
+  (`Basic …` or `Bearer …`) plus the required `X-Target-Origin`. Only GET and
+  HEAD, no method overrides (`_method`, `X-HTTP-Method-Override`) on any hop,
+  only to the exact origin (a redirect to another origin ends the chain with
+  `X-Upstream-Auth: withheld-cross-origin`), only over HTTPS except to an
+  `--allow-local` target on loopback, `no-store`, a header allowlist, never
+  logged. New response headers `X-Upstream-Auth` and `X-Upstream-Cache-Control`.
+  See [Target authentication](#target-authentication-since-v140).
+- **`--allow-local "<list>"`**: reach listed local targets (DDEV, wp-env,
+  intranet). Names reach loopback only, LAN addresses only through an IP or
+  CIDR entry; narrow wildcards; dangerous ports and fixed blocks refused; needs
+  `--origin` with https origins, not with `--allow-any-host`; enforced in the
+  dialer (rebinding-proof); no redirects from public into local targets; all
+  endpoints. See [`--allow-local`](#--allow-local-local-and-staging-sites-since-v140).
+- **`--token-file <absolute path>`**: the token survives a restart. Atomic
+  creation, `0600`, checks of the file and of every folder on its path like
+  ssh. See
+  [`--token-file`](#--token-file-keep-the-token-across-restarts-since-v140).
+- **`/version`** reports `capabilities`, `localTargets`, `tokenPersistent` and
+  `limits`; **`/version?challenge=<64 hex>`** answers with `proof`
+  (HMAC-SHA256 with the token over port and challenge), so a tool can check
+  that its proxy — not another program on that port, and not one relaying to
+  the proxy on another port — answers before it sends the token.
+- **Error `auth_refused`** (400) and the field **`reason`** on `auth_refused`
+  and `blocked_target` (`private`, `not_allowlisted`, `always_blocked`,
+  `redirect_into_local`, `unsupported_scheme`), on `/page` also per hop
+  (`errorReason`). See [Error responses](#error-responses).
+- **Token probe as a contract:** `GET /inspect` with `X-Proxy-Token` and
+  without `url` answers `400 bad_request` for a valid token and `403 forbidden`
+  for an invalid one, without contacting anything.
+- **Banner:** a `WARNING` line for arguments left over after the flags (they and
+  every flag after them were always ignored); with `--allow-local` or
+  `--token-file` such leftovers are a start-up error (quote the list).
+- **Releases:** `SHA256SUMS` for all nine binaries; the release is created as a
+  draft and published by hand.
+
+**No behaviour change for existing tools.** Without the new headers and flags
+every endpoint answers as in v1.3.0, except for these additive differences:
+
+1. `Access-Control-Allow-Headers` is `Content-Type, X-Proxy-Token,
+   X-Target-Authorization, X-Target-Origin` (all endpoints).
+2. `/proxy` responses carry a second `Vary: X-Target-Authorization`.
+3. `/version` has the additional keys `capabilities`, `localTargets`,
+   `tokenPersistent` and `limits`; the old keys are unchanged strings.
+4. `blocked_target` errors carry `reason` (on `/page` also the hop field
+   `errorReason`).
+
+A golden test records the v1.3.0 answers and checks exactly this.
+
+**Security fixes** (only edge cases change):
+
+5. **Userinfo in the `url`** (`https://user:pass@host/`) now counts as
+   credentials: it is removed from the URL before any request and never
+   appears in `X-Upstream-Final-URL`, JSON or the log; POST and writing method
+   overrides with it are refused (`auth_refused`); `/proxy` answers with
+   `no-store` and `X-Upstream-Auth`. GET and HEAD authenticate as before, now
+   also on same-origin redirect hops. On every endpoint such a request only
+   passes the browser headers `Accept`, `Accept-Language`, `Accept-Encoding`,
+   `User-Agent`, `Cache-Control` and `Pragma` to the target (the allowlist
+   for credentials); custom headers are dropped.
+6. **Forged metadata:** `X-Upstream-*` headers sent by the target are dropped,
+   also in underscore spelling (`X_Upstream_Auth`). So are `X-Target-Authorization`
+   and `X-Target-Origin` in a target's response (like `X-Proxy-Token` since
+   v1.3.0: the proxy's own header names are hop-by-hop in both directions).
+   Request headers in underscore spelling of blocked names (`X_Proxy_Token`,
+   `Sec_Fetch_Site`, …) are treated like the hyphen form.
 
 ### v1.3.0
 

@@ -270,6 +270,10 @@ func TestProxy_OptionsCORS(t *testing.T) {
 	if got := rr.Header().Get("Access-Control-Allow-Private-Network"); got != "true" {
 		t.Errorf("expected Access-Control-Allow-Private-Network=true, got %q", got)
 	}
+	// AUTH-1: exactly the two credential headers are added, nothing else.
+	if got := rr.Header().Get("Access-Control-Allow-Headers"); got != "Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin" {
+		t.Errorf("unexpected Access-Control-Allow-Headers %q", got)
+	}
 }
 
 func TestProxy_SuccessfulForward(t *testing.T) {
@@ -314,13 +318,10 @@ func TestPing(t *testing.T) {
 	req.Header.Set("Origin", "https://test.example.com")
 	rr := httptest.NewRecorder()
 
+	// The real handler main registers (CAP-1); TestPingHandler has more.
 	cfg := newTestConfig()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		writeCORSHeaders(w, r, cfg)
-		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte("localproxy ok\n"))
-	})
+	mux.Handle("/ping", pingHandler(cfg))
 	mux.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -585,23 +586,11 @@ func TestVersionDefault(t *testing.T) {
 }
 
 func TestVersionEndpoint(t *testing.T) {
+	// The real handler main registers (CAP-1). Only the v1.3.0 keys are
+	// checked here; TestVersionHandler_Capabilities covers the new ones.
 	cfg := newTestConfig()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-		writeCORSHeaders(w, r, cfg)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"version": Version,
-			"license": License,
-			"author":  Author,
-			"url":     AuthorURL,
-			"repo":    RepoURL,
-		})
-	})
+	mux.Handle("/version", versionHandler(cfg))
 
 	req := httptest.NewRequest(http.MethodGet, "/version", nil)
 	req.Header.Set("Origin", "https://test.example.com")
@@ -614,7 +603,7 @@ func TestVersionEndpoint(t *testing.T) {
 	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("expected application/json, got %q", ct)
 	}
-	var resp map[string]string
+	var resp map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("could not decode version response: %v", err)
 	}
@@ -638,15 +627,7 @@ func TestVersionEndpoint(t *testing.T) {
 func TestVersionEndpoint_CORS_Preflight(t *testing.T) {
 	cfg := newTestConfig()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-		writeCORSHeaders(w, r, cfg)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"version": Version})
-	})
+	mux.Handle("/version", versionHandler(cfg))
 
 	req := httptest.NewRequest(http.MethodOptions, "/version", nil)
 	req.Header.Set("Origin", "https://test.example.com")
@@ -1556,6 +1537,12 @@ func TestCopyRequestHeaders_StripsSensitiveHeaders(t *testing.T) {
 	src.Header.Set("Referer", "https://www.jpkc.com/tools/seo/")
 	src.Header.Set("Sec-Fetch-Mode", "cors")
 	src.Header.Set("X-Proxy-Token", "the-session-token")
+	// Credential headers (AUTH-3) and underscore spellings of blocked names:
+	// raw map keys, as a non-browser caller can send them.
+	src.Header.Set("X-Target-Authorization", "Basic dGVzdA==")
+	src.Header.Set("X-Target-Origin", "https://example.com")
+	src.Header["X_Proxy_Token"] = []string{"the-session-token"}
+	src.Header["X_Target_Authorization"] = []string{"Basic dGVzdA=="}
 	// Headers the tools rely on and that must survive.
 	src.Header.Set("Accept", "text/markdown")
 	src.Header.Set("User-Agent", "Mozilla/5.0")
@@ -1566,8 +1553,14 @@ func TestCopyRequestHeaders_StripsSensitiveHeaders(t *testing.T) {
 	dst.Header = http.Header{}
 	copyRequestHeaders(src, dst)
 
-	for _, h := range []string{"Cookie", "Authorization", "Origin", "Referer", "Sec-Fetch-Mode", "X-Proxy-Token"} {
+	for _, h := range []string{"Cookie", "Authorization", "Origin", "Referer", "Sec-Fetch-Mode", "X-Proxy-Token",
+		"X-Target-Authorization", "X-Target-Origin"} {
 		if v := dst.Header.Get(h); v != "" {
+			t.Errorf("%s must not reach the upstream target, got %q", h, v)
+		}
+	}
+	for _, h := range []string{"X_Proxy_Token", "X_Target_Authorization"} {
+		if v, ok := dst.Header[h]; ok {
 			t.Errorf("%s must not reach the upstream target, got %q", h, v)
 		}
 	}

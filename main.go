@@ -20,6 +20,7 @@ import (
 	"crypto/dsa" //lint:ignore SA1019 only to describe legacy DSA certificate keys
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
@@ -30,6 +31,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -37,6 +39,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"maps"
 	"math"
@@ -46,6 +49,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -84,6 +88,11 @@ type config struct {
 	// sessionToken is a random hex string generated at startup that every
 	// request must supply via the X-Proxy-Token header.
 	sessionToken string
+
+	// tokenPersistent reports that sessionToken comes from --token-file and
+	// therefore survives a restart (TOK-2). /version shows it as a boolean
+	// only — never the path (CAP-1).
+	tokenPersistent bool
 
 	// requestTimeout is the maximum time allowed for a proxied request.
 	requestTimeout time.Duration
@@ -272,6 +281,154 @@ func generateToken(byteLen int) (string, error) {
 }
 
 // -----------------------------------------------------------------------
+// Token file (--token-file) — since v1.4.0
+// -----------------------------------------------------------------------
+//
+// With --token-file the session token survives a restart (TOK-2): the first
+// start writes a fresh token to the file, every later start reads it back.
+// Nothing about the file ever leaves the local terminal — /version only says
+// tokenPersistent: true.
+//
+// The checks follow what ssh does for private keys. On Unix the file is
+// opened with O_NOFOLLOW and checked on the open descriptor (regular file,
+// owned by the user, no group/other bits) — no Lstat-then-Open window — and
+// neither its folder nor any folder above it may let anybody else replace
+// it (owner = user or root, not group/world-writable unless sticky; like ssh
+// StrictModes). The platform parts live in
+// tokenfile_unix.go and tokenfile_other.go.
+
+// tokenFileHelp is the fatal message for a path that is not absolute or still
+// contains shell syntax nobody expanded.
+const tokenFileHelp = `--token-file needs an absolute path; in PowerShell use $env:LOCALAPPDATA\localproxy\token, in cmd %LOCALAPPDATA%\localproxy\token, in bash/zsh $HOME/.config/localproxy/token (no quotes around ~)`
+
+// tokenFileMaxBytes caps how much of the token file is read; a token is 48
+// characters plus a line break.
+const tokenFileMaxBytes = 4096
+
+// tokenFormat is exactly what generateToken(24) produces. A token file with
+// anything else — a hand-made "secret", a truncated copy — is refused rather
+// than accepted as a weak token.
+var tokenFormat = regexp.MustCompile(`^[0-9a-f]{48}$`)
+
+// checkTokenFilePath refuses a path the proxy cannot use reliably: relative
+// (it would depend on the folder the proxy happens to start in), or holding
+// %, $ or a leading ~ — shell syntax that was not expanded. PowerShell does
+// not expand %LOCALAPPDATA% (cmd syntax), and bash/zsh leave ~ alone inside
+// quotes and after "=", so the proxy would create a folder literally named
+// "%LOCALAPPDATA%" or "~" in the working directory.
+func checkTokenFilePath(path string) error {
+	if path == "" || strings.ContainsAny(path, "%$") || strings.HasPrefix(path, "~") || !filepath.IsAbs(path) {
+		return errors.New(tokenFileHelp)
+	}
+	return nil
+}
+
+// loadOrCreateToken returns the token stored at path, or creates the file
+// with a new token when it does not exist yet (created = true). Every problem
+// is an error the caller treats as fatal.
+//
+// Creation is atomic: the token is written to a temporary file in the same
+// folder (0600, synced) and hard-linked to path. If a second proxy started at
+// the same moment won the race, the link fails with "exists" and the file it
+// wrote is read instead — with all the checks. No half-written file is ever
+// visible under path, and the temporary file is always removed.
+func loadOrCreateToken(path string) (token string, created bool, err error) {
+	if err := checkTokenFilePath(path); err != nil {
+		return "", false, err
+	}
+	path = filepath.Clean(path)
+	dir := filepath.Dir(path)
+
+	// MkdirAll does not change the mode of a folder that already exists;
+	// checkTokenDir looks at what is really there.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", false, fmt.Errorf("--token-file: cannot create the folder %s: %v", dir, err)
+	}
+	if err := checkTokenDir(dir); err != nil {
+		return "", false, err
+	}
+
+	token, err = readTokenFile(path)
+	if err == nil {
+		return token, false, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", false, err
+	}
+
+	token, err = generateToken(24)
+	if err != nil {
+		return "", false, err
+	}
+	tmp, err := os.CreateTemp(dir, ".localproxy-token-*")
+	if err != nil {
+		return "", false, fmt.Errorf("--token-file: cannot write in %s: %v", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	// CreateTemp already uses 0600; Chmod makes it explicit (and is a no-op
+	// for the permission bits on Windows).
+	werr := tmp.Chmod(0o600)
+	if werr == nil {
+		_, werr = tmp.WriteString(token + "\n")
+	}
+	if werr == nil {
+		werr = tmp.Sync()
+	}
+	if cerr := tmp.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return "", false, fmt.Errorf("--token-file: cannot write in %s: %v", dir, werr)
+	}
+
+	if err := os.Link(tmpName, path); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			// Another start created it in the meantime: use that token.
+			token, err = readTokenFile(path)
+			if err != nil {
+				return "", false, err
+			}
+			return token, false, nil
+		}
+		return "", false, fmt.Errorf("--token-file: cannot create %s (%v); choose a folder on a local disk", path, err)
+	}
+	return token, true, nil
+}
+
+// readTokenFile opens path with the platform checks (openTokenFile,
+// checkTokenFileInfo) and returns the token it holds. A missing file comes
+// back as an error matching fs.ErrNotExist.
+func readTokenFile(path string) (string, error) {
+	f, err := openTokenFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		return "", fmt.Errorf("--token-file: cannot open %s (a symbolic link is not accepted): %v", path, err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("--token-file: cannot read %s: %v", path, err)
+	}
+	if err := checkTokenFileInfo(path, fi); err != nil {
+		return "", err
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, tokenFileMaxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("--token-file: cannot read %s: %v", path, err)
+	}
+	token := strings.TrimSpace(string(data))
+	if len(data) > tokenFileMaxBytes || !tokenFormat.MatchString(token) {
+		return "", fmt.Errorf("--token-file: %s does not hold a localproxy token (48 lowercase hex characters); delete the file to get a new one", path)
+	}
+	return token, nil
+}
+
+// -----------------------------------------------------------------------
 // JSON error responses
 // -----------------------------------------------------------------------
 
@@ -339,15 +496,33 @@ type authorizedRequest struct {
 	// (LOCAL-6). The handler puts it on the request context (withLocalStart),
 	// from which every upstream request and the dialer read it.
 	localStart bool
+	// creds are the credentials for the target — from X-Target-Authorization
+	// (/proxy only) or from userinfo in the url — or nil for an anonymous
+	// request. target no longer carries userinfo either way (AUTH-13).
+	creds *targetAuth
 }
 
+// Endpoint names handed to authorizeRequest; only /proxy accepts
+// X-Target-Authorization (AUTH-4).
+const (
+	endpointProxy   = "/proxy"
+	endpointInspect = "/inspect"
+	endpointPage    = "/page"
+)
+
 // authorizeRequest runs the checks every authenticated endpoint shares: method,
-// CORS preflight, origin, token, target URL and the SSRF pre-check.
+// CORS preflight, origin, token, target URL, target credentials (checkTargetAuth)
+// and the SSRF pre-check. endpoint is one of the endpoint* names.
+//
+// The order is fixed: a caller without a valid token learns nothing about the
+// credential rules, and a credential refusal never contacts the target —
+// "insecure_scheme" alone comes after the pre-check, so an http target that is
+// not on the --allow-local list reports the missing allowance instead (AUTH-11).
 //
 // It returns the parsed target and true when the caller should proceed. When it
 // returns false it has already written the complete response — including the
 // 204 for a preflight — and the caller must return immediately.
-func authorizeRequest(w http.ResponseWriter, r *http.Request, cfg *config, allowedMethods ...string) (*authorizedRequest, bool) {
+func authorizeRequest(w http.ResponseWriter, r *http.Request, cfg *config, endpoint string, allowedMethods ...string) (*authorizedRequest, bool) {
 	if r.Method == http.MethodOptions {
 		writeCORSHeaders(w, r, cfg)
 		w.WriteHeader(http.StatusNoContent)
@@ -386,6 +561,14 @@ func authorizeRequest(w http.ResponseWriter, r *http.Request, cfg *config, allow
 		return nil, false
 	}
 
+	// Credentials for the target (AUTH-2 … AUTH-13). Also strips userinfo
+	// from target, so it never reaches a request, a header, JSON or a log.
+	creds, refusal := checkTargetAuth(r, endpoint, target)
+	if refusal != nil {
+		writeUpstreamError(w, r, cfg, refusal)
+		return nil, false
+	}
+
 	// Purely syntactic (no DNS): is the start URL itself an --allow-local
 	// target? Decides whether this request may reach local addresses at all.
 	localStart := cfg.allowLocalMatchURL(target)
@@ -395,7 +578,466 @@ func authorizeRequest(w http.ResponseWriter, r *http.Request, cfg *config, allow
 		return nil, false
 	}
 
-	return &authorizedRequest{target: target, localStart: localStart}, true
+	// AUTH-8, first stage: header credentials over plain http only to an
+	// --allow-local target. The dialer then admits loopback addresses only
+	// (authOverHTTPFrom). Userinfo keeps its v1.3.0 behaviour here.
+	if creds != nil && !creds.fromUserinfo && target.Scheme == "http" && !localStart {
+		writeUpstreamError(w, r, cfg, authRefused(reasonInsecureScheme))
+		return nil, false
+	}
+
+	return &authorizedRequest{target: target, localStart: localStart, creds: creds}, true
+}
+
+// -----------------------------------------------------------------------
+// Target credentials (X-Target-Authorization, userinfo) — since v1.4.0
+// -----------------------------------------------------------------------
+//
+// A caller hands credentials for the target in X-Target-Authorization (the
+// complete Authorization value, "Basic …" or "Bearer …") together with
+// X-Target-Origin, the origin they were entered for. Userinfo in the url
+// (https://user:pass@host/) counts as implicit Basic credentials. The rules:
+//
+//   - Only /proxy takes the header; /inspect and /page refuse it (AUTH-4).
+//   - With credentials only GET and HEAD (AUTH-5), never with a method
+//     override in a header or in the query (?_method=DELETE, AUTH-6).
+//   - Authorization goes only to the exact origin of the url — with the
+//     header also the origin of X-Target-Origin — and attachTargetAuth is the
+//     only place that sets it (AUTH-7). With the header a redirect to another
+//     origin ends the chain; userinfo just goes on anonymously.
+//   - Header credentials over http only to an --allow-local target whose
+//     connected address is loopback (AUTH-8).
+//   - The value never appears in a log, a message, a header or JSON, and
+//     userinfo never stays in a URL (LOG-1, LOG-2).
+//
+// "Read only" here means: no write method and no method override. Side
+// effects of GET routes are not the proxy's to know; the tool keeps to its
+// own route allowlist.
+
+// Reason sub-codes of auth_refused (proxyError.Reason, AUTH-11).
+const (
+	// reasonInvalidValue: malformed, repeated, empty or oversized
+	// X-Target-Authorization, an underscore variant of either credential
+	// header, or a missing or invalid X-Target-Origin.
+	reasonInvalidValue = "invalid_value"
+	// reasonEndpoint: X-Target-Authorization on /inspect or /page.
+	reasonEndpoint = "endpoint"
+	// reasonMethod: credentials with a method other than GET or HEAD.
+	reasonMethod = "method"
+	// reasonMethodOverride: credentials with a method-override header or a
+	// writing _method in the url's query.
+	reasonMethodOverride = "method_override"
+	// reasonUserinfo: userinfo in the url together with the header.
+	reasonUserinfo = "userinfo"
+	// reasonOriginMismatch: the url is not on X-Target-Origin.
+	reasonOriginMismatch = "origin_mismatch"
+	// reasonInsecureScheme: header credentials over http to a target that is
+	// not --allow-local, or whose connected address is not loopback.
+	reasonInsecureScheme = "insecure_scheme"
+)
+
+// Values of the X-Upstream-Auth response header on /proxy.
+const (
+	// authSent: Authorization went with every request of this response.
+	authSent = "sent"
+	// authWithheldCrossOrigin: the chain ended before a redirect to another
+	// origin; the response is that 3xx.
+	authWithheldCrossOrigin = "withheld-cross-origin"
+	// authWithheldMethodOverride: the chain ended before a redirect to a URL
+	// with a writing method override; the response is that 3xx.
+	authWithheldMethodOverride = "withheld-method-override"
+	// authWithheld: userinfo only — at least one request of the chain went
+	// without Authorization (another origin, or an override in its query).
+	authWithheld = "withheld"
+)
+
+// Limits of the credential headers (AUTH-2, AUTH-12).
+const (
+	maxTargetAuthLen   = 8192
+	maxTargetOriginLen = 512
+)
+
+// targetAuthPattern is the accepted form of X-Target-Authorization: scheme,
+// one space and a token68 (RFC 9110 §11.2). It rules out control characters,
+// spaces inside the value, comma lists and every other scheme.
+var targetAuthPattern = regexp.MustCompile(`^(?i:basic|bearer) [A-Za-z0-9\-._~+/]+=*$`)
+
+// methodOverrideHeaders are the (normHeader) names frameworks read as the
+// "real" method of a request. Any of them, with any value, refuses a request
+// with credentials.
+var methodOverrideHeaders = map[string]struct{}{
+	"x-http-method-override": {},
+	"x-http-method":          {},
+	"x-method-override":      {},
+}
+
+// errInsecureAuth is returned by the dialer when a request with header
+// credentials over http would connect to an address that is not loopback
+// (AUTH-8). Nothing has been sent at that point; upstreamFailure maps it to
+// auth_refused/insecure_scheme.
+var errInsecureAuth = errors.New("credentials over http are only sent to a loopback address")
+
+// targetAuth is the credential of one request. It lives on the request's
+// context (withTargetAuth) and is used by one handler at a time.
+type targetAuth struct {
+	// value is the complete Authorization value with a canonical scheme.
+	// Never logged, echoed or put into a URL.
+	value string
+	// origin (originOf form) is the only origin value is sent to.
+	origin string
+	// fromUserinfo marks implicit credentials from the url's userinfo; they
+	// keep the v1.3.0 behaviour wherever AUTH-13 allows it.
+	fromUserinfo bool
+	// withheld records that attachTargetAuth left a request of this chain
+	// without Authorization.
+	withheld atomic.Bool
+}
+
+// state is the X-Upstream-Auth value for a /proxy response. stopped is why
+// the handler ended the chain early, or "".
+func (a *targetAuth) state(stopped string) string {
+	if stopped != "" {
+		return stopped
+	}
+	if a.withheld.Load() {
+		return authWithheld
+	}
+	return authSent
+}
+
+// authRefused builds the auth_refused error for a reason. Its messages are
+// fixed texts: they never name a credential.
+func authRefused(reason string) *proxyError {
+	message := map[string]string{
+		reasonInvalidValue:   "X-Target-Authorization must be 'Basic <credentials>' or 'Bearer <token>', sent once, together with X-Target-Origin naming one origin",
+		reasonEndpoint:       "X-Target-Authorization is only accepted on /proxy",
+		reasonMethod:         "credentials allow GET and HEAD only",
+		reasonMethodOverride: "credentials cannot be combined with a method override",
+		reasonUserinfo:       "url must not contain credentials when X-Target-Authorization is set",
+		reasonOriginMismatch: "url is not on the origin the credentials were entered for",
+		reasonInsecureScheme: "credentials are only sent over https (or over http to an --allow-local target on this computer)",
+	}[reason]
+	return &proxyError{Error: "auth_refused", Message: message, Status: http.StatusBadRequest, Reason: reason}
+}
+
+// checkTargetAuth reads the credentials of a request for target and applies
+// every rule that needs no network, in the order of AUTH-11: invalid_value,
+// endpoint, method, method_override, userinfo, origin_mismatch. It always
+// removes userinfo from target. It returns nil credentials for an anonymous
+// request, and a refusal that the caller writes as it is.
+func checkTargetAuth(r *http.Request, endpoint string, target *url.URL) (*targetAuth, *proxyError) {
+	// Userinfo is taken out of the URL first, whatever happens next: it
+	// must never reach a request, a header, JSON or a log (AUTH-13, LOG-2).
+	userinfo := target.User
+	target.User = nil
+
+	// Header names as a server behind PHP sees them (normHeader).
+	var variant, override bool
+	for key := range r.Header {
+		name := normHeader(key)
+		switch name {
+		case "x-target-authorization", "x-target-origin":
+			// A spelling other than the canonical one (X_Target_Origin,
+			// a lower-case map key set by a non-browser caller) must never
+			// pass silently.
+			if key != http.CanonicalHeaderKey(name) {
+				variant = true
+			}
+		}
+		if _, ok := methodOverrideHeaders[name]; ok {
+			override = true
+		}
+	}
+	authValues := r.Header.Values("X-Target-Authorization")
+	originValues := r.Header.Values("X-Target-Origin")
+	headerMode := variant || len(authValues) > 0 || len(originValues) > 0
+
+	var creds *targetAuth
+	if headerMode {
+		if variant || len(authValues) != 1 || len(originValues) != 1 {
+			return nil, authRefused(reasonInvalidValue)
+		}
+		value, ok := canonicalTargetAuth(authValues[0])
+		if !ok {
+			return nil, authRefused(reasonInvalidValue)
+		}
+		origin, ok := parseTargetOrigin(originValues[0])
+		if !ok {
+			return nil, authRefused(reasonInvalidValue)
+		}
+		if endpoint != endpointProxy {
+			return nil, authRefused(reasonEndpoint)
+		}
+		creds = &targetAuth{value: value, origin: origin}
+	} else if userinfo != nil {
+		// Exactly what net/http's client would have sent for this URL.
+		password, _ := userinfo.Password()
+		creds = &targetAuth{
+			value:        "Basic " + base64.StdEncoding.EncodeToString([]byte(userinfo.Username()+":"+password)),
+			origin:       originOf(target),
+			fromUserinfo: true,
+		}
+	}
+	if creds == nil {
+		return nil, nil
+	}
+
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return nil, authRefused(reasonMethod)
+	}
+	if override || writesViaOverride(target) {
+		return nil, authRefused(reasonMethodOverride)
+	}
+	if headerMode && userinfo != nil {
+		return nil, authRefused(reasonUserinfo)
+	}
+	if originOf(target) != creds.origin {
+		return nil, authRefused(reasonOriginMismatch)
+	}
+	return creds, nil
+}
+
+// canonicalTargetAuth checks an X-Target-Authorization value (AUTH-2) and
+// returns it with the scheme written "Basic" or "Bearer".
+func canonicalTargetAuth(v string) (string, bool) {
+	if len(v) > maxTargetAuthLen || !targetAuthPattern.MatchString(v) {
+		return "", false
+	}
+	scheme, token, _ := strings.Cut(v, " ")
+	if strings.EqualFold(scheme, "basic") {
+		return "Basic " + token, true
+	}
+	return "Bearer " + token, true
+}
+
+// parseTargetOrigin checks an X-Target-Origin value — http or https, a host,
+// an optional port and nothing else (AUTH-12) — and returns it in originOf form.
+func parseTargetOrigin(v string) (string, bool) {
+	if v == "" || len(v) > maxTargetOriginLen {
+		return "", false
+	}
+	u, err := url.Parse(v)
+	if err != nil || u.Opaque != "" || u.User != nil || u.Host == "" || u.Hostname() == "" ||
+		u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery ||
+		u.Fragment != "" || strings.Contains(v, "#") {
+		return "", false
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return "", false
+		}
+	}
+	o := originOf(u)
+	return o, o != ""
+}
+
+// originOf is the origin of an http or https URL as a comparable string:
+// lower-case scheme and host (without a trailing dot) and the effective port,
+// e.g. "https://example.com:443". "" for any other scheme or an empty host.
+// No IDNA: a Unicode host and its Punycode form are different origins here.
+func originOf(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if host == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+		if scheme == "http" {
+			port = "80"
+		}
+	} else if n, err := strconv.Atoi(port); err == nil {
+		port = strconv.Itoa(n) // ":0443" and ":443" are one origin
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+// writesViaOverride reports whether u's query could make WordPress (or any
+// framework reading PHP's $_GET['_method']) treat the request as something
+// other than GET, HEAD or OPTIONS. It mirrors how PHP registers query names
+// (AUTH-6):
+//
+//   - pairs are split at "&" and at ";" (arg_separator.input may contain it);
+//   - names and values are URL-decoded ("+" is a space); any control
+//     character in either — a NUL cuts the name in PHP — is refused;
+//   - leading spaces of a name are dropped; the base name is the part before
+//     the first "[", with "." and " " turned into "_";
+//   - a base name equal to "_method" in any case must be a plain value GET,
+//     HEAD or OPTIONS (ASCII case, surrounding spaces ignored); an array form
+//     or any other value is refused.
+//
+// Every occurrence is checked (PHP keeps the last; being stricter is safe).
+func writesViaOverride(u *url.URL) bool {
+	for _, pair := range strings.FieldsFunc(u.RawQuery, func(r rune) bool { return r == '&' || r == ';' }) {
+		rawName, rawValue, _ := strings.Cut(pair, "=")
+		name, value := phpURLDecode(rawName), phpURLDecode(rawValue)
+		if hasControlChar(name) || hasControlChar(value) {
+			return true
+		}
+		name = strings.TrimLeft(name, " ")
+		base, _, isArray := strings.Cut(name, "[")
+		base = strings.NewReplacer(".", "_", " ", "_").Replace(base)
+		if !strings.EqualFold(base, "_method") {
+			continue
+		}
+		if isArray {
+			return true
+		}
+		// ASCII only, like PHP 8's strtoupper: the Unicode-aware
+		// strings.ToUpper/TrimSpace would turn "OPTıONS" (dotless i) or
+		// "OPTIONſ" (long s) into OPTIONS, or drop a no-break space, and let
+		// a value pass that WordPress does not read as GET/HEAD/OPTIONS.
+		switch asciiUpper(strings.Trim(value, " ")) {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// asciiUpper upper-cases a-z and leaves every other byte alone.
+func asciiUpper(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'a' <= c && c <= 'z' {
+			b[i] = c - ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+// phpURLDecode decodes like PHP's urldecode: "+" becomes a space, "%XX" a
+// byte, and a "%" not followed by two hex digits stays as it is.
+func phpURLDecode(s string) string {
+	if !strings.ContainsAny(s, "%+") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '+':
+			b.WriteByte(' ')
+		case c == '%' && i+2 < len(s) && isHexDigit(s[i+1]) && isHexDigit(s[i+2]):
+			v, _ := strconv.ParseUint(s[i+1:i+3], 16, 8)
+			b.WriteByte(byte(v))
+			i += 2
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func isHexDigit(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+// hasControlChar reports a byte below 0x20 or 0x7F.
+func hasControlChar(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
+}
+
+// attachTargetAuth sets Authorization on an upstream request when the
+// request's context carries credentials, the request goes to their origin and
+// its URL passes the override guard — and removes any Authorization otherwise.
+// It is the only place that sets the header, on every endpoint, so a code path
+// that forgot a check sends anonymously, never with credentials (AUTH-6/7).
+func attachTargetAuth(req *http.Request) {
+	req.Header.Del("Authorization")
+	creds := targetAuthFrom(req.Context())
+	if creds == nil {
+		return
+	}
+	if originOf(req.URL) != creds.origin || writesViaOverride(req.URL) {
+		creds.withheld.Store(true)
+		return
+	}
+	req.Header.Set("Authorization", creds.value)
+}
+
+// targetAuthKey and authOverHTTPKey are the context keys of withTargetAuth
+// and withAuthOverHTTP.
+type (
+	targetAuthKey   struct{}
+	authOverHTTPKey struct{}
+)
+
+// withTargetAuth records the request's credentials (nil: anonymous) on ctx,
+// from which doTraced and probeContentEncoding read them.
+func withTargetAuth(ctx context.Context, creds *targetAuth) context.Context {
+	if creds == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, targetAuthKey{}, creds)
+}
+
+// targetAuthFrom reads the credentials withTargetAuth recorded. Missing means
+// none: a code path that lost them sends anonymously.
+func targetAuthFrom(ctx context.Context) *targetAuth {
+	creds, _ := ctx.Value(targetAuthKey{}).(*targetAuth)
+	return creds
+}
+
+// withAuthOverHTTP marks a request with header credentials over plain http:
+// the dialer then connects to loopback addresses only (AUTH-8).
+func withAuthOverHTTP(ctx context.Context) context.Context {
+	return context.WithValue(ctx, authOverHTTPKey{}, true)
+}
+
+// authOverHTTPFrom reads the mark withAuthOverHTTP set.
+func authOverHTTPFrom(ctx context.Context) bool {
+	v, _ := ctx.Value(authOverHTTPKey{}).(bool)
+	return v
+}
+
+// loopbackOnlyControl is a dial Control hook that refuses every address that
+// is not loopback with errInsecureAuth and hands the rest to next.
+func loopbackOnlyControl(next func(network, address string, c syscall.RawConn) error) func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, rc syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() {
+			return errInsecureAuth
+		}
+		if next == nil {
+			return nil
+		}
+		return next(network, address, rc)
+	}
+}
+
+// varyTargetAuthWriter adds "Vary: X-Target-Authorization" to a /proxy
+// response when its header is written — after writeCORSHeaders added
+// "Vary: Origin", whatever path wrote the response (AUTH-10).
+type varyTargetAuthWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (v *varyTargetAuthWriter) WriteHeader(status int) {
+	if !v.wroteHeader {
+		v.wroteHeader = true
+		v.Header().Add("Vary", "X-Target-Authorization")
+	}
+	v.ResponseWriter.WriteHeader(status)
+}
+
+func (v *varyTargetAuthWriter) Write(b []byte) (int, error) {
+	if !v.wroteHeader {
+		v.WriteHeader(http.StatusOK)
+	}
+	return v.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (v *varyTargetAuthWriter) Unwrap() http.ResponseWriter {
+	return v.ResponseWriter
 }
 
 // classifyUpstreamError inspects the error chain from an upstream request and
@@ -496,6 +1138,11 @@ func isTimeout(err error) bool {
 // expired deadline is authoritative even when the transport reports the
 // cancellation in some other shape.
 func upstreamFailure(ctx context.Context, err error) *proxyError {
+	// The dialer refused to carry credentials over http to an address that is
+	// not loopback (AUTH-8). Not an upstream failure: nothing was sent.
+	if errors.Is(err, errInsecureAuth) {
+		return authRefused(reasonInsecureScheme)
+	}
 	code, message := classifyUpstreamError(err)
 	if ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		code, message = "timeout", "upstream request timed out"
@@ -734,21 +1381,42 @@ func isFollowableRedirect(status int) bool {
 // replayed) the proxy follows up to maxProxyRedirects redirects itself, each
 // target passing the SSRF pre-check first, and reports where it ended up in
 // X-Upstream-Final-URL and X-Upstream-Redirects.
+//
+// Credentials (X-Target-Authorization or userinfo, see checkTargetAuth) go only
+// to the start URL's origin, with GET and HEAD, and never with a method
+// override. With header credentials a redirect to another origin — or to a URL
+// with a write override — ends the chain before that request; the 3xx is
+// returned with X-Upstream-Auth saying why (AUTH-6, AUTH-7). An authenticated
+// response is never stored by the browser (AUTH-10).
 func proxyHandler(cfg *config, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every /proxy response varies on X-Target-Authorization, so the
+		// browser cache never hands an anonymous answer to an authenticated
+		// request or the other way round (AUTH-10). Added at WriteHeader,
+		// after writeCORSHeaders' "Vary: Origin".
+		w = &varyTargetAuthWriter{ResponseWriter: w}
 
 		// ------------------------------------------------------------------
-		// 1.-4. Method, CORS preflight, origin, token, target URL, SSRF.
+		// 1.-4. Method, CORS preflight, origin, token, target URL,
+		//       credentials, SSRF.
 		// ------------------------------------------------------------------
-		auth, ok := authorizeRequest(w, r, cfg,
+		auth, ok := authorizeRequest(w, r, cfg, endpointProxy,
 			http.MethodGet, http.MethodHead, http.MethodPost)
 		if !ok {
 			return
 		}
 		target := auth.target
+		creds := auth.creds
+		headerAuth := creds != nil && !creds.fromUserinfo
 		// Every upstream request below derives its context from r, so the
-		// dialer sees whether this request may reach local targets.
-		r = r.WithContext(withLocalStart(r.Context(), auth.localStart))
+		// dialer sees whether this request may reach local targets — and,
+		// for header credentials over http, that it may reach loopback only
+		// (AUTH-8) — and doTraced which credentials it may attach.
+		ctxValues := withTargetAuth(withLocalStart(r.Context(), auth.localStart), creds)
+		if headerAuth && target.Scheme == "http" {
+			ctxValues = withAuthOverHTTP(ctxValues)
+		}
+		r = r.WithContext(ctxValues)
 		follow := r.URL.Query().Get("follow") == "1" && r.Method != http.MethodPost
 
 		// ------------------------------------------------------------------
@@ -769,6 +1437,9 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 		current := target
 		visited := map[string]bool{current.String(): true}
 		redirects := 0
+		// authStopped names why header credentials ended the chain early
+		// ("withheld-cross-origin", "withheld-method-override"), or "".
+		authStopped := ""
 		var (
 			resp         *http.Response
 			ct           *connTrace
@@ -789,6 +1460,21 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 			// visited, is returned as it is — the caller sees the 3xx.
 			next, err := resolveRedirect(current, lastLocation(resp.Header))
 			if err != nil || visited[next.String()] {
+				break
+			}
+			// Header credentials never travel to another origin, and are
+			// never followed to another one anonymously either: anonymous
+			// data under "authenticated" would mislead the caller. The 3xx
+			// is returned before any DNS lookup or request for next (AUTH-7).
+			if headerAuth && originOf(next) != creds.origin {
+				authStopped = authWithheldCrossOrigin
+				break
+			}
+			// Nor to a same-origin URL whose query would turn the request
+			// into a write (?_method=DELETE, AUTH-6). With userinfo the hop
+			// goes on without credentials (doTraced leaves them off).
+			if headerAuth && writesViaOverride(next) {
+				authStopped = authWithheldMethodOverride
 				break
 			}
 			// A public start never leads into an --allow-local target: a
@@ -832,6 +1518,19 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 		writeCORSHeaders(w, r, cfg)
 		copyResponseHeaders(resp, w)
 
+		// An authenticated response holds private data: it never goes into
+		// the browser cache. The target's own policy travels as
+		// X-Upstream-Cache-Control (AUTH-10); validators that would let the
+		// browser revalidate a stored copy are dropped with it.
+		if creds != nil {
+			if cc := resp.Header.Values("Cache-Control"); len(cc) > 0 {
+				w.Header().Set("X-Upstream-Cache-Control", strings.Join(cc, ", "))
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Del("Expires")
+			w.Header().Del("ETag")
+		}
+
 		// Upstream metadata headers (timing, IP, protocol, content info).
 		w.Header().Set("X-Upstream-Protocol", resp.Proto)
 		if ip := ct.remoteIP(); ip != "" {
@@ -854,6 +1553,11 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 			w.Header().Set("X-Upstream-Final-URL", current.String())
 			w.Header().Set("X-Upstream-Redirects", strconv.Itoa(redirects))
 		}
+		// Whether the credentials went with every request of this response
+		// (AUTH-7, AUTH-13). A state, never a value.
+		if creds != nil {
+			w.Header().Set("X-Upstream-Auth", creds.state(authStopped))
+		}
 		// Build explicit Access-Control-Expose-Headers from the forwarded
 		// response headers (wildcard "*" doesn't work with specific origins
 		// per spec).
@@ -872,6 +1576,16 @@ func proxyHandler(cfg *config, client *http.Client) http.Handler {
 			"X-Upstream-Final-URL", "X-Upstream-Redirects",
 		} {
 			exposeSet[h] = struct{}{}
+		}
+		// Listed only with credentials, so the list of an anonymous
+		// response stays exactly as in v1.3.0.
+		if creds != nil {
+			delete(exposeSet, http.CanonicalHeaderKey("ETag"))
+			delete(exposeSet, http.CanonicalHeaderKey("Expires"))
+			exposeSet["X-Upstream-Auth"] = struct{}{}
+			if w.Header().Get("X-Upstream-Cache-Control") != "" {
+				exposeSet["X-Upstream-Cache-Control"] = struct{}{}
+			}
 		}
 		w.Header().Set("Access-Control-Expose-Headers", strings.Join(slices.Sorted(maps.Keys(exposeSet)), ", "))
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1904,20 +2618,41 @@ func extractSSLInfo(state *tls.ConnectionState, host string) *sslInfo {
 // doTraced performs one upstream request with a connTrace of its own, attached
 // to that request only — so timing and IP describe exactly this request, not a
 // probe that ran before it. The caller closes resp.Body.
+//
+// Credentials on ctx (withTargetAuth) are attached last, after tweak, and only
+// where attachTargetAuth allows — the single place that sets Authorization.
 func doTraced(ctx context.Context, client *http.Client, method, target string, browserReq *http.Request,
 	tweak func(*http.Request)) (resp *http.Response, ct *connTrace, start time.Time, err error) {
 	ct = &connTrace{}
 	start = time.Now()
-	req, err := http.NewRequestWithContext(ct.attach(ctx), method, target, nil)
+	req, err := newUpstreamRequest(ct.attach(ctx), method, target, browserReq)
 	if err != nil {
 		return nil, ct, start, err
 	}
-	copyRequestHeaders(browserReq, req)
 	if tweak != nil {
 		tweak(req)
 	}
+	attachTargetAuth(req)
 	resp, err = client.Do(req)
 	return resp, ct, start, err
+}
+
+// newUpstreamRequest builds an upstream request with the browser's headers
+// (copyRequestHeaders, or only the credential allowlist when ctx carries
+// credentials). The URL never carries userinfo: net/http would otherwise turn
+// it into an Authorization header of its own (AUTH-13).
+func newUpstreamRequest(ctx context.Context, method, target string, browserReq *http.Request) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.URL.User = nil
+	if targetAuthFrom(ctx) != nil {
+		copyAllowedRequestHeaders(browserReq, req)
+	} else {
+		copyRequestHeaders(browserReq, req)
+	}
+	return req, nil
 }
 
 // isHeadRefused reports a status that means "this server does not do HEAD".
@@ -1932,11 +2667,11 @@ func isHeadRefused(status int) bool {
 // its own header would hide that. The HEAD is untraced: reported timing and
 // IP belong to the GET. Returns "" on failure; the GET reports the error.
 func probeContentEncoding(ctx context.Context, client *http.Client, target string, browserReq *http.Request) string {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, target, nil)
+	req, err := newUpstreamRequest(ctx, http.MethodHead, target, browserReq)
 	if err != nil {
 		return ""
 	}
-	copyRequestHeaders(browserReq, req)
+	attachTargetAuth(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return ""
@@ -1962,13 +2697,15 @@ func probeContentEncoding(ctx context.Context, client *http.Client, target strin
 func inspectHandler(cfg *config, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		auth, ok := authorizeRequest(w, r, cfg, http.MethodGet, http.MethodHead)
+		auth, ok := authorizeRequest(w, r, cfg, endpointInspect, http.MethodGet, http.MethodHead)
 		if !ok {
 			return
 		}
 		target := auth.target
-		// Carried to the dialer and the TLS probe (see proxyHandler).
-		r = r.WithContext(withLocalStart(r.Context(), auth.localStart))
+		// Carried to the dialer and the TLS probe (see proxyHandler), and to
+		// every upstream request: userinfo credentials (AUTH-13) go only to
+		// the start URL's origin and never with a method override.
+		r = r.WithContext(withTargetAuth(withLocalStart(r.Context(), auth.localStart), auth.creds))
 
 		query := r.URL.Query()
 		includeBody := query.Get("body") == "1"
@@ -2683,14 +3420,15 @@ func traceRedirectChain(parent context.Context, client *http.Client, startURL st
 func pageHandler(cfg *config, client *http.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		auth, ok := authorizeRequest(w, r, cfg, http.MethodGet)
+		auth, ok := authorizeRequest(w, r, cfg, endpointPage, http.MethodGet)
 		if !ok {
 			return
 		}
 		target := auth.target
 		// Carried to the redirect tracer, the dialer and the TLS probe (see
-		// proxyHandler).
-		r = r.WithContext(withLocalStart(r.Context(), auth.localStart))
+		// proxyHandler), and the userinfo credentials to every upstream
+		// request (see inspectHandler).
+		r = r.WithContext(withTargetAuth(withLocalStart(r.Context(), auth.localStart), auth.creds))
 		rawTarget := target.String()
 		diag := r.URL.Query().Get("diag") == "1"
 
@@ -2875,7 +3613,11 @@ func writeCORSHeaders(w http.ResponseWriter, r *http.Request, cfg *config) {
 	}
 
 	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Proxy-Token")
+	// X-Target-Authorization and X-Target-Origin carry credentials for the
+	// target (since v1.4.0, /proxy only — the other endpoints refuse them).
+	// Authorization itself, X-HTTP-Method-Override and every other header
+	// stay out.
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin")
 	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	w.Header().Set("Access-Control-Max-Age", "600")
 	// Note: Access-Control-Expose-Headers is NOT set here because the
@@ -3740,10 +4482,26 @@ func (c *config) refineBlocked(err error) error {
 // transports, one per localStart value (localSplitTransport). Within one class
 // the verdict depends only on the authority — the h2 pool key — so sharing
 // there opens nothing a fresh dial would not.
+//
+// A request with header credentials over plain http (authOverHTTPFrom) may
+// connect to a loopback address only, whatever the verdict says: a listed
+// name can resolve publicly or be spoofed into the LAN, and Authorization is
+// already on the request (AUTH-8). Any other address fails with
+// errInsecureAuth before a connection is made.
 func localGuard(cfg *config, base *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// base is shared by every request; a request with credentials over
+		// http gets a copy whose Control admits loopback only — the backstop
+		// for the paths below that dial a name and never see the address.
+		dialer := base
+		authHTTP := authOverHTTPFrom(ctx)
+		if authHTTP {
+			guarded := *base
+			guarded.Control = loopbackOnlyControl(base.Control)
+			dialer = &guarded
+		}
 		if !cfg.allowLocalActive() && cfg.lookupIP == nil {
-			conn, err := base.DialContext(ctx, network, addr)
+			conn, err := dialer.DialContext(ctx, network, addr)
 			return conn, cfg.refineBlocked(err)
 		}
 		host, port, err := net.SplitHostPort(addr)
@@ -3752,7 +4510,7 @@ func localGuard(cfg *config, base *net.Dialer) func(ctx context.Context, network
 		}
 		local := localStartFrom(ctx) && cfg.allowLocalMatch(host, port)
 		if !local && cfg.lookupIP == nil {
-			conn, err := base.DialContext(ctx, network, addr)
+			conn, err := dialer.DialContext(ctx, network, addr)
 			return conn, cfg.refineBlocked(err)
 		}
 
@@ -3767,14 +4525,15 @@ func localGuard(cfg *config, base *net.Dialer) func(ctx context.Context, network
 
 		var blocked *blockedError
 		var dialErr error
+		insecure := false
 		for _, ip := range ips {
 			target := net.JoinHostPort(ip.String(), port)
-			d := base
+			d := dialer
 			if local {
 				switch cfg.localVerdict(host, port, ip) {
 				case verdictPublic:
 				case verdictAllowed:
-					exact := *base
+					exact := *dialer
 					exact.Control = exactAddressControl(ip, port, cfg.dialControlOrDefault())
 					d = &exact
 				default:
@@ -3784,6 +4543,11 @@ func localGuard(cfg *config, base *net.Dialer) func(ctx context.Context, network
 					}
 					continue
 				}
+			}
+			// Credentials over http: loopback or nothing (AUTH-8).
+			if authHTTP && !ip.IsLoopback() {
+				insecure = true
+				continue
 			}
 			conn, err := d.DialContext(ctx, network, target)
 			if err == nil {
@@ -3806,6 +4570,10 @@ func localGuard(cfg *config, base *net.Dialer) func(ctx context.Context, network
 		// the addresses that were refused.
 		if dialErr != nil {
 			return nil, dialErr
+		}
+		// The address was fine, the credentials over http were not.
+		if insecure {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: errInsecureAuth}
 		}
 		if blocked != nil {
 			return nil, &net.OpError{Op: "dial", Net: network, Err: blocked}
@@ -3870,8 +4638,11 @@ var hopByHopHeaders = map[string]struct{}{
 	"trailers":            {},
 	"transfer-encoding":   {},
 	"upgrade":             {},
-	// Proxy-internal headers.
-	"x-proxy-token": {},
+	// Proxy-internal headers. The credential headers never reach a target
+	// under their own name; only attachTargetAuth sets Authorization (AUTH-3).
+	"x-proxy-token":          {},
+	"x-target-authorization": {},
+	"x-target-origin":        {},
 }
 
 // sensitiveRequestHeaders lists headers that must never travel from the browser
@@ -3914,19 +4685,58 @@ func connectionTokens(h http.Header) map[string]struct{} {
 	return tokens
 }
 
+// normHeader is the name a header ends up under behind servers that accept
+// underscores in header names: PHP-FPM and CGI map "X_Proxy_Token" and
+// "X-Proxy-Token" to the same HTTP_X_PROXY_TOKEN. Go does not canonicalise "_"
+// to "-", so every name comparison on request headers uses this form (AUTH-3).
+func normHeader(name string) string {
+	return strings.ReplaceAll(strings.ToLower(name), "_", "-")
+}
+
 // copyRequestHeaders copies safe headers from the incoming browser request to
-// the upstream request, skipping hop-by-hop, proxy-specific and sensitive ones.
+// the upstream request, skipping hop-by-hop, proxy-specific and sensitive ones
+// — also when written with underscores (normHeader).
 func copyRequestHeaders(src *http.Request, dst *http.Request) {
-	dynamic := connectionTokens(src.Header)
+	dynamic := make(map[string]struct{})
+	for token := range connectionTokens(src.Header) {
+		dynamic[normHeader(token)] = struct{}{}
+	}
 	for key, values := range src.Header {
-		lower := strings.ToLower(key)
-		if _, skip := hopByHopHeaders[lower]; skip {
+		name := normHeader(key)
+		if _, skip := hopByHopHeaders[name]; skip {
 			continue
 		}
-		if _, skip := sensitiveRequestHeaders[lower]; skip {
+		if _, skip := sensitiveRequestHeaders[name]; skip {
 			continue
 		}
-		if _, skip := dynamic[lower]; skip {
+		if _, skip := dynamic[name]; skip {
+			continue
+		}
+		for _, v := range values {
+			dst.Header.Add(key, v)
+		}
+	}
+}
+
+// credentialRequestHeaders are the only browser headers an upstream request
+// carrying credentials gets: an allowlist instead of the deny lists above, so
+// no custom header (an override, a nonce, a cookie under another name) can ride
+// along with an authenticated request (AUTH-3). Matched on the exact lower-case
+// name: an underscore variant is dropped, not forwarded.
+var credentialRequestHeaders = map[string]struct{}{
+	"accept":          {},
+	"accept-language": {},
+	"accept-encoding": {},
+	"user-agent":      {},
+	"cache-control":   {},
+	"pragma":          {},
+}
+
+// copyAllowedRequestHeaders copies the credentialRequestHeaders from the
+// browser request to an upstream request that carries credentials.
+func copyAllowedRequestHeaders(src *http.Request, dst *http.Request) {
+	for key, values := range src.Header {
+		if _, ok := credentialRequestHeaders[strings.ToLower(key)]; !ok {
 			continue
 		}
 		for _, v := range values {
@@ -3947,6 +4757,14 @@ func forwardsResponseHeader(lower string, dynamic map[string]struct{}) bool {
 	}
 	// Strip upstream CORS headers — we set our own.
 	if strings.HasPrefix(lower, "access-control-") {
+		return false
+	}
+	// Every X-Upstream-* header is the proxy's own metadata. A target that
+	// sends one itself (a forged X-Upstream-Auth, X-Upstream-Location on a
+	// 200, …) must not get it to the caller (AUTH-14) — also not written
+	// with underscores (X_Upstream_Auth), which a caller reading headers
+	// through a CGI-style layer would see under the same name (normHeader).
+	if strings.HasPrefix(normHeader(lower), "x-upstream-") {
 		return false
 	}
 	// Never hand the browser a redirect to follow: fetch() would go straight
@@ -4068,6 +4886,164 @@ func newUpstreamTransport(cfg *config) *http.Transport {
 }
 
 // -----------------------------------------------------------------------
+// /ping and /version (no token)
+// -----------------------------------------------------------------------
+
+// pingHandler is the health check: no token, CORS for the browser, a fixed
+// plain-text body. Unchanged since v1.1.0.
+func pingHandler(cfg *config) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCORSHeaders(w, r, cfg)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		fmt.Fprintln(w, "localproxy ok")
+	})
+}
+
+// capabilities are the features this binary has (CAP-1), so a tool can test
+// for a feature instead of comparing versions ("dev" builds report no useful
+// version). Lower case with hyphens; the list only ever grows. The v1.3.0
+// features are listed too, so later tools never need a version check.
+//
+//	follow        /proxy?follow=1                                  (v1.3.0)
+//	diag          diag=1 on /inspect and /page                     (v1.3.0)
+//	inspect-get   /inspect?get=1                                   (v1.3.0)
+//	no-location   /proxy never sends Location, X-Upstream-Location (v1.3.0)
+//	error-type    field "type" in errors                           (v1.3.0)
+//	target-auth   X-Target-Authorization + X-Target-Origin, AUTH-1…14
+//	allow-local   the binary knows --allow-local (not: whether it is set)
+//	token-file    the binary knows --token-file (not: whether it is set)
+//	error-reason  field "reason" on auth_refused / blocked_target
+//	proof         /version?challenge=<hex> answers with "proof" (CAP-2)
+var capabilities = []string{
+	"follow", "diag", "inspect-get", "no-location", "error-type",
+	"target-auth", "allow-local", "token-file", "error-reason", "proof",
+}
+
+// versionLimits tells a tool where the proxy cuts off, before it asks for a
+// large response.
+type versionLimits struct {
+	// MaxBytes is --max-mb in bytes; 0 means unlimited.
+	MaxBytes int64 `json:"maxBytes"`
+	// TimeoutSeconds is --timeout.
+	TimeoutSeconds int64 `json:"timeoutSeconds"`
+}
+
+// versionResponse is the body of /version. The first five keys are the
+// v1.3.0 ones, unchanged and still strings (in the alphabetical order the
+// v1.3.0 map produced); everything after them is additive (v1.4.0).
+//
+// /version has no token and, without --origin, is readable by every website.
+// So the runtime state is booleans only: never an --allow-local entry, never
+// the token file path.
+type versionResponse struct {
+	Author          string        `json:"author"`
+	License         string        `json:"license"`
+	Repo            string        `json:"repo"`
+	URL             string        `json:"url"`
+	Version         string        `json:"version"`
+	Capabilities    []string      `json:"capabilities"`
+	LocalTargets    bool          `json:"localTargets"`
+	TokenPersistent bool          `json:"tokenPersistent"`
+	Limits          versionLimits `json:"limits"`
+	// Proof is only present for a valid ?challenge= (CAP-2).
+	Proof string `json:"proof,omitempty"`
+}
+
+// proofPrefix separates the proof HMAC from any other use of the token.
+const proofPrefix = "localproxy-proof:"
+
+// challengeLen is the length of a valid challenge: 32 random bytes in hex.
+const challengeLen = 64
+
+// validChallenge reports whether c is exactly 64 hex digits. Upper and lower
+// case are both accepted; the proof is computed over c as sent.
+func validChallenge(c string) bool {
+	if len(c) != challengeLen {
+		return false
+	}
+	for i := 0; i < len(c); i++ {
+		if !isHexDigit(c[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// versionProof is the answer to a challenge (CAP-2):
+//
+//	hex(HMAC-SHA256(key = token, message = "localproxy-proof:" + port + ":" + challenge))
+//
+// port is the TCP port in decimal, without leading zeros, on which the proxy
+// received the request. The key is the token exactly as the banner shows it —
+// its 48 ASCII characters, not the 24 bytes they encode. A tool that holds the
+// token checks the proof before it sends the token anywhere: a process
+// squatting on the port cannot compute it, and the HMAC gives nothing away
+// about the token.
+//
+// The port binds the proof to the address the tool talks to. Without it a
+// squatter on an old port (the token survives a restart with --token-file,
+// the port does not without --port) could relay the challenge to the real
+// proxy on its new port and hand the genuine proof back; the tool would then
+// send the token and the target credentials to the squatter. The tool
+// computes the proof with the port it addressed, so a relayed proof from
+// another port does not match.
+func versionProof(token string, port int, challenge string) string {
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write([]byte(proofPrefix + strconv.Itoa(port) + ":" + challenge))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// proofPort is the port that goes into the proof: the local port of the
+// connection the request came in on (in main always the listening port),
+// cfg.port when the request carries no connection address (handler tests).
+// It is never taken from the Host header, which a relay controls.
+func proofPort(r *http.Request, cfg *config) int {
+	if a, ok := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr); ok && a != nil {
+		return a.Port
+	}
+	return cfg.port
+}
+
+// versionHandler serves /version: no token, CORS for the browser, the
+// capabilities and runtime state (CAP-1), and with ?challenge=<64 hex> the
+// proof (CAP-2). An invalid or repeated challenge is ignored — the field is
+// then missing and the answer is the same as without one.
+func versionHandler(cfg *config) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCORSHeaders(w, r, cfg)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		resp := versionResponse{
+			Author:          Author,
+			License:         License,
+			Repo:            RepoURL,
+			URL:             AuthorURL,
+			Version:         Version,
+			Capabilities:    slices.Clone(capabilities),
+			LocalTargets:    cfg.allowLocalActive(),
+			TokenPersistent: cfg.tokenPersistent,
+			Limits: versionLimits{
+				MaxBytes:       cfg.maxResponseBytes,
+				TimeoutSeconds: int64(cfg.requestTimeout / time.Second),
+			},
+		}
+		if challenges := r.URL.Query()["challenge"]; len(challenges) == 1 && validChallenge(challenges[0]) {
+			resp.Proof = versionProof(cfg.sessionToken, proofPort(r, cfg), challenges[0])
+			// A proof belongs to this one exchange.
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		writeJSON(w, http.StatusOK, resp)
+	})
+}
+
+// -----------------------------------------------------------------------
 // Start-up flags and banner
 // -----------------------------------------------------------------------
 
@@ -4091,6 +5067,26 @@ func (f *listFlag) Set(v string) error {
 	return nil
 }
 
+// optionalFlag is a string flag that remembers whether it was given, so
+// "--token-file=" (given, empty: a start-up error) differs from not given.
+type optionalFlag struct {
+	value string
+	set   bool
+}
+
+func (f *optionalFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return f.value
+}
+
+func (f *optionalFlag) Set(v string) error {
+	f.value = v
+	f.set = true
+	return nil
+}
+
 // startFlags are the raw command-line values validateFlags checks.
 type startFlags struct {
 	port         int
@@ -4102,6 +5098,10 @@ type startFlags struct {
 	// given" (off) from "given, but empty" (a start-up error).
 	allowLocal    []string
 	allowLocalSet bool
+	// tokenFile is --token-file; tokenFileSet tells "not given" from "given,
+	// but empty".
+	tokenFile    string
+	tokenFileSet bool
 	// args are the positional arguments left after the flags (flag.Args).
 	args []string
 }
@@ -4110,6 +5110,8 @@ type startFlags struct {
 type startConfig struct {
 	origins    []string
 	allowLocal []allowEntry
+	// tokenFile is the checked --token-file path, "" when not given.
+	tokenFile string
 	// warnings are extra banner lines (the text after the label).
 	warnings []string
 }
@@ -4120,8 +5122,9 @@ type startConfig struct {
 // single upstream request would fail instantly. Every error is fatal; main
 // prints it with a "fatal: " prefix.
 //
-// Without --allow-local the checks are exactly those of v1.3.0, plus a banner
-// warning for positional arguments (which v1.3.0 ignored silently).
+// Without --allow-local and --token-file the checks are exactly those of
+// v1.3.0, plus a banner warning for positional arguments (which v1.3.0
+// ignored silently).
 func validateFlags(f startFlags) (*startConfig, error) {
 	if f.port < 0 || f.port > 65535 {
 		return nil, fmt.Errorf("--port must be between 0 and 65535, got %d", f.port)
@@ -4151,8 +5154,27 @@ func validateFlags(f startFlags) (*startConfig, error) {
 		if f.allowLocalSet || argsNameAllowLocal(f.args) {
 			return nil, fmt.Errorf("unexpected arguments %q: they and every flag after them would be ignored; quote the list: --allow-local \"a,b\"", f.args)
 		}
+		// The same for --token-file: an unquoted path with a space
+		// (C:\Users\Jean Pierre\…) arrives split, and the flags after it
+		// would be dropped silently.
+		if f.tokenFileSet || argsNameFlag(f.args, "token-file") {
+			return nil, fmt.Errorf("unexpected arguments %q: they and every flag after them would be ignored; quote the path: --token-file \"C:\\path with spaces\\token\"", f.args)
+		}
 		start.warnings = append(start.warnings,
 			fmt.Sprintf("ignored arguments %q and every flag after them (quote values with commas or spaces)", f.args))
+	}
+
+	if f.tokenFileSet {
+		if err := checkTokenFilePath(f.tokenFile); err != nil {
+			return nil, err
+		}
+		start.tokenFile = f.tokenFile
+		if f.port == 0 {
+			start.warnings = append(start.warnings, "--port not set — the address changes on every start")
+		}
+		if w := tokenPathWarning(f.tokenFile); w != "" {
+			start.warnings = append(start.warnings, w)
+		}
 	}
 
 	if !f.allowLocalSet {
@@ -4184,12 +5206,18 @@ func validateFlags(f startFlags) (*startConfig, error) {
 // before it, so the flag is never set although the user clearly gave it.
 // v1.3.0 knew no such flag, so no working v1.3.0 command line contains it.
 func argsNameAllowLocal(args []string) bool {
+	return argsNameFlag(args, "allow-local")
+}
+
+// argsNameFlag reports whether args contain the flag name itself ("-name",
+// "--name", "-name=…", "--name=…"). Used for the flags v1.3.0 did not know.
+func argsNameFlag(args []string, flagName string) bool {
 	for _, a := range args {
 		name, ok := strings.CutPrefix(a, "--")
 		if !ok {
 			name, ok = strings.CutPrefix(a, "-")
 		}
-		if ok && (name == "allow-local" || strings.HasPrefix(name, "allow-local=")) {
+		if ok && (name == flagName || strings.HasPrefix(name, flagName+"=")) {
 			return true
 		}
 	}
@@ -4230,9 +5258,13 @@ func isStrictOrigin(o string) bool {
 
 // bannerInfo is what the start-up banner shows.
 type bannerInfo struct {
-	version      string
-	port         int
-	token        string
+	version string
+	port    int
+	token   string
+	// tokenFile is the --token-file path ("" without the flag);
+	// tokenCreated says this start wrote it.
+	tokenFile    string
+	tokenCreated bool
 	dnsLabel     string
 	origins      []string
 	allowAnyHost bool
@@ -4247,6 +5279,17 @@ func bannerLines(b bannerInfo) []string {
 	title := fmt.Sprintf("localproxy %s  —  ready", b.version)
 	addressLine := fmt.Sprintf("  Address  :  http://127.0.0.1:%d", b.port)
 	tokenLine := fmt.Sprintf("  Token    :  %s", b.token)
+	// With --token-file: where the token comes from, and the path. Absent
+	// without the flag, so the v1.3.0 banner is unchanged.
+	var tokenFileLines []string
+	if b.tokenFile != "" {
+		if b.tokenCreated {
+			tokenLine += "  (new, saved to the token file)"
+		} else {
+			tokenLine += "  (from token file)"
+		}
+		tokenFileLines = append(tokenFileLines, "  Tokenfile:  "+b.tokenFile)
+	}
 	dnsLine := fmt.Sprintf("  DNS      :  %s", b.dnsLabel)
 	var originsLine string
 	if len(b.origins) > 0 {
@@ -4282,6 +5325,7 @@ func bannerLines(b bannerInfo) []string {
 	runeWidth := func(s string) int { return utf8.RuneCountInString(s) }
 	innerWidth := runeWidth(title)
 	widthLines := []string{addressLine, tokenLine, dnsLine, originsLine, hostLine, licenseLine, authorLine, repoLine}
+	widthLines = append(widthLines, tokenFileLines...)
 	for _, line := range append(widthLines, extraLines...) {
 		if w := runeWidth(line); w > innerWidth {
 			innerWidth = w
@@ -4312,11 +5356,16 @@ func bannerLines(b bannerInfo) []string {
 		"╠" + hBar + "╣",
 		pad(addressLine),
 		pad(tokenLine),
+	}
+	for _, line := range tokenFileLines {
+		lines = append(lines, pad(line))
+	}
+	lines = append(lines,
 		thinBar,
 		pad(dnsLine),
 		pad(originsLine),
 		pad(hostLine),
-	}
+	)
 	for _, line := range extraLines {
 		lines = append(lines, pad(line))
 	}
@@ -4346,7 +5395,9 @@ func main() {
 	rawDNS := flag.String("dns", "1.1.1.1,8.8.8.8", `Comma-separated DNS servers (e.g. "9.9.9.9,8.8.4.4"), or "system" for OS defaults`)
 	allowAnyHost := flag.Bool("allow-any-host", false, "Accept requests with a non-localhost Host header (not recommended)")
 	var allowLocal listFlag
-	flag.Var(&allowLocal, "allow-local", `Comma-separated `+"`list`"+` of local targets the proxy may reach, e.g. "mysite.ddev.site,localhost:8888,10.0.5.0/24" (quote the list; IPv6 in brackets; without a port only 80/443; names reach loopback only). Off by default; requires --origin, and every --origin must then be https://host[:port] (or http://localhost[:port], http://127.0.0.1[:port]) without a path`)
+	flag.Var(&allowLocal, "allow-local", `Comma-separated `+"`list`"+` of local targets the proxy may reach, e.g. "*.ddev.site,localhost:8888" or "mysite.ddev.site,10.0.5.0/24" (quote the list in every shell; IPv6 in brackets; without a port only 80/443; names reach loopback only, LAN addresses only through an IP or CIDR entry). Off by default; requires --origin, and every --origin must then be https://host[:port] (or http://localhost[:port], http://127.0.0.1[:port]) without a path; cannot be combined with --allow-any-host. Any script on an allowed origin that has the token can reach these targets`)
+	var tokenFile optionalFlag
+	flag.Var(&tokenFile, "token-file", `Absolute `+"`path`"+` of a file that keeps the token across restarts, e.g. "$HOME/.config/localproxy/token" (bash/zsh), "$env:LOCALAPPDATA\localproxy\token" (PowerShell) or "%LOCALAPPDATA%\localproxy\token" (cmd). Created with mode 0600 when missing; the file and its folder must belong to you and not be writable by others. Delete the file to get a new token. Off by default; use it together with --port`)
 	showVersion := flag.Bool("version", false, "Print version information and exit")
 	flag.Parse()
 
@@ -4367,6 +5418,8 @@ func main() {
 		allowAnyHost:  *allowAnyHost,
 		allowLocal:    allowLocal.values,
 		allowLocalSet: allowLocal.set,
+		tokenFile:     tokenFile.value,
+		tokenFileSet:  tokenFile.set,
 		args:          flag.Args(),
 	})
 	if err != nil {
@@ -4374,8 +5427,14 @@ func main() {
 	}
 	origins := start.origins
 
-	// ---- Generate session token ------------------------------------------
-	token, err := generateToken(24) // 48 hex chars
+	// ---- Session token: new per start, or from --token-file ---------------
+	var token string
+	tokenCreated := false
+	if start.tokenFile != "" {
+		token, tokenCreated, err = loadOrCreateToken(start.tokenFile)
+	} else {
+		token, err = generateToken(24) // 48 hex chars
+	}
 	if err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
@@ -4423,6 +5482,7 @@ func main() {
 		resolver:         resolver,
 		allowAnyHost:     *allowAnyHost,
 		allowLocal:       start.allowLocal,
+		tokenPersistent:  start.tokenFile != "",
 	}
 
 	httpClient := newUpstreamClient(cfg)
@@ -4442,33 +5502,9 @@ func main() {
 	mux.Handle("/inspect", inspectHandler(cfg, httpClient))
 	mux.Handle("/page", pageHandler(cfg, httpClient))
 
-	// Health / ping endpoint — no auth needed but needs CORS for browser access.
-	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		writeCORSHeaders(w, r, cfg)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		fmt.Fprintln(w, "localproxy ok")
-	})
-
-	// Version endpoint — no auth needed, returns version info as JSON.
-	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-		writeCORSHeaders(w, r, cfg)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{
-			"version": Version,
-			"license": License,
-			"author":  Author,
-			"url":     AuthorURL,
-			"repo":    RepoURL,
-		})
-	})
+	// No token needed, but CORS for the browser.
+	mux.Handle("/ping", pingHandler(cfg))
+	mux.Handle("/version", versionHandler(cfg))
 
 	server := &http.Server{
 		// Every route sits behind the Host check, including /ping and /version.
@@ -4482,6 +5518,8 @@ func main() {
 		version:      Version,
 		port:         actualPort,
 		token:        token,
+		tokenFile:    start.tokenFile,
+		tokenCreated: tokenCreated,
 		dnsLabel:     dnsLabel,
 		origins:      origins,
 		allowAnyHost: cfg.allowAnyHost,

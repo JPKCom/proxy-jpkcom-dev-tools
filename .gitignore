@@ -11,3 +11,6 @@ localproxy-*
 
 # Development
 .dev
+
+# Local release builds (see CLAUDE.md "Build & Run")
+dist/
