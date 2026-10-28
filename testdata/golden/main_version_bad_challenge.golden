@@ -1,0 +1,40 @@
+> GET /version?challenge=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+> Origin: https://test.example.com
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Length: 397
+< Content-Type: application/json
+< Date: <date>
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "author": "Jean Pierre Kolb",
+  "capabilities": [
+    "follow",
+    "diag",
+    "inspect-get",
+    "no-location",
+    "error-type",
+    "target-auth",
+    "allow-local",
+    "token-file",
+    "error-reason",
+    "proof"
+  ],
+  "license": "GPL-2.0-or-later",
+  "limits": {
+    "maxBytes": 52428800,
+    "timeoutSeconds": 30
+  },
+  "localTargets": false,
+  "repo": "https://github.com/JPKCom/proxy-jpkcom-dev-tools",
+  "tokenPersistent": false,
+  "url": "https://www.jpkc.com/",
+  "version": "dev"
+}

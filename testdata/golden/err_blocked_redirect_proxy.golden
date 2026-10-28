@@ -3,13 +3,14 @@
 > X-Proxy-Token: <token>
 
 < 403
-< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
 < Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
 < Access-Control-Allow-Origin: https://test.example.com
 < Access-Control-Allow-Private-Network: true
 < Access-Control-Max-Age: 600
 < Content-Type: application/json
 < Vary: Origin
+< Vary: X-Target-Authorization
 < X-Content-Type-Options: nosniff
 
 {

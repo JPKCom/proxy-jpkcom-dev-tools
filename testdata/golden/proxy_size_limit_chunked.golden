@@ -1,0 +1,22 @@
+> GET /proxy?url=http://127.0.0.1:<plain-port>/big-chunked
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Expose-Headers: Content-Type, Date, X-Upstream-Content-Encoding, X-Upstream-Content-Length, X-Upstream-Final-URL, X-Upstream-IP, X-Upstream-Location, X-Upstream-Protocol, X-Upstream-Redirects, X-Upstream-Timing, X-Upstream-Truncated
+< Access-Control-Max-Age: 600
+< Content-Type: text/plain; charset=utf-8
+< Date: <date>
+< Vary: Origin
+< Vary: X-Target-Authorization
+< X-Content-Type-Options: nosniff
+< X-Upstream-Ip: 127.0.0.1
+< X-Upstream-Protocol: HTTP/1.1
+< X-Upstream-Timing: dns=<ms>;tcp=<ms>;ssl=<ms>;ttfb=<ms>;total=<ms>
+
+0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN
+0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM

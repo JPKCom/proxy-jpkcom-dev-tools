@@ -5,7 +5,10 @@ package main
 // and flag default must be what v1.3.0 produced. The only allowed difference
 // on these paths is the additive "reason" field on blocked_target errors (and
 // the /page hop field "errorReason"), plus a banner WARNING line for positional
-// arguments v1.3.0 ignored silently.
+// arguments v1.3.0 ignored silently. With AUTH-* (v1.4.0) two more values
+// change on every request, as section 4.1 allows: Access-Control-Allow-Headers
+// names X-Target-Authorization and X-Target-Origin (difference 1), and /proxy
+// responses add "Vary: X-Target-Authorization" (difference 2).
 
 import (
 	"bufio"
@@ -495,8 +498,8 @@ func TestCompat13_PrecheckRejectionBody(t *testing.T) {
 				if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://test.example.com" {
 					t.Errorf("%s %s: Allow-Origin %q", path, target, got)
 				}
-				if got := rr.Header().Values("Vary"); !slices.Equal(got, []string{"Origin"}) {
-					t.Errorf("%s %s: Vary %q, want [Origin]", path, target, got)
+				if got, want := rr.Header().Values("Vary"), compat14Vary(path); !slices.Equal(got, want) {
+					t.Errorf("%s %s: Vary %q, want %q", path, target, got, want)
 				}
 				if rr.Header().Get("Access-Control-Expose-Headers") != "" {
 					t.Errorf("%s %s: Expose-Headers on a pre-check error", path, target)
@@ -504,6 +507,16 @@ func TestCompat13_PrecheckRejectionBody(t *testing.T) {
 			}
 		}
 	}
+}
+
+// compat14Vary is the Vary list of a v1.4.0 response without credentials:
+// v1.3.0's "Origin", plus "X-Target-Authorization" on /proxy (section 4.1,
+// difference 2).
+func compat14Vary(path string) []string {
+	if path == "/proxy" {
+		return []string{"Origin", "X-Target-Authorization"}
+	}
+	return []string{"Origin"}
 }
 
 // TestCompat13_DialerRejectionBody: a dialer block (pre-check disabled by the
@@ -662,14 +675,16 @@ func TestCompat13_NoReasonOnOtherErrors(t *testing.T) {
 	}
 }
 
-// TestCompat13_PreflightHeadersUnchanged pins the v1.3.0 CORS values: R32 (dev
-// build without AUTH-*) must not add X-Target-Authorization or change Vary.
+// TestCompat13_PreflightHeadersUnchanged pins the v1.3.0 CORS values, apart
+// from the two differences of section 4.1 that AUTH-1 and AUTH-10 bring:
+// Allow-Headers adds the two credential headers, Vary on /proxy adds
+// X-Target-Authorization. Methods, Max-Age and the rest stay.
 func TestCompat13_PreflightHeadersUnchanged(t *testing.T) {
 	cfg := newTestConfig()
 	want := map[string]string{
 		"Access-Control-Allow-Origin":          "https://test.example.com",
 		"Access-Control-Allow-Methods":         "GET, HEAD, POST, OPTIONS",
-		"Access-Control-Allow-Headers":         "Content-Type, X-Proxy-Token",
+		"Access-Control-Allow-Headers":         "Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin",
 		"Access-Control-Allow-Private-Network": "true",
 		"Access-Control-Max-Age":               "600",
 	}
@@ -686,8 +701,8 @@ func TestCompat13_PreflightHeadersUnchanged(t *testing.T) {
 				t.Errorf("%s OPTIONS: %s = %q, want %q", name, k, got, v)
 			}
 		}
-		if got := rr.Header().Values("Vary"); !slices.Equal(got, []string{"Origin"}) {
-			t.Errorf("%s OPTIONS: Vary %q, want [Origin]", name, got)
+		if got, want := rr.Header().Values("Vary"), compat14Vary(name); !slices.Equal(got, want) {
+			t.Errorf("%s OPTIONS: Vary %q, want %q", name, got, want)
 		}
 		if rr.Header().Get("Access-Control-Expose-Headers") != "" {
 			t.Errorf("%s OPTIONS: Expose-Headers set", name)
@@ -711,8 +726,8 @@ func TestCompat13_SuccessPathUnchanged(t *testing.T) {
 	if rr.Code != 200 || rr.Body.String() != "ok" {
 		t.Fatalf("status %d body %q", rr.Code, rr.Body.String())
 	}
-	if got := rr.Header().Values("Vary"); !slices.Equal(got, []string{"Origin"}) {
-		t.Errorf("Vary %q, want [Origin] (no X-Target-Authorization in the dev build)", got)
+	if got, want := rr.Header().Values("Vary"), compat14Vary("/proxy"); !slices.Equal(got, want) {
+		t.Errorf("Vary %q, want %q", got, want)
 	}
 	exp := rr.Header().Get("Access-Control-Expose-Headers")
 	for _, h := range []string{"X-Custom", "X-Upstream-IP", "X-Upstream-Final-URL"} {

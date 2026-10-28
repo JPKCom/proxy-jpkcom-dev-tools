@@ -1,0 +1,48 @@
+> GET /proxy?url=http://127.0.0.1:<plain-port>/echo&follow=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+> X_Proxy_Token: not-the-token
+> Sec_Fetch_Site: cross-site
+> Sec_Fetch_Mode: cors
+> Proxy_Authorization: Basic Zm9vOmJhcg==
+> X_Custom_Header: kept
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Expose-Headers: Content-Length, Content-Type, Date, X-Upstream-Content-Encoding, X-Upstream-Content-Length, X-Upstream-Final-URL, X-Upstream-IP, X-Upstream-Location, X-Upstream-Protocol, X-Upstream-Redirects, X-Upstream-Timing, X-Upstream-Truncated
+< Access-Control-Max-Age: 600
+< Content-Length: 166
+< Content-Type: application/json
+< Date: <date>
+< Vary: Origin
+< Vary: X-Target-Authorization
+< X-Content-Type-Options: nosniff
+< X-Upstream-Content-Length: 166
+< X-Upstream-Final-Url: http://127.0.0.1:<plain-port>/echo
+< X-Upstream-Ip: 127.0.0.1
+< X-Upstream-Protocol: HTTP/1.1
+< X-Upstream-Redirects: 0
+< X-Upstream-Timing: dns=<ms>;tcp=<ms>;ssl=<ms>;ttfb=<ms>;total=<ms>
+
+{
+  "body": "",
+  "headers": {
+    "Accept-Encoding": [
+      "gzip"
+    ],
+    "Connection": [
+      "close"
+    ],
+    "User-Agent": [
+      "Go-http-client/1.1"
+    ],
+    "X_custom_header": [
+      "kept"
+    ]
+  },
+  "method": "GET",
+  "uri": "/echo"
+}

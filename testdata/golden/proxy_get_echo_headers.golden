@@ -11,7 +11,7 @@
 > X-Requested-With: XMLHttpRequest
 
 < 200
-< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
 < Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
 < Access-Control-Allow-Origin: https://test.example.com
 < Access-Control-Allow-Private-Network: true
@@ -21,6 +21,7 @@
 < Content-Type: application/json
 < Date: <date>
 < Vary: Origin
+< Vary: X-Target-Authorization
 < X-Content-Type-Options: nosniff
 < X-Upstream-Content-Length: 240
 < X-Upstream-Final-Url: http://127.0.0.1:<plain-port>/echo?x=1

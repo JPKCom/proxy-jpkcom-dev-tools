@@ -3,7 +3,7 @@
 > X-Proxy-Token: <token>
 
 < 502
-< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
 < Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
 < Access-Control-Allow-Origin: https://test.example.com
 < Access-Control-Allow-Private-Network: true

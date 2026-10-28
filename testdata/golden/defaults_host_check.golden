@@ -1,0 +1,10 @@
+> GET /version
+> Host: evil.example
+
+< 403
+< Content-Length: 48
+< Content-Type: text/plain; charset=utf-8
+< Date: <date>
+< X-Content-Type-Options: nosniff
+
+forbidden: proxy must be addressed as localhost

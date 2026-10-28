@@ -8,12 +8,16 @@ package main
 // every response (status, headers, body) with a file under testdata/golden/.
 // The files were recorded on v1.3.0 with -update; afterwards only the
 // differences listed in section 4.1 of the v1.4.0 spec may change, in one
-// reviewed commit of their own.
+// reviewed commit of their own. Cases added later (underscore headers,
+// method overrides without credentials, the size limit, main() with default
+// flags, an invalid /version challenge) were recorded the same way: this file
+// copied into an export of commit 92f51d6 (v1.3.0 code), -update there, then
+// compared here, so their first version is the v1.3.0 answer too.
 //
 // /proxy, /inspect and /page run in-process against httptest targets. /ping
-// and /version are inline closures in main(), so those cases (and a few
-// through the full server stack, including the Host check) run against main()
-// itself in a subprocess.
+// and /version (inline closures in main() up to v1.3.0), a few requests
+// through the full server stack including the Host check, and main() without
+// any flag run against main() itself in a subprocess.
 //
 // Normalised are only values that depend on time or on the ports the test
 // happens to get: the Date header (also inside JSON header maps and raw header
@@ -227,8 +231,48 @@ func goldenTargetHandler() http.Handler {
 		w.WriteHeader(http.StatusFound)
 	})
 
+	// Bodies larger than the "small" config's cap (goldenSmallCap): with
+	// Content-Length, chunked, and gzip-compressed.
+	mux.HandleFunc("/big", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Length", strconv.Itoa(len(goldenBigBody)))
+		if r.Method != http.MethodHead {
+			io.WriteString(w, goldenBigBody)
+		}
+	})
+	mux.HandleFunc("/big-chunked", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
+		for i := 0; i < len(goldenBigBody); i += 50 {
+			io.WriteString(w, goldenBigBody[i:min(i+50, len(goldenBigBody))])
+			w.(http.Flusher).Flush()
+		}
+	})
+	mux.HandleFunc("/big-gzip", func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		io.WriteString(zw, goldenBigBody)
+		zw.Close()
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			w.Write(buf.Bytes())
+		}
+	})
+
 	return mux
 }
+
+// goldenSmallCap is maxResponseBytes of the "small" config; goldenBigBody is
+// three times as long, so every endpoint has to cut it.
+const goldenSmallCap = 100
+
+var goldenBigBody = strings.Repeat("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN\n", 6)
 
 // goldenTLSCert loads the fixed self-signed certificate of the TLS target.
 // With -update it is created once when missing; it is committed with the
@@ -365,8 +409,16 @@ func newGoldenEnv(t *testing.T) *goldenEnv {
 	short.rootCAs = roots
 	short.requestTimeout = 300 * time.Millisecond
 
+	// small: like main, with a response cap of goldenSmallCap bytes.
+	small := base()
+	small.ssrfCheck = mainCfg.ssrfCheck
+	small.dialControl = allowAllDial
+	small.rootCAs = roots
+	small.maxResponseBytes = goldenSmallCap
+
 	env.cfgs = map[string]*config{
 		"main": mainCfg, "strict": strict, "dialer": dialer, "untrusted": untrusted, "timeout": short,
+		"small": small,
 	}
 	return env
 }
@@ -444,6 +496,33 @@ func goldenCases() []goldenCase {
 		{name: "proxy_get_follow_userinfo", path: "/proxy", target: "http://user:pa55@{plainhost}/auth-redirect", query: "&follow=1"},
 		{name: "proxy_get_follow_userinfo_direct", path: "/proxy", target: "http://user:pa55@{plainhost}/auth", query: "&follow=1"},
 		{name: "proxy_get_userinfo", path: "/proxy", target: "http://user:pa55@{plainhost}/auth"},
+
+		// Request headers in underscore spelling (difference 6): the blocked
+		// names are dropped like their hyphen form, other names pass.
+		{name: "proxy_get_underscore_headers", path: "/proxy", target: "{plain}/echo", query: "&follow=1",
+			header: [][2]string{
+				{"X_Proxy_Token", "not-the-token"},
+				{"Sec_Fetch_Site", "cross-site"},
+				{"Sec_Fetch_Mode", "cors"},
+				{"Proxy_Authorization", "Basic Zm9vOmJhcg=="},
+				{"X_Custom_Header", "kept"},
+			}},
+		// Method overrides without credentials: forwarded as in v1.3.0
+		// (the AUTH-5/AUTH-6 rules apply only with credentials).
+		{name: "proxy_get_method_override_query", path: "/proxy", target: "{plain}/echo?_method=DELETE", query: "&follow=1"},
+		{name: "proxy_get_method_override_header", path: "/proxy", target: "{plain}/echo",
+			header: [][2]string{{"X-HTTP-Method-Override", "DELETE"}, {"X-Method-Override", "PUT"}}},
+		{name: "proxy_post_method_override", method: http.MethodPost, path: "/proxy", target: "{plain}/echo?_method=PUT",
+			header: [][2]string{{"Content-Type", "application/x-www-form-urlencoded"}, {"X-HTTP-Method-Override", "DELETE"}},
+			body:   "_method=DELETE&title=golden"},
+		{name: "inspect_method_override_query", path: "/inspect", target: "{plain}/echo?_method=DELETE", query: "&body=1"},
+		// Response size limit (cfg "small").
+		{name: "proxy_size_limit", cfg: "small", path: "/proxy", target: "{plain}/big"},
+		{name: "proxy_size_limit_chunked", cfg: "small", path: "/proxy", target: "{plain}/big-chunked"},
+		{name: "proxy_size_limit_gzip", cfg: "small", path: "/proxy", target: "{plain}/big-gzip"},
+		{name: "inspect_size_limit", cfg: "small", path: "/inspect", target: "{plain}/big", query: "&body=1"},
+		{name: "inspect_size_limit_gzip", cfg: "small", path: "/inspect", target: "{plain}/big-gzip", query: "&body=1"},
+		{name: "page_size_limit", cfg: "small", path: "/page", target: "{plain}/big", query: "&diag=1"},
 
 		// ---- /inspect ----
 		// seo.js LocalProxy.inspectFetch( currentUrl ): no options, HEAD.
@@ -615,6 +694,7 @@ func TestCompat_Golden(t *testing.T) {
 	}
 
 	t.Run("main", func(t *testing.T) { goldenMainCases(t) })
+	t.Run("defaults", func(t *testing.T) { goldenDefaultFlagCases(t) })
 }
 
 // goldenMainCases runs main() in a subprocess and records /ping, /version,
@@ -624,28 +704,19 @@ func goldenMainCases(t *testing.T) {
 	_, proxyPort, _ := net.SplitHostPort(addr)
 	ports := map[string]string{proxyPort: "<proxy-port>"}
 
-	client := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: &http.Transport{DisableKeepAlives: true, DisableCompression: true},
-	}
-
-	type mainCase struct {
-		name   string
-		method string
-		uri    string
-		host   string // Host header; "" means the listener address
-		header [][2]string
-	}
 	preflight := [][2]string{
 		{"Origin", goldenOrigin},
 		{"Access-Control-Request-Method", "GET"},
 		{"Access-Control-Request-Headers", "x-proxy-token"},
 	}
-	cases := []mainCase{
+	cases := []goldenMainCase{
 		{name: "main_ping", method: http.MethodGet, uri: "/ping", header: [][2]string{{"Origin", goldenOrigin}}},
 		{name: "main_ping_no_origin", method: http.MethodGet, uri: "/ping"},
 		{name: "main_ping_foreign_origin", method: http.MethodGet, uri: "/ping", header: [][2]string{{"Origin", "https://evil.example"}}},
 		{name: "main_version", method: http.MethodGet, uri: "/version", header: [][2]string{{"Origin", goldenOrigin}}},
+		// An invalid challenge (63 hex digits): answered like plain /version.
+		{name: "main_version_bad_challenge", method: http.MethodGet, uri: "/version?challenge=" + strings.Repeat("a", 63),
+			header: [][2]string{{"Origin", goldenOrigin}}},
 		{name: "main_options_ping", method: http.MethodOptions, uri: "/ping", header: preflight},
 		{name: "main_options_version", method: http.MethodOptions, uri: "/version", header: preflight},
 		{name: "main_options_proxy", method: http.MethodOptions, uri: "/proxy", header: preflight},
@@ -659,6 +730,55 @@ func goldenMainCases(t *testing.T) {
 		{name: "main_not_found", method: http.MethodGet, uri: "/nope", header: [][2]string{{"Origin", goldenOrigin}}},
 	}
 
+	goldenRunMainCases(t, addr, token, ports, cases)
+}
+
+// goldenMainCase is one request against main() in a subprocess.
+type goldenMainCase struct {
+	name   string
+	method string
+	uri    string
+	host   string // Host header; "" means the listener address
+	header [][2]string
+}
+
+// goldenDefaultFlagCases runs main() without any flag — no --origin, random
+// port, default DNS — as a double-clicked binary starts. None of the cases
+// needs DNS.
+func goldenDefaultFlagCases(t *testing.T) {
+	addr, token := goldenStartMain(t)
+	_, proxyPort, _ := net.SplitHostPort(addr)
+	ports := map[string]string{proxyPort: "<proxy-port>"}
+	preflight := [][2]string{
+		{"Origin", "https://any.example"},
+		{"Access-Control-Request-Method", "GET"},
+		{"Access-Control-Request-Headers", "x-proxy-token"},
+	}
+	cases := []goldenMainCase{
+		{name: "defaults_ping", method: http.MethodGet, uri: "/ping", header: [][2]string{{"Origin", "https://any.example"}}},
+		{name: "defaults_ping_no_origin", method: http.MethodGet, uri: "/ping"},
+		{name: "defaults_version", method: http.MethodGet, uri: "/version", header: [][2]string{{"Origin", "https://any.example"}}},
+		{name: "defaults_options_proxy", method: http.MethodOptions, uri: "/proxy", header: preflight},
+		{name: "defaults_proxy_wrong_token", method: http.MethodGet,
+			uri:    "/proxy?url=" + url.QueryEscape("https://example.com/"),
+			header: [][2]string{{"Origin", "https://any.example"}, {"X-Proxy-Token", "wrong-token"}}},
+		{name: "defaults_proxy_blocked_private", method: http.MethodGet,
+			uri:    "/proxy?url=" + url.QueryEscape("http://192.168.1.1/") + "&follow=1",
+			header: [][2]string{{"Origin", "https://any.example"}, {"X-Proxy-Token", "<token>"}}},
+		{name: "defaults_inspect_missing_url", method: http.MethodGet, uri: "/inspect",
+			header: [][2]string{{"Origin", "https://any.example"}, {"X-Proxy-Token", "<token>"}}},
+		{name: "defaults_host_check", method: http.MethodGet, uri: "/version", host: "evil.example"},
+	}
+	goldenRunMainCases(t, addr, token, ports, cases)
+}
+
+// goldenRunMainCases sends cases to the main() at addr and compares them.
+func goldenRunMainCases(t *testing.T, addr, token string, ports map[string]string, cases []goldenMainCase) {
+	t.Helper()
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true, DisableCompression: true},
+	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			req, err := http.NewRequest(c.method, "http://"+addr+c.uri, nil)

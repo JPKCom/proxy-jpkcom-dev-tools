@@ -3,7 +3,7 @@
 > X-Proxy-Token: <token>
 
 < 200
-< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
 < Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
 < Access-Control-Allow-Origin: https://test.example.com
 < Access-Control-Allow-Private-Network: true
@@ -14,6 +14,7 @@
 < Date: <date>
 < Vary: Origin
 < Vary: Accept
+< Vary: X-Target-Authorization
 < X-Content-Type-Options: nosniff
 < X-Upstream-Content-Length: 16
 < X-Upstream-Ip: 127.0.0.1

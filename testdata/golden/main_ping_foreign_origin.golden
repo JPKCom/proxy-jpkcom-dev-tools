@@ -2,7 +2,7 @@
 > Origin: https://evil.example
 
 < 200
-< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
 < Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
 < Access-Control-Allow-Private-Network: true
 < Access-Control-Max-Age: 600

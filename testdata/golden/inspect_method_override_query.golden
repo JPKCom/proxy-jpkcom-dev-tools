@@ -1,0 +1,43 @@
+> GET /inspect?url=http://127.0.0.1:<plain-port>/echo?_method=DELETE&body=1
+> Origin: https://test.example.com
+> X-Proxy-Token: <token>
+
+< 200
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://test.example.com
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Type: application/json
+< Vary: Origin
+< X-Content-Type-Options: nosniff
+
+{
+  "body": "{\"body\":\"\",\"headers\":{\"Accept-Encoding\":[\"gzip, deflate\"],\"Connection\":[\"close\"],\"User-Agent\":[\"Go-http-client/1.1\"]},\"method\":\"GET\",\"uri\":\"/echo?_method=DELETE\"}\n",
+  "headers": {
+    "Content-Length": [
+      "163"
+    ],
+    "Content-Type": [
+      "application/json"
+    ],
+    "Date": [
+      "<date>"
+    ]
+  },
+  "http3": false,
+  "ip": "127.0.0.1",
+  "maxBodySize": 1048576,
+  "method": "GET",
+  "protocol": "HTTP/1.1",
+  "ssl": null,
+  "status": 200,
+  "timing": {
+    "dnsLookup": "<ms>",
+    "sslHandshake": "<ms>",
+    "tcpConnect": "<ms>",
+    "total": "<ms>",
+    "ttfb": "<ms>"
+  },
+  "truncated": false
+}

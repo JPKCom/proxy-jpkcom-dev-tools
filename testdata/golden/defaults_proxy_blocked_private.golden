@@ -1,0 +1,23 @@
+> GET /proxy?url=http://192.168.1.1/&follow=1
+> Origin: https://any.example
+> X-Proxy-Token: <token>
+
+< 403
+< Access-Control-Allow-Headers: Content-Type, X-Proxy-Token, X-Target-Authorization, X-Target-Origin
+< Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS
+< Access-Control-Allow-Origin: https://any.example
+< Access-Control-Allow-Private-Network: true
+< Access-Control-Max-Age: 600
+< Content-Length: 120
+< Content-Type: application/json
+< Date: <date>
+< Vary: Origin
+< Vary: X-Target-Authorization
+< X-Content-Type-Options: nosniff
+
+{
+  "error": "blocked_target",
+  "message": "target resolves to a private or reserved address",
+  "reason": "private",
+  "status": 403
+}

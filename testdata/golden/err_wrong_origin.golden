@@ -4,6 +4,7 @@
 
 < 403
 < Content-Type: text/plain; charset=utf-8
+< Vary: X-Target-Authorization
 < X-Content-Type-Options: nosniff
 
 forbidden: origin not allowed
