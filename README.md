@@ -76,9 +76,13 @@ release build produced.
    ```
 
 3. SmartScreen may say "Windows protected your PC", because the binary is not
-   signed. Click "More info" → "Run anyway".
+   signed. Click "More info" → "Run anyway". This only happens for a file a
+   browser downloaded; a binary you built or copied yourself starts without it.
 4. A firewall prompt normally does not appear: the proxy listens on
    `127.0.0.1` only.
+5. The first time the tool talks to the proxy, your browser may ask about
+   access to your local network — see
+   [HTTPS pages calling HTTP localhost](#https-pages-calling-http-localhost).
 
 A double-click starts the proxy **without flags** — every origin allowed, a
 random port. For a repeatable start, put the command into a `.cmd` file next to
@@ -1262,13 +1266,26 @@ TLS 1.2, and SSLv3.
 
 Browsers treat `http://127.0.0.1` as a **"potentially trustworthy origin"** (W3C Secure Contexts spec). Requests from an HTTPS page to the local proxy are **not blocked** as mixed content.
 
-Chrome replaces Private Network Access with **Local Network Access**: the first
-time an HTTPS page talks to `127.0.0.1`, Chrome asks you whether the site may
-access devices on your local network. Allow it for the tool's site; you can
-change the decision later in the site settings. `Access-Control-Allow-Private-Network`
-(still sent) does not replace this prompt. The prompt only covers the page
-talking to the proxy — not what the proxy sends on with `--allow-local`.
-<!-- TODO(LNA hand test): confirm Chrome's exact prompt and setting labels. -->
+Chromium-based browsers (Chrome, Edge, Brave) replace Private Network Access
+with **Local Network Access**: the first time a public HTTPS page talks to
+`127.0.0.1`, the browser may ask whether the site may access devices on your
+local network. If your browser asks about access to devices on your local
+network, choose Allow, then press Check again (in the tools without that
+button: reload the page). The request that caused the prompt fails even when
+you allow it; the next one goes through. A page that itself runs on a local
+address (for example a DDEV site that resolves to `127.0.0.1`) already counts
+as local, and the browser does not ask.
+
+To change the decision later:
+
+- **Chrome:** click the icon left of the address bar → "Site settings" → the
+  local network permission of the site.
+- **Brave:** Settings → "Privacy and security" → "Site and Shields Settings" →
+  "All sites" → the site (for example `www.jpkc.com`) → "Local network".
+
+`Access-Control-Allow-Private-Network` (still sent) does not replace this
+prompt. The prompt only covers the page talking to the proxy — not what the
+proxy sends on with `--allow-local`.
 
 ---
 
