@@ -1532,7 +1532,7 @@ x/tools v0.51.0 or newer, a plain `go install` works again.
 
 ## Changelog
 
-### v1.4.0 (unreleased)
+### v1.4.0
 
 Feature release for the **WP REST API Explorer** of the JPKCom Tools:
 credentials for the target, local and staging sites, feature detection and a
